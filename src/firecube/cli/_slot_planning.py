@@ -30,6 +30,8 @@ from firecube.cli._product import resolve_product_identity
 from firecube.core.controlplane import ChunkManager
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
+from firecube.core.zarr._layout import slot_window_layout
+from firecube.core.zarr.engine_owned import is_engine_owned_spec
 from firecube.ingestor.api import ZarrGroupSpec
 
 #: Plan JSON schema version. Independent of control-plane SCHEMA_VERSION.
@@ -47,10 +49,22 @@ def _resolve_per_group_slot_sizes(
 
     per_group: dict[str, int] = {}
     for group_spec in schema:
-        time_chunks = [
-            int((arr_spec.shards if arr_spec.shards is not None else arr_spec.chunks)[0])
+        # The schema does not name the time coordinate, so it is planned like
+        # an array pods write: a one-slot unit when it declares neither chunks
+        # nor shards, otherwise its declared chunks or shards count toward the
+        # slot size. That is stricter than the capability gate, which does not
+        # align windows to a coordinate that declares shards but no chunks.
+        layouts = [
+            layout
             for arr_spec in group_spec.arrays
-            if arr_spec.time_indexed and arr_spec.chunks is not None and arr_spec.chunks
+            # Engine-owned arrays are written whole by preallocate, never by a window.
+            if not is_engine_owned_spec(arr_spec)
+            and (layout := slot_window_layout(arr_spec, coord_name=None)) is not None
+        ]
+        time_chunks = [
+            int(unit[0])
+            for layout in layouts
+            if (unit := layout.shards if layout.shards is not None else layout.chunks)
         ]
         if not time_chunks:
             continue

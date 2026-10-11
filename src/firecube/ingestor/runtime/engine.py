@@ -36,7 +36,7 @@ import concurrent.futures
 import contextlib
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
@@ -621,6 +621,15 @@ def _create_batches_with_parallel_filter(
             all_items = list(cached_items)
         original_count = len(all_items)
 
+        # Keep what inspect_item returned for each item, so the window's
+        # planned slots are known without inspecting any item twice.
+        inspected: dict[int, Any] = {}
+
+        def _inspect_and_keep(item: Any, item_ctx: Any) -> Any:
+            info = host.inspect_item(item, item_ctx)
+            inspected[id(item)] = info
+            return info
+
         try:
             filtered = filter_items_by_index(
                 all_items,
@@ -628,7 +637,7 @@ def _create_batches_with_parallel_filter(
                 slot_start,
                 slot_end,
                 engine_config.slot_group,
-                host.inspect_item,
+                _inspect_and_keep,
                 plugin_ctx,
             )
         except Exception as exc:
@@ -659,6 +668,17 @@ def _create_batches_with_parallel_filter(
             )
             return []
 
+        if str(engine_config.write_mode) == "staged":
+            _refuse_sparse_staged_window(
+                host=host,
+                ctx=plugin_ctx,
+                resolved=binding.resolved,
+                window=(slot_start, slot_end),
+                slot_group=engine_config.slot_group,
+                items=filtered_items,
+                inspected=inspected,
+            )
+
         batches = list(
             base_host._batch_planner.create_batches(
                 host,
@@ -674,6 +694,37 @@ def _create_batches_with_parallel_filter(
         return batches
 
     return list(host._create_batches(ctx, batch_size))
+
+
+def _refuse_sparse_staged_window(
+    *,
+    host: PipelineHost,
+    ctx: PluginContext,
+    resolved: Any,
+    window: tuple[int, int],
+    slot_group: str | None,
+    items: Sequence[Any],
+    inspected: Mapping[int, Any],
+) -> None:
+    """Hand the window's planned slots to a host that checks staged unit coverage.
+
+    Runs after the slot filter and before any batch exists, so a refusal
+    comes before any payload write. Skipped when the host has no such check
+    or an item's inspection result is unknown.
+    """
+    check = getattr(host, "_refuse_sparse_staged_window", None)
+    if not callable(check) or not items:
+        return
+    if any(id(item) not in inspected for item in items):
+        return
+    # Same group the slot filter positions items in (shared axis when unset).
+    group = slot_group if slot_group is not None else resolved.groups[0]
+    planned: set[int] = set()
+    for item in items:
+        info = inspected[id(item)]
+        coordinate = info.coordinate if hasattr(info, "coordinate") else info
+        planned.add(int(resolved.position(group, coordinate)))
+    check(ctx, frozenset(planned), window=window, slot_group=slot_group)
 
 
 class PipelineExecutor:
@@ -875,6 +926,14 @@ class PipelineExecutor:
         plugin = host.name
         run_id = ctx.run_id or ""
         output_name = _output_product_name(ctx)
+
+        if effective_write_mode == "staged":
+            # Promotion replaces whole objects: a host that tracks its staged
+            # writes refuses here, before the target is touched, when a unit
+            # would be promoted half-written.
+            refuse_incomplete = getattr(host, "_refuse_incomplete_staged_units", None)
+            if callable(refuse_incomplete):
+                refuse_incomplete()
 
         stored = _storage_completer().complete_output(result, ctx)
 

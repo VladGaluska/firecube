@@ -530,6 +530,7 @@ def write_dataset_to_zarr(
                 zarr_format=zarr_format,
                 consolidated=False,
                 safe_chunks=False,
+                align_chunks=True,
             )
 
         state_arr = cast(Any, zarr_group[state_var_name])

@@ -29,6 +29,7 @@ import datetime as dt
 import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final, Literal
 
 import numpy as np
@@ -536,16 +537,83 @@ class ItemInfo:
     """Metadata returned by ``inspect_item`` describing a single source item.
 
     The engine uses ``coordinate`` to map the item to a position on its
-    assigned axis.
+    assigned axis, and ``values`` to fill the item's slot in arrays the
+    engine writes itself (``ZarrArraySpec(engine_owned=True)``).
 
     Attributes:
         coordinate: The item's coordinate value. For ``RegularTimeAxis`` this
             is a UTC-explicit timestamp. For ``IntegerAxis`` this is an integer
             coordinate.
+        values: Per-slot scalars for engine-owned arrays, keyed by array name,
+            or ``None`` when the schema has none. ``firecube zarr preallocate``
+            collects them from every item and writes each engine-owned array
+            whole, once; ingest pods never write those arrays, they only
+            verify. Firecube reads ``values`` only when the schema declares
+            an engine-owned array; otherwise it ignores the mapping without
+            checking its keys. When one is declared, each key must name an
+            engine-owned array, and every engine-owned array of the item's
+            group needs a key. Values are scalars (a Python number, a NumPy
+            scalar or a 0-d array), cast to the array's dtype with NumPy's
+            casting rules, so a value outside those checks can be truncated
+            or rounded silently. ``firecube zarr preallocate`` refuses NaN
+            or infinity, a fraction or an out-of-range number for an integer
+            array, anything but a bool for a bool array, and a finite real
+            number that would overflow to infinity in a float array. The
+            integer checks apply to values whose NumPy dtype is bool,
+            integer, float, string or object (a ``datetime.datetime`` or an
+            object-dtype complex value is refused). Values of complex,
+            datetime64 or timedelta64 dtype skip them and are cast; a
+            complex value can therefore be truncated, or become infinity in
+            a float array. The mapping is stored read-only and does not take
+            part in ``hash(info)``. A 0-d array is copied at construction
+            (the copy is read-only), so reusing one buffer for every item is
+            safe.
+
+    Raises:
+        TypeError: If ``values`` is not a mapping, a key is not a string, or a
+            value is ``None`` or not a scalar.
+
+    Examples:
+        >>> from datetime import UTC, datetime
+        >>> info = ItemInfo(
+        ...     coordinate=datetime(2024, 1, 1, 0, 10, tzinfo=UTC),
+        ...     values={"platform_lon": 0.25},
+        ... )
+        >>> info.values["platform_lon"]
+        0.25
     """
 
     coordinate: Any = None
     """Coordinate value used by the resolver to compute a position."""
+
+    values: Mapping[str, Any] | None = field(default=None, hash=False)
+    """Per-slot scalars for engine-owned arrays, keyed by array name."""
+
+    def __post_init__(self) -> None:
+        if self.values is None:
+            return
+        if not isinstance(self.values, Mapping):
+            raise TypeError(
+                f"ItemInfo.values must be a mapping of array name to scalar, "
+                f"got {type(self.values).__name__}"
+            )
+        frozen: dict[str, Any] = {}
+        for name, value in self.values.items():
+            if not isinstance(name, str):
+                raise TypeError(f"ItemInfo.values keys must be array names (str), got {name!r}")
+            if value is None or callable(value) or np.ndim(value) != 0:
+                raise TypeError(
+                    f"ItemInfo.values[{name!r}] must be a scalar, got {value!r}; "
+                    "engine-owned arrays hold one value per slot"
+                )
+            # A 0-D array is copied (dtype and byte order kept) and made
+            # read-only, so a caller refilling one buffer per item cannot change
+            # a value already handed over. Other scalars are immutable already.
+            if isinstance(value, np.ndarray):
+                value = np.array(value, copy=True)
+                value.flags.writeable = False
+            frozen[name] = value
+        object.__setattr__(self, "values", MappingProxyType(frozen))
 
 
 def _utc_explicit_epoch_s(value: str, field_name: str) -> int:

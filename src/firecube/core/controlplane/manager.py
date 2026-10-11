@@ -22,7 +22,7 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -663,6 +663,7 @@ class ChunkManager:
         coord_chunk_sizes: dict[str, int],
         slot_group: str | None = None,
         meta: dict[str, Any] | None = None,
+        whole_extent_groups: Mapping[str, int] | None = None,
     ) -> ClaimHandle:
         """Atomically reject overlapping coord-chunk peers and return a live claim.
 
@@ -671,6 +672,11 @@ class ChunkManager:
         chunk geometry, rejects any window that touches a peer-owned
         coordinate chunk, then records this run as started while the claim is
         still held.
+
+        ``whole_extent_groups`` maps a group to its slot count when this run
+        writes the group's engine-owned arrays whole: every live ranged peer
+        on that group conflicts, whatever its window, and the recorded run
+        range covers ``[0, slot count)``.
 
         If this method raises, no run is registered and no terminalization is
         needed. If it returns normally, the caller must release the returned
@@ -736,9 +742,25 @@ class ChunkManager:
                             f"firecube chunks runs abandon {peer.run_id} "
                             f"then re-run preallocate. Automatic timeout is not implemented."
                         )
+            whole = dict(whole_extent_groups or {})
+            for group in whole:
+                for peer in ranged_peers:
+                    if peer.slot_group is not None and peer.slot_group != group:
+                        continue
+                    peer_range = peer.slot_range
+                    assert peer_range is not None
+                    raise ConfigurationError(
+                        f"group {group!r} has engine-owned arrays, which preallocate writes "
+                        f"whole, but run {peer.run_id} is live on window "
+                        f"[{peer_range[0]}, {peer_range[1]}) (state: {peer.status}); wait for "
+                        f"it to finish, or if it is confirmed dead abandon it explicitly: "
+                        f"firecube chunks runs abandon {peer.run_id} "
+                        f"then re-run preallocate. Automatic timeout is not implemented."
+                    )
 
-            hull_start = min(window[0] for window in windows_by_group.values())
-            hull_end = max(window[1] for window in windows_by_group.values())
+            claimed = [*windows_by_group.values(), *((0, extent) for extent in whole.values())]
+            hull_start = min(window[0] for window in claimed)
+            hull_end = max(window[1] for window in claimed)
             self.record_run_started(
                 product=product,
                 run_id=run_id,

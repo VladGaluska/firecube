@@ -39,8 +39,11 @@ from firecube.core.uris import storage_uri_from_target
 from firecube.core.zarr._drift import (
     arrays_equal_missing_aware as _arrays_equal_missing_aware,
 )
+from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
 from firecube.core.zarr.chunk_geometry import physical_chunk_keys_for_region
-from firecube.core.zarr.region_writer import RegionZarrWriter
+from firecube.core.zarr.engine_owned import is_engine_owned_spec, is_pod_written_slot_array
+from firecube.core.zarr.region_writer import RegionZarrWriter, open_root_read_only
+from firecube.core.zarr.unit_ownership import require_window_owns_stored_units
 from firecube.ingestor.runtime.coverage import CoverageTracker
 from firecube.ingestor.runtime.parallel_evidence import log_filter_evidence
 
@@ -65,6 +68,46 @@ def _session_for_store(store_uri: str, storage_config: StorageConfig) -> Storage
 
 
 log = logging.getLogger("firecube.runtime.zarr.strategies.indexed_region")
+
+
+def require_intents_in_slot_window(
+    group_to_intents: Mapping[str, Sequence[Any]],
+    slot_range: tuple[int, int],
+    slot_group: str | None,
+) -> None:
+    """Refuse an intent addressing a slot outside the assigned half-open window.
+
+    With ``slot_group`` set only that group's intents are checked; the others
+    are skipped with a warning (this pod does not own them). Static intents
+    carry no time semantics and are exempt.
+
+    Raises:
+        WriteIntentRangeError: An intent's ``ts_index`` is outside ``slot_range``.
+    """
+    slot_start, slot_end = slot_range
+    for group_name, intents in group_to_intents.items():
+        if slot_group is not None and group_name != slot_group:
+            if intents:
+                log.warning(
+                    "slot_group=%r: skipping %d intent(s) for group %r "
+                    "(this pod does not own that group)",
+                    slot_group,
+                    len(intents),
+                    group_name,
+                )
+            continue
+        for intent in intents:
+            if getattr(intent, "kind", None) == "static":
+                continue
+            ts = getattr(intent, "ts_index", None)
+            if ts is not None and not (slot_start <= ts < slot_end):
+                from firecube.ingestor.errors import WriteIntentRangeError
+
+                raise WriteIntentRangeError(
+                    f"Intent ts_index={ts} for group={group_name!r} is outside "
+                    f"assigned slot_range=[{slot_start}, {slot_end}). "
+                    "Plugin filter is advisory; this is a correctness violation."
+                )
 
 
 @contextlib.contextmanager
@@ -275,40 +318,13 @@ class IndexedRegionStrategy:
         region_writes_aligned_count = 0
 
         if slot_range is not None:
-            slot_start, slot_end = slot_range
             all_intents = [
                 intent
                 for intents in group_to_intents.values()
                 for intent in intents
                 if hasattr(intent, "ts_index")
             ]
-            for group_name, intents in group_to_intents.items():
-                # Phase 3.1 T7: When slot_group is set, only validate that group's
-                # intents; skip + warn for other groups (this pod does not own them).
-                if slot_group is not None and group_name != slot_group:
-                    if intents:
-                        log.warning(
-                            "slot_group=%r: skipping %d intent(s) for group %r "
-                            "(this pod does not own that group)",
-                            slot_group,
-                            len(intents),
-                            group_name,
-                        )
-                    continue
-                for intent in intents:
-                    if getattr(intent, "kind", None) == "static":
-                        # Static arrays carry no time semantics; ts_index is
-                        # semantically ignored, so slot-range bounds do not apply.
-                        continue
-                    ts = getattr(intent, "ts_index", None)
-                    if ts is not None and not (slot_start <= ts < slot_end):
-                        from firecube.ingestor.errors import WriteIntentRangeError
-
-                        raise WriteIntentRangeError(
-                            f"Intent ts_index={ts} for group={group_name!r} is outside "
-                            f"assigned slot_range=[{slot_start}, {slot_end}). "
-                            "Plugin filter is advisory; this is a correctness violation."
-                        )
+            require_intents_in_slot_window(group_to_intents, slot_range, slot_group)
             log_filter_evidence(
                 log,
                 stage="post_intent_assertion",
@@ -317,6 +333,13 @@ class IndexedRegionStrategy:
                 filtered_count=len(all_intents),
                 dropped_count=0,
             )
+            # Before any write of this batch, every group: the window must own
+            # every stored unit its writes touch.
+            written_paths = self._pod_written_paths(group_to_intents, schema_by_group, slot_group)
+            if written_paths:
+                require_window_owns_stored_units(
+                    self._stored_root_read_only(), written_paths, slot_range
+                )
 
         for group_name, intents in group_to_intents.items():
             # Phase 3.1 T7: When slot_group is set, skip writes for other groups
@@ -332,19 +355,7 @@ class IndexedRegionStrategy:
                     arr.name for arr in group_spec.arrays if not getattr(arr, "time_indexed", True)
                 )
                 coord_names = coord_names | static_names
-            zarr_store = None
-            if self._storage_config:
-                session = self._session or _session_for_store(self._store_uri, self._storage_config)
-                zarr_store = session.zarr.create_store(
-                    uri=storage_uri_from_target(self._store_uri),
-                    mode="a",
-                ).store
-            writer = RegionZarrWriter(
-                self._store_uri,
-                store=zarr_store,
-                coord_names=coord_names,
-                time_coord_name=self._time_coord_name,
-            )
+            writer = self._new_writer(coord_names)
 
             intents_with_ts = [
                 intent for intent in intents if getattr(intent, "ts_index", None) is not None
@@ -393,14 +404,22 @@ class IndexedRegionStrategy:
                             if codec_pipelines_by_array is not None
                             else (None, None, None)
                         )
+                        array_path = f"{group_name}/{arr_spec.name}"
+                        layout = resolve_effective_layout(
+                            arr_spec,
+                            coord_name=self._time_coord_name,
+                            # Static arrays (possibly rank 0) have no time extent.
+                            time_count=effective_shape[0] if arr_spec.time_indexed else 0,
+                            engine_owned=is_engine_owned_spec(arr_spec),
+                        )
                         writer.ensure_group(
-                            f"{group_name}/{arr_spec.name}",
+                            array_path,
                             shape=effective_shape,
                             dtype=arr_spec.dtype,
                             fill_value=arr_spec.fill_value,
-                            chunks=arr_spec.chunks,
+                            chunks=layout.chunks,
                             allow_grow=allow_grow,
-                            shards=arr_spec.shards,
+                            shards=layout.shards,
                             attrs=arr_spec.attrs,
                             dimension_names=_schema_dimension_names(
                                 arr_spec,
@@ -409,6 +428,13 @@ class IndexedRegionStrategy:
                             filters=filters,
                             serializer=serializer,
                             compressors=compressors,
+                            # Warns once: only the batch that creates the array
+                            # applies the default; later batches open it as stored.
+                            on_create=(
+                                (lambda _arr, p=array_path, lay=layout: warn_default_layout(p, lay))
+                                if layout.is_default
+                                else None
+                            ),
                         )
                     writer.set_group_attrs(group_name, getattr(group_spec, "attrs", None))
 
@@ -529,6 +555,63 @@ class IndexedRegionStrategy:
             "region_writes_aligned_count": region_writes_aligned_count,
             "region_writes_total_count": region_writes_total_count,
         }
+
+    def _new_writer(self, coord_names: frozenset[str]) -> RegionZarrWriter:
+        return RegionZarrWriter(
+            self._store_uri,
+            store=self._session_store(mode="a"),
+            coord_names=coord_names,
+            time_coord_name=self._time_coord_name,
+        )
+
+    def _session_store(self, *, mode: str) -> object | None:
+        if not self._storage_config:
+            return None
+        session = self._session or _session_for_store(self._store_uri, self._storage_config)
+        return session.zarr.create_store(
+            uri=storage_uri_from_target(self._store_uri),
+            mode=mode,
+        ).store
+
+    def _stored_root_read_only(self) -> Any | None:
+        """The store as written so far, opened read-only (``None`` if it does not exist)."""
+        try:
+            store = self._session_store(mode="r")
+        except FileNotFoundError:
+            return None
+        return open_root_read_only(self._store_uri, store=store)
+
+    def _pod_written_paths(
+        self,
+        group_to_intents: Mapping[str, Sequence[Any]],
+        schema_by_group: Mapping[str, Any],
+        slot_group: str | None,
+    ) -> list[str]:
+        """Paths of the time-indexed arrays this batch writes slots of.
+
+        Engine-owned arrays and the time coordinate are left out: pods only
+        verify engine-owned arrays, and a time coordinate that carries a
+        preallocate marker. An unmarked coordinate, which pods do write, is
+        left out as well. Static arrays have no slots.
+        """
+        paths: set[str] = set()
+        for group_name, intents in group_to_intents.items():
+            if slot_group is not None and group_name != slot_group:
+                continue
+            group_spec = schema_by_group.get(group_name)
+            specs = {arr.name: arr for arr in getattr(group_spec, "arrays", ())}
+            for intent in intents:
+                if getattr(intent, "kind", None) not in ("region", "1d"):
+                    continue
+                if intent.array == self._time_coord_name:
+                    continue
+                spec = specs.get(intent.array)
+                if spec is not None and not is_pod_written_slot_array(
+                    spec, time_coord_name=self._time_coord_name
+                ):
+                    continue
+                paths.add(f"{group_name}/{intent.array}")
+        return sorted(paths)
 
     @staticmethod
     def _should_suppress_static_intent(
@@ -1053,27 +1136,38 @@ class IndexedRegionStrategy:
         - marker present → committed previously: the incoming data must replay
           the identical bytes (NaN/NaT-aware via ``equal_nan=True``), else
           `SchemaDriftError`. Re-writing is skipped on an exact match.
+
+        Marker check, comparison, write and marker stamp run as one
+        transaction under the writer's lock on the whole array, so concurrent
+        batches of one run (``pipeline_workers``) take it in turn within the
+        process. The array is opened inside the lock. The batch that takes the
+        lock second finds the marker and compares as a resume does: an
+        identical payload is a no-op, a different one raises
+        `SchemaDriftError`. Which payload stays depends on scheduling.
         """
         arr_path = f"{intent.group}/{intent.array}"
         # callable() is the right duck-type check; typing.Callable would treat
         # some numpy objects with __call__ descriptors as lazy payloads.
         data = cast(np.ndarray, intent.data() if callable(intent.data) else intent.data)
+        if writer.verify_engine_written_coordinate(intent.group, intent.array, data):
+            return  # preallocate's coordinate: verified, neither written nor marked
         root = writer._open_root()
-        try:
-            arr = root[arr_path]
-        except KeyError:
-            arr = None
-        if arr is not None and bool(arr.attrs.get(_STATIC_WRITTEN_ATTR, False)):
-            # ``[...]`` reads every rank; ``[:]`` raises IndexError on 0-d arrays.
-            existing = np.asarray(arr[...])
-            if not _arrays_equal_missing_aware(existing, data):
-                raise SchemaDriftError(
-                    f"Static array {arr_path!r} diverged from existing data on "
-                    "resume. Re-ingest from scratch; static arrays are write-once."
-                )
-            return
-        writer.write_static(group=intent.group, array_name=intent.array, data=data)
-        root[arr_path].attrs[_STATIC_WRITTEN_ATTR] = True
+        with writer._hold_array(arr_path):
+            try:
+                arr = root[arr_path]  # read after the lock: another batch may have stamped it
+            except KeyError:
+                arr = None
+            if arr is not None and bool(arr.attrs.get(_STATIC_WRITTEN_ATTR, False)):
+                existing = np.asarray(arr[...])  # [...] also reads a rank-0 array
+                if not _arrays_equal_missing_aware(existing, data):
+                    raise SchemaDriftError(
+                        f"Static array {arr_path!r} diverged from existing data on "
+                        "resume, or from another batch of this run. Re-ingest from "
+                        "scratch; static arrays are write-once."
+                    )
+                return
+            writer.write_static(group=intent.group, array_name=intent.array, data=data)
+            root[arr_path].attrs[_STATIC_WRITTEN_ATTR] = True
 
     @staticmethod
     def _dispatch_intent(writer: RegionZarrWriter, intent: Any) -> None:

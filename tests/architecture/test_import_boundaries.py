@@ -26,8 +26,11 @@ ALLOWED_TEMPLATES_FIRECUBE_PREFIXES = (
     "firecube.core.indexed_write",  # IndexedWrite dataclass lives in core; imported by direct_zarr compiler
     "firecube.core.slot_index",  # direct import avoids circular-load via firecube.core.api
     "firecube.core.uris",
+    "firecube.core.zarr._layout",  # creation layout of DirectZarr arrays (schema setup)
     "firecube.core.zarr.codec_pipeline",
+    "firecube.core.zarr.engine_owned",  # pod-side engine-owned checks (DirectZarr)
     "firecube.core.zarr.region_writer",
+    "firecube.core.zarr.unit_ownership",  # stored-unit and staged-coverage checks (DirectZarr)
     "firecube.ingestor.api",
     "firecube.ingestor.config",
     "firecube.ingestor.extensions",

@@ -19,7 +19,7 @@ import contextvars
 import json
 import shutil
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, SupportsIndex, cast
@@ -197,12 +197,19 @@ class StorageSession:
         from firecube.core.filesystem.protocol import Multipart  # pyright: ignore[reportAttributeAccessIssue]  # noqa: I001
 
         file_size = local_path.stat().st_size
-        fs = self.fs()
-        if file_size > multipart_threshold and Multipart in cast(Any, fs).capabilities():
-            cast(Any, fs).multipart_upload(str(local_path), dst.to_str())
-            return file_size
-        with local_path.open("rb") as src_handle, cast(Any, fs).open(dst, "wb") as dst_handle:
-            shutil.copyfileobj(src_handle, dst_handle)
+        fs = cast(Any, self.fs())
+        if file_size > multipart_threshold and Multipart in fs.capabilities():
+
+            def _write(target: StorageUri) -> None:
+                fs.multipart_upload(str(local_path), target.to_str())
+
+        else:
+
+            def _write(target: StorageUri) -> None:
+                with local_path.open("rb") as src_handle, fs.open(target, "wb") as dst_handle:
+                    shutil.copyfileobj(src_handle, dst_handle)
+
+        _publish_object(fs, dst, _write)
         return file_size
 
     def upload_tree(
@@ -373,13 +380,40 @@ def _upload_tree_upload_file(
 
     file_size = file_path.stat().st_size
     if file_size > multipart_threshold:
-        if not _upload_tree_multipart(fs, file_path, dst_uri.to_str()):
-            raise RuntimeError(f"multipart upload helper returned False for {file_path!s}")
-        return file_size, 1
 
-    with file_path.open("rb") as src_handle, fs.open(dst_uri, "wb") as dst_handle:
-        shutil.copyfileobj(src_handle, dst_handle)
+        def _write(target: StorageUri) -> None:
+            if not _upload_tree_multipart(fs, file_path, target.to_str()):
+                raise RuntimeError(f"multipart upload helper returned False for {file_path!s}")
+
+    else:
+
+        def _write(target: StorageUri) -> None:
+            with file_path.open("rb") as src_handle, fs.open(target, "wb") as dst_handle:
+                shutil.copyfileobj(src_handle, dst_handle)
+
+    _publish_object(fs, dst_uri, _write)
     return file_size, 1
+
+
+def _publish_object(fs: Any, dst_uri: StorageUri, write: Callable[[StorageUri], None]) -> None:
+    """Hand ``write`` to the driver's ``AtomicPublish`` capability, or run it in place.
+
+    The capability is looked up through ``capabilities()``, not ``isinstance``:
+    the metrics proxy (``InstrumentedFilesystem``) forwards attributes with
+    ``__getattr__``, which a runtime-protocol ``isinstance`` does not see, so an
+    ``isinstance`` test would silently fall back to the in-place write whenever
+    filesystem metrics are active.
+
+    The driver decides what atomic means for ``dst_uri`` (a hidden temporary and
+    a rename for a local target, a direct write for an object store); see
+    ``AtomicPublish.publish_atomic``.
+    """
+    from firecube.core.filesystem.protocol import AtomicPublish
+
+    if AtomicPublish in fs.capabilities():
+        fs.publish_atomic(dst_uri, write)
+    else:
+        write(dst_uri)
 
 
 def _upload_tree_multipart(fs: Any, local_path: Path, remote_path: str) -> bool:

@@ -19,6 +19,7 @@ Not part of firecube.core.api or firecube.ingestor.api.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from firecube.core.storage.uri import StorageUri
@@ -115,6 +116,24 @@ class Multipart(Protocol):
         *,
         part_size: int = 64 * 1024 * 1024,
     ) -> None: ...
+
+
+@runtime_checkable
+class AtomicPublish(Protocol):
+    """Whole-object publication capability for storage drivers."""
+
+    def publish_atomic(self, dst_uri: StorageUri, write: Callable[[StorageUri], None]) -> None:
+        """Run ``write`` so a concurrent reader of ``dst_uri`` sees the old or the new object.
+
+        ``write`` receives the URI to write to and must write the complete
+        object there. For a local (``file``) target the driver hands it a
+        hidden reserved temporary beside ``dst_uri`` and renames that onto
+        ``dst_uri`` afterwards, keeping an existing regular file's permission
+        bits; the temporary is removed if ``write`` or the rename fails. For a
+        remote target the store already publishes a PUT or completed multipart
+        upload whole, so ``write`` receives ``dst_uri`` itself.
+        """
+        ...
 
 
 @runtime_checkable

@@ -411,6 +411,19 @@ def _is_coordinate_chunk(path: str, coords: list[str] | None) -> bool:
     return any(parts[i] in coords and parts[i + 1] == "c" for i in range(len(parts) - 2))
 
 
+def _is_in_flight_write(path: str) -> bool:
+    """True for a temporary that a concurrent writer has not yet renamed into place.
+
+    Covers firecube's reserved publication temporaries and zarr ``LocalStore``'s
+    ``<key>.<uuid>.partial`` files. Under a coordinate's ``c/`` prefix either
+    would otherwise match ``_is_coordinate_chunk``, be seeded into the
+    workspace and published back to the target as a stray object.
+    """
+    from firecube.core.filesystem.publication import is_publication_temp
+
+    return is_publication_temp(path) or path.rstrip("/").endswith(".partial")
+
+
 def _seed_group_via_session(
     *,
     session: StorageSession,
@@ -438,12 +451,15 @@ def _seed_group_via_session(
     files_to_copy = [
         entry
         for entry in all_entries
-        if entry.path.endswith("zarr.json")
-        or _is_coordinate_chunk(
-            entry.path[len(final_root) + 1 :]
-            if entry.path.startswith(f"{final_root}/")
-            else entry.path.lstrip("/"),
-            coordinate_arrays,
+        if not _is_in_flight_write(entry.path)
+        and (
+            entry.path.endswith("zarr.json")
+            or _is_coordinate_chunk(
+                entry.path[len(final_root) + 1 :]
+                if entry.path.startswith(f"{final_root}/")
+                else entry.path.lstrip("/"),
+                coordinate_arrays,
+            )
         )
     ]
     if not files_to_copy:

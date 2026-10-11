@@ -126,6 +126,9 @@ Discovery makes `inspect_item` load-bearing. It must follow three rules:
 - Return `ItemInfo(coordinate=timestamp)` for every item that belongs in the
   cube.
 - Return `None` to skip an item entirely.
+- Add `values={"<array name>": <scalar>}` when the schema has engine-owned
+  per-slot arrays; see
+  [Per-Slot Scalars](direct-zarr.md#per-slot-scalars).
 - Return `ItemInfo(coordinate=None)` only when the item exists but its
   timestamp cannot be read; Firecube then fails discovery loudly instead of
   writing a cube with a hole.

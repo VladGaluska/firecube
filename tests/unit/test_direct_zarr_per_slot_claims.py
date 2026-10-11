@@ -28,6 +28,7 @@ from firecube.ingestor.runtime.zarr.strategies.indexed_region import IndexedRegi
 from firecube.ingestor.templates.direct_zarr import (
     DirectZarrIngestor,
     WriteIntent,
+    ZarrArraySpec,
     ZarrGroupSpec,
 )
 from tests.helpers.storage import make_test_binding
@@ -47,7 +48,11 @@ class _DummyDirectIngestor(DirectZarrIngestor):
         raise NotImplementedError
 
     def zarr_schema(self, ctx):
-        return [ZarrGroupSpec(group="F024", arrays=[])]
+        return [
+            ZarrGroupSpec(
+                group="F024", arrays=[ZarrArraySpec(name="data", shape=(8, 1), dtype="float32")]
+            )
+        ]
 
     def build_write_intents(self, batch, ctx):
         return self._intents

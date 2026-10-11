@@ -111,6 +111,18 @@ def _chunk_alignment_message(
     )
 
 
+def _alignment_shapes_by_group(
+    chunk_shapes_per_group: dict[str, list[tuple[int, ...]]],
+    shards_per_group: dict[str, list[tuple[int, ...]]] | None,
+) -> dict[str, list[tuple[int, ...]]]:
+    """Return chunk and shard shapes per group, keeping groups with only shards."""
+    groups = [*chunk_shapes_per_group, *(shards_per_group or {})]
+    return {
+        group: [*chunk_shapes_per_group.get(group, []), *(shards_per_group or {}).get(group, [])]
+        for group in dict.fromkeys(groups)
+    }
+
+
 def validate_chunk_alignment(
     slot_start: int,
     slot_end: int,
@@ -123,9 +135,10 @@ def validate_chunk_alignment(
     Terminal partial chunks are allowed when ``slot_end`` matches the group's
     global expected total.
     """
-    for group, chunk_shapes in chunk_shapes_per_group.items():
+    for group, alignment_shapes in _alignment_shapes_by_group(
+        chunk_shapes_per_group, shards_per_group
+    ).items():
         group_total = (global_expected or {}).get(group)
-        alignment_shapes = [*chunk_shapes, *(shards_per_group or {}).get(group, [])]
         misaligned_shapes = [
             shape
             for shape in alignment_shapes
@@ -150,9 +163,10 @@ def warn_if_misaligned(
     Terminal partial chunks are allowed when ``slot_end`` matches the group's
     global expected total.
     """
-    for group, chunk_shapes in chunk_shapes_per_group.items():
+    for group, alignment_shapes in _alignment_shapes_by_group(
+        chunk_shapes_per_group, shards_per_group
+    ).items():
         group_total = (global_expected or {}).get(group)
-        alignment_shapes = [*chunk_shapes, *(shards_per_group or {}).get(group, [])]
         misaligned_shapes = [
             shape
             for shape in alignment_shapes

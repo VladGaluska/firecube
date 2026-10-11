@@ -77,7 +77,7 @@ def test_write_groups_enters_claim_before_schema_initialization(monkeypatch) -> 
     )
 
     strategy = IndexedRegionStrategy(store_uri="/tmp/test.zarr", schema=[])
-    schema = [_GroupSpec(group="data", arrays=[_ArraySpec("values", (1, 2), object())])]
+    schema = [_GroupSpec(group="data", arrays=[_ArraySpec("values", (1, 2), "float32")])]
     intents = [
         SimpleNamespace(
             kind="region",

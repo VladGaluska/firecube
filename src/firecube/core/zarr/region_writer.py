@@ -30,7 +30,8 @@ import base64
 import logging
 import math
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -47,6 +48,12 @@ from firecube.core.zarr._coord_lifecycle import (
     resolve_coord_lifecycle,
 )
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
+from firecube.core.zarr._unit_locks import _UNIT_LOCKS, _store_identity, canonical_array_path
+from firecube.core.zarr.chunk_geometry import (
+    Bounds,
+    units_touched,
+)
+from firecube.core.zarr.unit_ownership import _axis_index, stored_write_unit
 
 log = logging.getLogger("firecube.core.zarr.region_writer")
 
@@ -164,13 +171,40 @@ def _array_path_exists(root: Any, group_path: str) -> bool:
 
 def _open_root_read_only(writer: RegionZarrWriter) -> Any | None:
     """Open the root group without creating missing Zarr metadata."""
+    return open_root_read_only(writer._store_uri, store=writer._store)
+
+
+def open_root_read_only(
+    store_uri: str,
+    *,
+    store: object | None = None,
+    storage_options: Mapping[str, Any] | None = None,
+) -> Any | None:
+    """Open a store's root group read-only; ``None`` when the store has no root group.
+
+    Any failure other than a missing store or root group propagates.
+
+    Args:
+        store_uri: Store URI or local path, used when ``store`` is not given.
+        store: A pre-built zarr store (for example from a storage session), or a
+            store URI that ``storage_options`` belongs to.
+        storage_options: Filesystem options for a ``store`` given as a URI.
+    """
     try:
-        if writer._store is not None:
-            return zarr.open_group(store=writer._store, mode="r", zarr_format=3)
-        if not is_remote_target(writer._store_uri):
-            store = LocalStore(str(local_path_from_target(writer._store_uri)))
-            return zarr.open_group(store=store, mode="r", zarr_format=3)
-        return zarr.open_group(store=writer._store_uri, mode="r", zarr_format=3)
+        if store is not None:
+            if storage_options is not None:
+                return zarr.open_group(
+                    store=store,
+                    storage_options=dict(storage_options),
+                    mode="r",
+                    zarr_format=3,
+                    use_consolidated=False,
+                )
+            return zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
+        if not is_remote_target(store_uri):
+            local = LocalStore(str(local_path_from_target(store_uri)))
+            return zarr.open_group(store=local, mode="r", zarr_format=3, use_consolidated=False)
+        return zarr.open_group(store=store_uri, mode="r", zarr_format=3, use_consolidated=False)
     except (FileNotFoundError, GroupNotFoundError, NodeNotFoundError):
         return None
 
@@ -424,14 +458,20 @@ class RegionZarrWriter:
             return self._root
 
         if self._store is not None:
-            self._root = zarr.open_group(store=self._store, mode="a", zarr_format=3)
+            self._root = zarr.open_group(
+                store=self._store, mode="a", zarr_format=3, use_consolidated=False
+            )
             return self._root
 
         if not is_remote_target(self._store_uri):
             store = LocalStore(str(local_path_from_target(self._store_uri)))
-            self._root = zarr.open_group(store=store, mode="a", zarr_format=3)
+            self._root = zarr.open_group(
+                store=store, mode="a", zarr_format=3, use_consolidated=False
+            )
         else:
-            self._root = zarr.open_group(store=self._store_uri, mode="a", zarr_format=3)
+            self._root = zarr.open_group(
+                store=self._store_uri, mode="a", zarr_format=3, use_consolidated=False
+            )
         return self._root
 
     @staticmethod
@@ -516,6 +556,8 @@ class RegionZarrWriter:
         filters: Sequence[Any] | None = None,
         serializer: Any | None = None,
         compressors: Sequence[Any] | None = None,
+        on_create: Callable[[Any], None] | None = None,
+        engine_attrs: Mapping[str, Any] | None = None,
     ) -> Any:
         """Ensure a group or array path exists.
 
@@ -537,6 +579,12 @@ class RegionZarrWriter:
                 created arrays. On resume, a mismatch against an existing
                 array raises `SchemaDriftError`; firecube does not
                 perform in-place dimension renames.
+            on_create: Optional callback invoked with the array only when this
+                call creates it; never invoked for an existing array.
+            engine_attrs: Engine-supplied attributes, reserved keys allowed,
+                written in the same metadata write that creates the array
+                (unlike *on_create*, which runs after it); ignored for an
+                existing array. Never pass plugin-supplied attributes here.
 
         Returns:
             Existing or newly created group/array.
@@ -604,8 +652,8 @@ class RegionZarrWriter:
             kwargs["chunks"] = chunks
         if shards is not None:
             kwargs["shards"] = shards
-        if attrs is not None:
-            kwargs["attributes"] = dict(attrs)
+        if attrs is not None or engine_attrs is not None:
+            kwargs["attributes"] = {**(attrs or {}), **(engine_attrs or {})}
         if dimension_names is not None:
             kwargs["dimension_names"] = list(dimension_names)
         if filters is not None:
@@ -618,6 +666,8 @@ class RegionZarrWriter:
         _fv_attr = _fill_value_attr_value(fill_value, dtype)
         if _fv_attr is not None and _FILL_VALUE_ATTR not in dict(arr.attrs):
             arr.attrs[_FILL_VALUE_ATTR] = _fv_attr
+        if on_create is not None:
+            on_create(arr)
         return arr
 
     def set_group_attrs(self, group: str, attrs: Mapping[str, Any] | None) -> None:
@@ -822,17 +872,66 @@ class RegionZarrWriter:
             ValueError: If target array rank is unsupported.
         """
         root = self._root if self._root is not None else self._open_root()
-        arr = root[f"{group}/{array_name}"]
+        array_path = f"{group}/{array_name}"
+        arr = root[array_path]
+        if arr.ndim not in (3, 4):
+            raise ValueError(f"Unsupported array rank for write_region: {arr.ndim}")
+        y_len = int(arr.shape[1])
+        # Any other row selector: lock every row (never fewer than written).
+        start, stop, step = y_slice.indices(y_len) if isinstance(y_slice, slice) else (0, y_len, 1)
+        rows = (start, max(start, stop)) if step > 0 else (max(stop + 1, 0), start + 1)
+        # Integer selections normalised as zarr does (-1 is the last), so two
+        # spellings of one cell take one lock.
+        slot = _axis_index(ts_index, int(arr.shape[0]))
+        bounds: list[tuple[int, int]] = [(slot, slot + 1), rows, (0, int(arr.shape[2]))]
         if arr.ndim == 4:
             if channel_index is None:
-                arr[ts_index, y_slice, :, :] = data
+                bounds.append((0, int(arr.shape[3])))
             else:
-                arr[ts_index, y_slice, :, channel_index] = data
-            return
-        if arr.ndim == 3:
-            arr[ts_index, y_slice, :] = data
-            return
-        raise ValueError(f"Unsupported array rank for write_region: {arr.ndim}")
+                channel = _axis_index(channel_index, int(arr.shape[3]))
+                bounds.append((channel, channel + 1))
+        # Write the normalised indices the locks were taken for.
+        with self._hold_units(array_path, arr, tuple(bounds)):
+            if arr.ndim == 4:
+                if channel_index is None:
+                    arr[slot, y_slice, :, :] = data
+                else:
+                    arr[slot, y_slice, :, bounds[3][0]] = data
+                return
+            arr[slot, y_slice, :] = data
+
+    def _hold_array(self, array_path: str) -> AbstractContextManager[None]:
+        """Hold this process's lock on the whole array at ``array_path``.
+
+        The same lock ``write_timestamp`` takes on an unmarked time
+        coordinate: one key per store and array, not per stored unit. Static
+        dispatch holds it across marker check, write and marker stamp, so
+        concurrent batches of one run take that transaction in turn.
+        """
+        return _UNIT_LOCKS.hold(
+            [(_store_identity(self._store_uri, self._store), canonical_array_path(array_path), ())]
+        )
+
+    def _hold_units(
+        self, array_path: str, arr: Any, bounds: Bounds
+    ) -> AbstractContextManager[None]:
+        """Hold this process's lock on every stored unit ``bounds`` touches.
+
+        Concurrent batches of one run (``pipeline_workers``) may write slots
+        that share a stored chunk or shard; each write reads the object,
+        merges and writes it back, so overlapping ones are serialised here.
+        Disjoint units never wait for each other. A time coordinate reaching
+        here has no marker, so ``write_timestamp`` may create or grow it:
+        every write to it takes that method's whole-array lock.
+        """
+        store = _store_identity(self._store_uri, self._store)
+        array_path = canonical_array_path(array_path)
+        if array_path.rsplit("/", 1)[-1] == self._time_coord_name:
+            return _UNIT_LOCKS.hold([(store, array_path, ())])
+        unit_shape, _ = stored_write_unit(arr)
+        return _UNIT_LOCKS.hold(
+            (store, array_path, unit) for unit in units_touched(bounds, unit_shape)
+        )
 
     def write_1d(
         self,
@@ -869,29 +968,88 @@ class RegionZarrWriter:
                 or if a higher-rank target receives a payload whose shape does
                 not match ``arr.shape[1:]``.
         """
-        arr = self._open_root()[f"{group}/{array_name}"]
+        array_path = f"{group}/{array_name}"
+        if self.verify_engine_written_coordinate(group, array_name, data, ts_index=ts_index):
+            return
+        arr = self._open_root()[array_path]
         payload = np.asarray(data)
 
         if arr.ndim == 1:
-            if payload.ndim == 0:
-                arr[ts_index : ts_index + 1] = payload.reshape(1)
-                return
-            if payload.size != 1:
+            if payload.ndim != 0 and payload.size != 1:
                 raise ValueError(
                     f"write_1d writes exactly one slot for 1-D targets; got "
                     f"payload with size={payload.size} for "
                     f"{group}/{array_name}"
                 )
-            arr[ts_index : ts_index + 1] = payload.reshape(1)
-            return
-
-        if payload.shape != tuple(arr.shape[1:]):
+        elif payload.shape != tuple(arr.shape[1:]):
             raise ValueError(
                 f"write_1d payload shape {payload.shape} does not match "
                 f"target arr.shape[1:]={tuple(arr.shape[1:])} for "
                 f"{group}/{array_name}"
             )
-        arr[ts_index] = payload
+        slot = _axis_index(ts_index, int(arr.shape[0]))
+        bounds = ((slot, slot + 1), *((0, int(n)) for n in arr.shape[1:]))
+        with self._hold_units(array_path, arr, bounds):
+            if arr.ndim == 1:
+                arr[slot : slot + 1] = payload.reshape(1)
+            else:
+                arr[slot] = payload
+
+    def verify_engine_written_coordinate(
+        self,
+        group: str,
+        array_name: str,
+        data: Any,
+        *,
+        ts_index: int | None = None,
+    ) -> bool:
+        """Verify, instead of writing, a payload aimed at an engine-written time coordinate.
+
+        A time coordinate whose lifecycle is ``PREALLOCATED`` or
+        ``COORD_MANAGED`` is written by ``firecube zarr preallocate`` alone;
+        pods only verify it, whatever the intent kind (mirrors
+        ``write_timestamp``). Compares *data*, cast to the stored dtype as a
+        write would cast it, with slot *ts_index* (or the whole array when
+        ``None``); NaT equals NaT.
+
+        Returns:
+            ``True`` when the target is such a coordinate and the values match
+            (the caller writes nothing); ``False`` for any other array, a
+            coordinate without a marker included, which the caller writes.
+
+        Raises:
+            SchemaDriftError: The stored values differ, or the coordinate
+                carries inconsistent markers.
+        """
+        if array_name != self._time_coord_name:
+            return False
+        array_path = f"{group}/{array_name}"
+        try:
+            arr = self._open_root()[array_path]
+        except KeyError:
+            return False
+        state = resolve_coord_lifecycle(dict(arr.attrs))
+        raise_if_invalid(state, array_path)
+        if state not in (CoordLifecycleState.PREALLOCATED, CoordLifecycleState.COORD_MANAGED):
+            return False
+        where = "every slot" if ts_index is None else f"slot {ts_index}"
+        stored = np.asarray(
+            arr[...] if ts_index is None else arr[_axis_index(ts_index, int(arr.shape[0]))]
+        )
+        try:
+            incoming = np.asarray(data() if callable(data) else data).astype(arr.dtype)
+            incoming = incoming.reshape(stored.shape)
+        except (TypeError, ValueError) as exc:
+            raise SchemaDriftError(
+                f"time coordinate {array_path!r} is written by preallocate; a write intent "
+                f"for {where} cannot be compared with it: {exc}"
+            ) from exc
+        if np.array_equal(stored, incoming, equal_nan=stored.dtype.kind in "fcmM"):
+            return True
+        raise SchemaDriftError(
+            f"time coordinate {array_path!r} ({where}) diverged: stored {stored}, incoming "
+            f"{incoming}. Preallocate writes it; pods only verify it and never overwrite it."
+        )
 
     def resolve_timestamp_index(self, group: str, timestamp_val: Any) -> int:
         """Return the existing or next compact timestamp index for *group*.
@@ -984,6 +1142,13 @@ class RegionZarrWriter:
                 f"slot {ts_index} diverged: current={current_norm!r} incoming={incoming_norm!r}."
             )
 
+        # Pre-marker coordinate: create, grow and element write all rewrite
+        # shared objects, so concurrent batches of one run take them in turn.
+        store = _store_identity(self._store_uri, self._store)
+        with _UNIT_LOCKS.hold([(store, canonical_array_path(timestamp_path), ())]):
+            self._write_legacy_timestamp(group, ts_index, timestamp_val)
+
+    def _write_legacy_timestamp(self, group: str, ts_index: int, timestamp_val: Any) -> None:
         normalized = self._normalize_timestamp_value(timestamp_val)
         timestamp_arr = self.ensure_group(
             f"{group}/{self._time_coord_name}",
@@ -1028,7 +1193,12 @@ class RegionZarrWriter:
             KeyError: If the array does not exist in the store.
             ValueError: If ``data.ndim`` or ``data.shape`` does not match the
                 stored array.
+            SchemaDriftError: The target is a preallocated or coord-managed
+                time coordinate holding other values (see
+                ``verify_engine_written_coordinate``).
         """
+        if self.verify_engine_written_coordinate(group, array_name, data):
+            return
         root = self._open_root()
         arr_path = f"{group}/{array_name}"
         if arr_path not in root:

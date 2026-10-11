@@ -75,5 +75,8 @@ def test_item_info_rejects_group_keyword() -> None:
         index_spec.ItemInfo(coordinate="x", group="g")  # type: ignore[call-arg]
 
 
-def test_item_info_has_single_field() -> None:
-    assert {field.name for field in dataclasses.fields(index_spec.ItemInfo)} == {"coordinate"}
+def test_item_info_fields_are_coordinate_and_values() -> None:
+    assert {field.name for field in dataclasses.fields(index_spec.ItemInfo)} == {
+        "coordinate",
+        "values",
+    }

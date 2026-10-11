@@ -204,6 +204,89 @@ element types mix freely in one returned list. See
 [Plugin Templates](../../reference/templates.md#firecube.ingestor.api.DirectZarrIngestor.build_write_intents) for
 the full contract.
 
+### Pick Chunks For Pod-Written Arrays
+
+The example uses `chunks=(1, 4)` for `value`: one slot per chunk, so any slot
+range is safe. See
+[Configure Zarr Chunking](configure-zarr-chunking.md#in-a-directzarringestor-schema)
+for the defaults and how to override them.
+
+### Per-Slot Scalars
+
+Use an engine-owned array for a value that you know per slot from the item
+header, such as a platform position. Workers never write it. `firecube zarr
+preallocate` writes it once.
+
+Set `engine_owned=True` on a rank-1 time-indexed array. Do not set it on the
+time coordinate. The group needs a known time extent.
+
+```python
+ZarrArraySpec(
+    name="platform_lon",
+    shape=(n_times,),
+    dtype=np.float64,
+    fill_value=float("nan"),
+    dimension_names=("timestamp",),
+    engine_owned=True,
+)
+```
+
+Return the scalar of each engine-owned array in `ItemInfo.values` for every
+item. Each key must name an engine-owned array. Items that map to the same
+slot must agree.
+
+```python
+def read_platform_longitude(path: Path) -> float:
+    with xr.open_dataset(path) as product:
+        return float(product.attrs["platform_lon"])
+
+
+def inspect_item(self, item: object, ctx: PluginContext) -> ItemInfo | None:
+    path = ctx.materialize(item)
+    timestamp, _ = read_product_item(path)
+    return ItemInfo(
+        coordinate=timestamp,
+        values={"platform_lon": read_platform_longitude(path)},
+    )
+```
+
+`build_write_intents` does not change. It still writes only the arrays that
+workers write.
+
+Firecube stores each value in the dtype of its array. A float array rounds a
+finite number to the nearest value its dtype holds, and accepts NaN and
+infinity. `firecube zarr preallocate` refuses a value it cannot store without
+changing it, before it creates or writes any array:
+
+- NaN or infinity for an integer array.
+- A fraction (such as `2.5`) or a number outside the dtype's range for an
+  integer array. A whole float such as `3.0` is accepted.
+- Anything but a `bool` or `numpy.bool_` for a bool array. The integer `1` is
+  refused.
+- A finite number too large for a float array, such as `1e300` for `float32`,
+  because it would be stored as infinity.
+
+The message names the array, the item, the value and the reason, for example
+`which cannot be stored as int32: not a whole number`.
+
+Firecube reads `ItemInfo.values` only when the schema declares an engine-owned
+array. Without one, it ignores `values` and does not check its keys.
+
+Run `firecube zarr preallocate` with `--input-data` before ingest. Run it once
+for the whole product, without slot flags. Rerun it after an interruption or
+when new source slots arrive. Do not change the ownership of an array in an
+existing product.
+
+Workers reject writes to slots that preallocate did not fill. They do not
+compare `ItemInfo.values` during ingest. To check an incoming value, emit a
+slot write intent for the array. Firecube compares that value with the stored
+value. A mismatch fails the batch.
+
+See [Run Parallel Zarr Writes](../../operations/parallel-zarr-writes.md#1-preallocate-the-product)
+for the operator steps and
+[`ZarrArraySpec`](../../reference/templates.md#firecube.ingestor.api.ZarrArraySpec)
+for the full field reference.
+
 ## Verify
 
 Run one ingest against a small input and confirm the store is written:
@@ -230,6 +313,13 @@ worker per range. That is an operator workflow with its own page:
 [MTG FCI L1C benchmark notebook](../../showcase/mtg-fci-l1c-benchmarks.ipynb)
 reproduces the parallel setup with a public plugin and real observations.
 
+Each worker must own disjoint ranges of whole stored units. A stored unit is a
+shard for a sharded array. Otherwise, it is a chunk. Use `firecube zarr slots`
+to plan ranges. In staged mode, write every cell of each unit you touch. Use
+`--write-mode direct` for partial-unit updates. See
+[Chunk Ownership Refusals](../../operations/parallel-zarr-writes.md#chunk-ownership-refusals)
+for the refusals and their fixes.
+
 ## Common Mistakes
 
 | Mistake | Fix |
@@ -239,6 +329,8 @@ reproduces the parallel setup with a public plugin and real observations.
 | Returning rounded slot times from `inspect_item` with `TimeAxis.observed` | Return the real observation timestamp; Firecube does the slot mapping. |
 | Sizing arrays from the input files | Use `resolved_index(ctx).size(group)` in `zarr_schema`. |
 | Importing private runtime modules | Import from `firecube.ingestor.api`. |
+| Writing a per-slot scalar from every worker into a shared chunk | Declare the array `engine_owned=True`; see [Per-Slot Scalars](#per-slot-scalars). |
+| Starting workers with ranges that split a stored chunk or shard | Plan ranges with `firecube zarr slots`. |
 | Calling `.position()` for every write by hand | Return `IndexedWrite` elements with `coordinate=` and let Firecube resolve the slot. |
 
 ## Next Steps

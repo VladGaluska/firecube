@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 
+import numpy as np
 import pytest
 
-from firecube.core.api import AUTO, IrregularTimeAxis, RegularTimeAxis
+from firecube.core.api import AUTO, IrregularTimeAxis, ItemInfo, RegularTimeAxis
 from firecube.core.index_spec import _canonical_coordinate_value
 from firecube.ingestor.api import AUTO as INGESTOR_AUTO
 
@@ -97,3 +98,13 @@ def test_canonical_coordinate_value_timezone_canonicalization(
     expected: object,
 ) -> None:
     assert _canonical_coordinate_value(value) == expected
+
+
+def test_item_info_values_are_copied_read_only_and_outside_the_hash():
+    buffer = np.array(1.5)
+    info = ItemInfo(coordinate=0, values={"lon": buffer})
+    buffer[...] = 9.0
+    assert info == ItemInfo(coordinate=0, values={"lon": 1.5})
+    assert hash(info) == hash(ItemInfo(coordinate=0))
+    with pytest.raises(TypeError):
+        info.values["lon"] = 2.0  # pyright: ignore[reportIndexIssue, reportOptionalSubscript]

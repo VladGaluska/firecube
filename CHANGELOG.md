@@ -9,6 +9,28 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Added
 
+- `ZarrArraySpec(engine_owned=True)` and `ItemInfo(values={...})` for rank-1
+  per-slot arrays in `DirectZarrIngestor` plugins. `firecube zarr preallocate`
+  inspects every source item (any time axis, `--input-data` required), writes
+  the array whole, and marks it materialized; ingest workers only verify it
+  and raise `SchemaDriftError` on a mismatch. Preallocate refuses these
+  per-slot values before it creates the array: NaN, infinity, a fraction or
+  an out-of-range number for an integer array; a value other than `bool` or
+  `numpy.bool_` for a bool array; and a finite number too large for a float
+  array. Other roundings, such as a large integer into `float32`, are not
+  refused. Ingest into a target where the
+  array is not materialized, or into a slot that preallocate did not see, is
+  refused with the preallocate command. After a failure that preallocate
+  handles itself, running it again finishes the work; a run killed outright
+  must have its claim cleared (`firecube chunks claims clear`) and its run
+  abandoned (`firecube chunks runs abandon`) before preallocate is rerun. An
+  existing array that lacks the engine-owned marker is never taken over,
+  whatever it holds: preallocate and ingest refuse it, and it must be deleted
+  and preallocated again. Ingest
+  reads the markers from the array's own metadata, so stale consolidated
+  metadata does not hide them. `firecube zarr consolidate-time-coord`,
+  append resume and validation still read consolidated metadata and can see
+  stale values.
 - `--archive-format [tensogram|zip]` option on `firecube archive create`.
   `--archive-format zip` packs a Zarr product into a single local
   `.zip` file that opens as a Zarr zip store. The default stays `tensogram`.
@@ -20,6 +42,25 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Changed
 
+- A time-indexed array that ingest workers write and that declares neither
+  `chunks=` nor `shards=` is now created with one slot per chunk. Zarr's own
+  chunks for the whole array are kept, without a warning, when they already
+  hold one slot each; otherwise the array gets time chunk 1 (other dimensions
+  chosen by Zarr for one slot, unsharded) instead of one dense chunk, and a
+  warning names the chosen chunks when Firecube changes Zarr's choice. An array
+  that declares `shards=` keeps them. The time coordinate and engine-owned
+  arrays keep dense chunks; existing arrays keep their layout.
+- Slot-window workers now check the chunk or shard layout stored in the target
+  and refuse a window that covers a stored unit only in part, including
+  stores created by earlier versions with an undeclared array. A worker also
+  refuses a write to an engine-owned array at a slot outside its window,
+  before the batch's data writes are dispatched, in direct and staged mode.
+- A `DirectZarrIngestor` write intent aimed at an array that the plugin's
+  `zarr_schema()` does not declare is now refused with `ConfigurationError`
+  before the batch's writes are dispatched, in direct and staged mode; setup
+  files under the target and `.firecube/` can already exist. It was written
+  unchecked before. Timestamp intents are exempt. Declare the array in
+  `zarr_schema()` or stop emitting intents for it.
 - `firecube archive create` no longer prints the codec on the size line of
   its summary. The line now reads `Size: <n> MB`.
 - `firecube chunks delete-span` now exits 1 when it reports errors. It
@@ -29,6 +70,53 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Fixed
 
+- `DirectZarrIngestor` no longer loses slots silently when slot-window
+  workers, `pipeline_workers` threads in one process, or staged promotion
+  shared a chunk or shard along time. Windows that would split a stored unit
+  are now refused (see Changed), and a write to a slot outside a 1-D array
+  raises `IndexError` instead of being ignored. A window that splits a shard
+  of a group that declares shards and no chunks is now refused at the start
+  of the run, before any array data or metadata is written to the target
+  (`.firecube/` run records can already exist), in direct and staged mode.
+  Writers in one process serialize per stored unit when they address a local
+  store by a file path, a `file://` URI, a symbolic link or a supplied
+  `LocalStore`. Other supplied stores are keyed by their URI label, and two
+  spellings of one remote store, such as `s3://bucket` and `s3://bucket/`, still take separate locks.
+- With `pipeline_workers` of 2 or more, two batches of one run that carried
+  different payloads for one static array (`WriteIntent.static`) could both
+  succeed, and the later silently replaced the earlier, in direct and staged
+  mode. The check, the write and the marker stamp of a static array now run
+  under one lock per array in the process. The batch that finds the array
+  already written compares its payload and fails with `SchemaDriftError` if it
+  differs, as a resume does; which payload stays depends on which batch takes
+  the lock first.
+- A `GenericZarrIngestor` refill or overwrite (`force_reingest`) could lose
+  values written within one stored chunk when Dask computed the pieces of that
+  chunk as separate tasks, leaving some slots with their old values. Dask
+  tasks are now aligned to chunk boundaries. Shards are not covered: on the
+  oldest supported xarray, a region write whose inner chunks share a shard can
+  still lose values.
+- A payload or static write intent aimed at a preallocated or coord-managed
+  time coordinate is now verified against the stored values (identical: no
+  write; different: `SchemaDriftError`) instead of overwriting them.
+- Staged runs that would promote a chunk or shard they do not write completely
+  (sparse windows, serial runs, partially written rows or channels) are
+  refused instead of resetting the unwritten cells to the fill value. A
+  staged `force_reingest` that writes a whole stored unit with nothing but
+  fill values still leaves the previous data of that unit in place on a local
+  target.
+- Concurrent staged runs into one local target no longer fail with Zstd or
+  JSON decode errors from reading a half-written file. On a local target each
+  uploaded object now replaces the old one whole, so a reader sees the old or
+  the new object. The replacement is a new file, so its owner is the user that
+  ran the promotion and a symbolic-link destination is replaced by a regular
+  file. A run killed during promotion can leave `.firecube-publish-*.tmp`
+  files to delete. Claim files that runs rewrite while they heartbeat are
+  not replaced whole, so a peer that lists claims at that moment can still
+  fail with a control-plane corruption error. A parallel upload in which one
+  object fails can still hang instead of raising. S3 and GCS uploads are
+  unchanged. See the
+  "Run Parallel Zarr Writes" operations guide.
 - `firecube chunks delete` no longer tries to delete span, run, and schema
   records from storage: their keys are not storage objects. On local products
   the attempt failed with "Missing local target base", and on S3 it deleted
@@ -53,6 +141,19 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   `IndexError` when the plugin writes a 0-d static array, such as a CF
   `spatial_ref` grid mapping (#84). The replay check now reads static
   arrays of any rank.
+- A rank-1 time-indexed array that declares `shards=` but not `chunks=`
+  (written by ingest workers, engine-owned, or the time coordinate) is now
+  created with inner chunks that divide its shards, at most 256 slots each.
+  `firecube zarr preallocate` gave a worker-written array or a time
+  coordinate on an exact or irregular axis `min(256, slots)` slots per
+  chunk, which failed with "not divisible by the shard's inner chunk size"
+  when that number did not divide the shards (for example 512 slots in
+  shards of 100). Ingest without preallocate let Zarr choose, which failed
+  the same way for many shapes. The exception is an observed time
+  coordinate (`RegularTimeAxis(mode="floor")`) that preallocate creates: it
+  is unsharded with `min(256, slots)` slots per chunk, and its declared
+  shards are not used, as before.
+  Existing arrays keep their layout, and preallocate still accepts them.
 
 ## [0.1.7] - 2026-09-19
 
@@ -887,7 +988,9 @@ the migration procedure including `firecube zarr index rebuild`.
 - `uv build`: built `firecube-0.1.1.tar.gz` and `firecube-0.1.1-py3-none-any.whl`.
 - `uv run --with twine twine check dist/*`: passed.
 
-[Unreleased]: https://github.com/eumetsat/firecube/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/eumetsat/firecube/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/eumetsat/firecube/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/eumetsat/firecube/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/eumetsat/firecube/compare/v0.1.4.post1...v0.1.5
 [0.1.4.post1]: https://github.com/eumetsat/firecube/compare/v0.1.4.post0...v0.1.4.post1
 [0.1.4.post0]: https://github.com/eumetsat/firecube/compare/v0.1.4...v0.1.4.post0

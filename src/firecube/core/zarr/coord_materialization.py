@@ -18,8 +18,8 @@ This module is the write half of the single-writer time-coordinate
 mechanism: it creates coordinate arrays, fills grid or observed values,
 stamps the sealing/ownership markers, and reconciles re-runs per slot.
 Callers hold the global coord-materialization claim for the duration of a
-materialization run; pods never write coordinate arrays (they verify via
-``RegionZarrWriter``).
+materialization run. Pods only verify a coordinate that carries a preallocate
+marker (via ``RegionZarrWriter``); an unmarked coordinate is written by pods.
 
 Progress reporting is caller-injected: functions accept a
 ``report`` callable (the CLI passes ``click.echo``) so the module stays

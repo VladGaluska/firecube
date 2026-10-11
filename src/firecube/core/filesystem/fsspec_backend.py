@@ -19,13 +19,25 @@ import errno
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from typing import Any
 
-from firecube.core.filesystem.protocol import AtomicWriter, Multipart, MultipartUploader
+from firecube.core.filesystem import publication
+from firecube.core.filesystem.protocol import (
+    AtomicPublish,
+    AtomicWriter,
+    Multipart,
+    MultipartUploader,
+)
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.uri import StorageUri
 
 log = logging.getLogger(__name__)
+
+
+def _is_listed_publication_temp(entry: Any) -> bool:
+    name = entry.get("name", "") if isinstance(entry, dict) else entry
+    return publication.is_publication_temp(str(name))
 
 
 def _is_precondition_failed(exc: BaseException) -> bool:
@@ -255,7 +267,8 @@ class FsspecFilesystem:
         return self._fs.exists(self._to_path(uri))
 
     def ls(self, uri: StorageUri, detail: bool = False) -> list:
-        return self._fs.ls(self._to_path(uri), detail=detail)
+        entries = self._fs.ls(self._to_path(uri), detail=detail)
+        return [entry for entry in entries if not _is_listed_publication_temp(entry)]
 
     def isdir(self, uri: StorageUri) -> bool:
         return self._fs.isdir(self._to_path(uri))
@@ -281,10 +294,17 @@ class FsspecFilesystem:
         )
 
     def find(self, uri: StorageUri) -> list[StorageUri]:
-        return [self._from_path(path) for path in self._fs.find(self._to_path(uri))]
+        return [
+            self._from_path(path)
+            for path in self._fs.find(self._to_path(uri))
+            if not publication.is_publication_temp(str(path))
+        ]
 
     def info(self, uri: StorageUri) -> dict:
         return self._fs.info(self._to_path(uri))
+
+    def publish_atomic(self, dst_uri: StorageUri, write: Callable[[StorageUri], None]) -> None:
+        publication.publish_atomic(dst_uri, write)
 
     @property
     def atomic_writer(self) -> AtomicWriter:
@@ -302,7 +322,7 @@ class FsspecFilesystem:
         return self._multipart_uploader
 
     def capabilities(self) -> set[type]:
-        return {Multipart}
+        return {Multipart, AtomicPublish}
 
     @classmethod
     def from_binding(cls, binding: StorageBinding) -> FsspecFilesystem:

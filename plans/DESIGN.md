@@ -125,9 +125,20 @@ These entries record audit findings that were reviewed and accepted rather than 
 
 ## Time-coordinate arrays: single-writer invariant
 
-Time-coordinate arrays are engine-owned single-writer surfaces. Ingest pods never write them.
+Arrays declared `engine_owned=True` are single-writer surfaces: ingest pods never write them. A time-coordinate array is one once `firecube zarr preallocate` has marked it (`firecube_preallocated` or `firecube_coord_managed`); pods then only verify it. A coordinate that carries neither marker (no preallocate ran, or a store from before the markers) is written by pods per slot, and two slot-disjoint processes sharing one of its chunks can lose a timestamp (see plans/TODO.md).
 
-The engine materializes coordinate values during `firecube zarr preallocate`. Pods that run later verify the stored value against the incoming coordinate and raise `SchemaDriftError` on mismatch. They never overwrite. This eliminates the read-modify-write race that the legacy per-slot chunk model exposed under parallel ingestion.
+The engine materializes coordinate values during `firecube zarr preallocate`. Pods that run later verify the stored value against the incoming coordinate and raise `SchemaDriftError` on mismatch. They never overwrite. For a marked coordinate this eliminates the read-modify-write race that the legacy per-slot chunk model exposed under parallel ingestion.
+
+The same invariant covers any rank-1 time-indexed plugin array declared `ZarrArraySpec(engine_owned=True)`. Preallocate inspects every source item (any axis kind, `--input-data` required), collects `ItemInfo.values[name]`, refuses missing, unknown and conflicting values, writes the array whole under a whole-extent materialization claim, and stamps `firecube_engine_owned`. Pods drop intents aimed at it and verify the stored value against the final target (also in staged mode, so promotion has nothing of it to write back). Ingest into a target where it is not materialized is refused, and a pod-written array later declared engine-owned is refused.
+
+### Chunk-ownership rule for pod-written arrays
+
+No two concurrent writers may read-modify-write one stored write unit (the shard if sharded, else the chunk). A chunk is a read-modify-write unit, so a shared unit loses one writer's slot silently. The rule is enforced on the stored layout, never inferred from declarations:
+
+- Creation: `core/zarr/_layout.py` decides the creation layout of every array the spec loop, pod startup and the serial path create; it is not the only creator of a coordinate. Undeclared pod-written time-indexed arrays (no chunks, no shards) keep zarr's own whole-array chunks when their time chunk is already 1 (no warning), else get time chunk 1 (zarr's heuristic for the per-slot shape, unsharded) and one warning. A shards-only declaration keeps the declared shards; a rank-1 time-indexed array (pod-written, engine-owned or the time coordinate) gets as its chunk the largest divisor of its shard that is at most `min(256, slots)`. Other declared layouts pass through; the time coordinate and engine-owned arrays without shards stay dense. Coordinate materialization creates its own coordinates (an observed regular coordinate in preallocate, or a coordinate without a spec) with `resolve_coord_chunks`, unsharded, and does not use declared shards. The default is never applied to an existing array.
+- Slot windows: at pod startup and per batch, a window covering a stored unit only partly is refused (`ConfigurationError`) before any write outside `.firecube/`. Units wholly inside the window are legal at any size. Existing unsafe stores (e.g. an undeclared array preallocated dense by an earlier version) are refused by the same rule; they are not repaired.
+- Staged runs: promotion replaces whole objects, so every promoted unit must be written completely in all dimensions (sparse writes by seeding are deferred, see TODO). Window runs are refused before batches; serial runs and partially written rows/channels are refused just before promotion, after workspace writes, with the target untouched.
+- In-process threads (`pipeline_workers`): read-modify-write of one (store, array, unit) is serialised by a per-process lock table; a run's own batches share its schema claim. A static array's marker check, write and stamp run under one whole-array lock, so a concurrent batch with a different payload raises `SchemaDriftError`. Cross-process safety is the ownership rule above, not locks.
 
 ### Axis regime table
 

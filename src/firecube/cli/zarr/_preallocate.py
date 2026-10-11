@@ -48,7 +48,7 @@ from firecube.core.observability.metrics import TelemetryService, emit_index_ens
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
-from firecube.core.zarr._coord_chunks import resolve_coord_chunks
+from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
 from firecube.core.zarr.coord_materialization import (
     array_schema_mismatches,
     axis_has_resolvable_extent,
@@ -57,8 +57,17 @@ from firecube.core.zarr.coord_materialization import (
     materialize_irregular_coord_array,
     materialize_regular_coord_array,
 )
+from firecube.core.zarr.engine_owned import (
+    collect_engine_owned_values,
+    engine_owned_adoption_error,
+    engine_owned_creation_attrs,
+    engine_owned_names_by_group,
+    is_engine_owned_reserved,
+    is_engine_owned_spec,
+    materialize_engine_owned_array,
+)
 from firecube.core.zarr.region_writer import RegionZarrWriter
-from firecube.ingestor.errors import ConfigurationError
+from firecube.ingestor.errors import ConfigurationError, SchemaDriftError
 from firecube.ingestor.registry.loader import discover_ingestors
 from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
 
@@ -372,7 +381,6 @@ def preallocate(
         _preallocate_can_record_failure = True
         schema = ingestor.zarr_schema(plugin_ctx)
         all_specs = [array for group in schema for array in group.arrays]
-        from firecube.ingestor.runtime.zarr.write import derive_effective_codecs_for_spec
         from firecube.ingestor.templates.config import (
             ZarrTemplateConfig,
             validate_zarr_specs_against_template,
@@ -398,10 +406,23 @@ def preallocate(
 
         warn_on_chunk_alignment(global_expected, schema)
 
-        from firecube.core.zarr.planning import coord_chunk_sizes_by_group
+        engine_owned_values = _discover_engine_owned_values(
+            ingestor=ingestor,
+            plugin_ctx=plugin_ctx,
+            resolved_index=resolved_index,
+            schema=schema,
+            global_expected=global_expected,
+            input_data=input_data,
+        )
+
+        from firecube.core.zarr.planning import (
+            coord_chunk_sizes_by_group,
+            engine_owned_extents_by_group,
+        )
 
         coord_chunk_sizes = coord_chunk_sizes_by_group(schema, resolved_index, windows_by_group)
-        if coord_chunk_sizes:
+        whole_extent_groups = engine_owned_extents_by_group(schema, global_expected)
+        if coord_chunk_sizes or whole_extent_groups:
             # Claim unconditionally whenever any coordinate array will be
             # materialized: the default full-extent invocation (no slot flags)
             # is the production driver's shape and must guard against
@@ -416,6 +437,7 @@ def preallocate(
                     coord_chunk_sizes=coord_chunk_sizes,
                     slot_group=None,
                     meta={"kind": "preallocate"},
+                    whole_extent_groups=whole_extent_groups,
                 )
             except BaseException:
                 _preallocate_claim_rejected = True
@@ -513,20 +535,13 @@ def preallocate(
                         effective_shape = (expected_time_count, *arr_spec.shape[1:])
                     else:
                         effective_shape = arr_spec.shape
-                    # For 1-D time-indexed coord specs with chunks=None, resolve
-                    # dense chunks up front instead of letting Zarr auto-chunking
-                    # degrade to one chunk per slot. 2-D calibration arrays keep
-                    # their declared chunks (or None) unchanged.
-                    if (
-                        arr_spec.time_indexed
-                        and arr_spec.chunks is None
-                        and len(arr_spec.shape) == 1
-                    ):
-                        effective_chunks: tuple[int, ...] | None = resolve_coord_chunks(
-                            arr_spec, expected_time_count
-                        )
-                    else:
-                        effective_chunks = arr_spec.chunks
+                    engine_owned = is_engine_owned_spec(arr_spec)
+                    layout = resolve_effective_layout(
+                        arr_spec,
+                        coord_name=ingestor.time_dim_name,
+                        time_count=expected_time_count,
+                        engine_owned=engine_owned,
+                    )
                     array_path = f"{group_name}/{arr_spec.name}"
                     if (
                         isinstance(group_axis, RegularTimeAxis)
@@ -537,12 +552,13 @@ def preallocate(
                     ):
                         continue
                     existing = existing_array(root, array_path)
+                    _refuse_ownership_change(existing, engine_owned, array_path)
                     if existing is not None:
                         mismatches = array_schema_mismatches(
                             existing=existing,
                             expected_shape=effective_shape,
                             expected_dtype=arr_spec.dtype,
-                            expected_chunks=effective_chunks,
+                            expected_chunks=_stored_chunks_to_match(arr_spec, layout, engine_owned),
                         )
                         if mismatches:
                             diff = "; ".join(mismatches)
@@ -554,24 +570,15 @@ def preallocate(
                         click.echo(f"array {array_path}: existing arrays match the plan; no-op")
                         continue
 
-                    filters, serializer, compressors = derive_effective_codecs_for_spec(
-                        arr_spec, template_config
-                    )
-
-                    writer.ensure_group(
+                    _create_array(
+                        writer,
+                        arr_spec,
                         array_path,
-                        shape=effective_shape,
-                        dtype=arr_spec.dtype,
-                        fill_value=arr_spec.fill_value,
-                        chunks=effective_chunks,
-                        attrs=arr_spec.attrs,
-                        shards=arr_spec.shards,
-                        dimension_names=arr_spec.dimension_names,
-                        filters=filters,
-                        serializer=serializer,
-                        compressors=compressors,
+                        effective_shape,
+                        layout,
+                        engine_owned,
+                        template_config,
                     )
-                    click.echo(f"array {array_path}: created")
 
                 axis = group_axis
                 if isinstance(axis, IrregularTimeAxis) and axis.values is not AUTO:
@@ -621,6 +628,8 @@ def preallocate(
                         input_data=input_data,
                         report=click.echo,
                     )
+
+                _materialize_engine_owned_arrays(root, group_name, engine_owned_values)
 
         summary = {
             "status": "ok",
@@ -743,6 +752,147 @@ def preallocate(
         finally:
             with contextlib.suppress(Exception):
                 chunk_manager.close()
+
+
+def _refuse_ownership_change(existing: Any, engine_owned: bool, array_path: str) -> None:
+    """Refuse a declaration that disagrees with the stored array's ownership marker."""
+    if existing is not None and not engine_owned and is_engine_owned_reserved(existing):
+        raise SchemaDriftError(
+            f"array {array_path!r} is engine-owned in the target but no "
+            "longer declared engine_owned=True; ownership changes are "
+            "refused. Restore the declaration, or rebuild the array."
+        )
+    if existing is not None and engine_owned and not is_engine_owned_reserved(existing):
+        # Ownership is never inferred from contents: an unmarked
+        # array is pod-written even when it holds only fill values.
+        raise engine_owned_adoption_error(array_path)
+
+
+def _stored_chunks_to_match(arr_spec: Any, layout: Any, engine_owned: bool) -> Any:
+    """Chunks an existing array must have to match the plan, or ``None`` for any."""
+    # A stored layout is never judged against the creation
+    # default: an existing undeclared array keeps its chunks.
+    # Nor is an undeclared engine-owned one: only this command
+    # writes it, under the materialization claim, so any
+    # stored layout is safe.
+    undeclared_owned = engine_owned and arr_spec.chunks is None
+    # Likewise a pod-written array declaring shards and no
+    # chunks: its inner chunks are the creation rule's, not a
+    # contract, and earlier releases chose others.
+    shards_only = layout.source == "declared" and arr_spec.time_indexed and arr_spec.chunks is None
+    return (
+        None
+        if layout.source in ("default", "zarr") or undeclared_owned or shards_only
+        else layout.chunks
+    )
+
+
+def _create_array(
+    writer: Any,
+    arr_spec: Any,
+    array_path: str,
+    effective_shape: tuple[int, ...],
+    layout: Any,
+    engine_owned: bool,
+    template_config: Any,
+) -> None:
+    """Create one missing array with its effective layout, codecs and ownership marker."""
+    from firecube.ingestor.runtime.zarr.write import derive_effective_codecs_for_spec
+
+    filters, serializer, compressors = derive_effective_codecs_for_spec(arr_spec, template_config)
+
+    writer.ensure_group(
+        array_path,
+        shape=effective_shape,
+        dtype=arr_spec.dtype,
+        fill_value=arr_spec.fill_value,
+        chunks=layout.chunks,
+        attrs=arr_spec.attrs,
+        shards=layout.shards,
+        dimension_names=arr_spec.dimension_names,
+        filters=filters,
+        serializer=serializer,
+        compressors=compressors,
+        # Marked in the write that creates it: no crash leaves
+        # an unmarked engine-owned array behind.
+        engine_attrs=engine_owned_creation_attrs() if engine_owned else None,
+    )
+    if layout.is_default:
+        warn_default_layout(array_path, layout)
+    click.echo(f"array {array_path}: created")
+
+
+def _materialize_engine_owned_arrays(
+    root: Any, group_name: str, engine_owned_values: dict[str, dict[str, dict[int, Any]]]
+) -> None:
+    """Write each engine-owned array of *group_name* whole, from the collected values."""
+    for array_name, values_by_slot in engine_owned_values.get(group_name, {}).items():
+        array_path = f"{group_name}/{array_name}"
+        materialize_engine_owned_array(
+            arr=root[array_path],
+            array_path=array_path,
+            values_by_slot=values_by_slot,
+            report=click.echo,
+        )
+
+
+def _discover_engine_owned_values(
+    *,
+    ingestor: Any,
+    plugin_ctx: Any,
+    resolved_index: Any,
+    schema: Any,
+    global_expected: dict[str, int],
+    input_data: str | None,
+) -> dict[str, dict[str, dict[int, Any]]]:
+    """Validate the engine-owned declarations and collect their values from every item.
+
+    Runs BEFORE the claim and any array creation, so bad plugin input leaves the
+    store untouched. Returns ``{}`` when the schema declares no engine-owned array. Every axis
+    kind is inspected: the values come only from ``inspect_item``, never from
+    the axis, so ``--input-data`` is required.
+    """
+    owned = engine_owned_names_by_group(schema)
+    if not owned:
+        return {}
+    paths = [f"{group}/{name}" for group, names in owned.items() for name in names]
+    for group, names in owned.items():
+        if group not in global_expected:
+            raise ConfigurationError(
+                f"engine-owned arrays {[f'{group}/{n}' for n in names]} need a bounded "
+                f"time axis for group {group!r}: set end_date or slot_count in index_spec"
+            )
+        coord_names = {ingestor.time_dim_name}
+        axis_coord = getattr(resolved_index.axis_for(group), "coordinate", None)
+        if isinstance(axis_coord, str):
+            coord_names.add(axis_coord)
+        clashing = sorted(set(names) & coord_names)
+        if clashing:
+            raise ConfigurationError(
+                f"group {group!r}: the time coordinate {clashing} cannot be engine_owned; "
+                "the engine already materializes coordinates"
+            )
+    if input_data is None:
+        raise ConfigurationError(
+            f"engine-owned arrays {paths} take their values from inspect_item on every "
+            "source item; pass --input-data so preallocate can inspect them"
+        )
+    dtypes = {
+        group_spec.group: {
+            arr_spec.name: arr_spec.dtype
+            for arr_spec in group_spec.arrays
+            if arr_spec.name in owned.get(group_spec.group, ())
+        }
+        for group_spec in schema
+        if group_spec.group in owned
+    }
+    return collect_engine_owned_values(
+        ingestor=ingestor,
+        plugin_ctx=plugin_ctx,
+        resolved_index=resolved_index,
+        dtypes=dtypes,
+        extents={group: global_expected[group] for group in dtypes},
+    )
 
 
 def _resolve_preallocate_windows(

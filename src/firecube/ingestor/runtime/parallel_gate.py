@@ -21,6 +21,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from firecube.core.index_resolve import ExtentUnknownError
+from firecube.core.zarr._layout import slot_window_layout
+from firecube.core.zarr.engine_owned import is_engine_owned_spec
 from firecube.ingestor.errors import (
     ConfigurationError,
     UnboundedAxisError,
@@ -76,7 +78,7 @@ def warn_on_chunk_alignment(
         if expected is None:
             continue
         for arr_spec in group_spec.arrays:
-            if not arr_spec.time_indexed:
+            if not arr_spec.time_indexed or is_engine_owned_spec(arr_spec):
                 continue
             alignment_shape = arr_spec.shards if arr_spec.shards is not None else arr_spec.chunks
             if alignment_shape and alignment_shape[0] > 0 and expected % alignment_shape[0] != 0:
@@ -153,17 +155,20 @@ def validate_parallel_capability(
             warn_on_chunk_alignment(global_expected, schema)
         chunk_shapes_per_group: dict[str, list[tuple[int, ...]]] = {}
         shard_shapes_per_group: dict[str, list[tuple[int, ...]]] = {}
+        coord_name = ingestor._resolve_time_dim_name()
         for group_spec in schema:
-            shapes = [
-                arr_spec.chunks
+            # Windows align to the layout arrays are created with: declared
+            # layouts, and the one-slot default for undeclared pod-written arrays.
+            # Engine-owned arrays are written whole by preallocate, never by a
+            # window, so their chunks do not constrain windows.
+            layouts = [
+                layout
                 for arr_spec in group_spec.arrays
-                if arr_spec.chunks is not None and arr_spec.time_indexed
+                if not is_engine_owned_spec(arr_spec)
+                and (layout := slot_window_layout(arr_spec, coord_name=coord_name)) is not None
             ]
-            shard_shapes = [
-                arr_spec.shards
-                for arr_spec in group_spec.arrays
-                if arr_spec.shards is not None and arr_spec.time_indexed
-            ]
+            shapes = [layout.chunks for layout in layouts if layout.chunks is not None]
+            shard_shapes = [layout.shards for layout in layouts if layout.shards is not None]
             if shapes:
                 chunk_shapes_per_group[group_spec.group] = shapes
             if shard_shapes:
@@ -189,7 +194,7 @@ def validate_parallel_capability(
                 if group == slot_group
             }
 
-        if chunk_shapes_per_group:
+        if chunk_shapes_per_group or shard_shapes_per_group:
             from firecube.ingestor.types.planned_range import (
                 validate_chunk_alignment,
                 warn_if_misaligned,

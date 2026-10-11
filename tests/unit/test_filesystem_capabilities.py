@@ -19,6 +19,7 @@ import pytest
 from firecube.core.filesystem.fsspec_backend import FsspecFilesystem
 from firecube.core.filesystem.obstore_backend import ObstoreFilesystem
 from firecube.core.filesystem.protocol import (
+    AtomicPublish,
     AtomicWriter,
     Multipart,
     MultipartUploader,
@@ -42,7 +43,7 @@ def test_fsspec_capabilities_includes_multipart(tmp_path):
 def test_obstore_capabilities_includes_ranged_read(tmp_path):
     fs = ObstoreFilesystem.from_local(str(tmp_path))
 
-    assert fs.capabilities() == {Multipart, RangedRead}
+    assert fs.capabilities() == {Multipart, RangedRead, AtomicPublish}
 
 
 @pytest.mark.unit

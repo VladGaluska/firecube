@@ -18,7 +18,8 @@ The plugin must:
 
 - subclass `DirectZarrIngestor`;
 - declare `index_spec(ctx)` with a regular time axis;
-- implement `inspect_item(item, ctx)` to return `ItemInfo(coordinate=...)`;
+- implement `inspect_item(item, ctx)` to return `ItemInfo(coordinate=...)`
+  (with `values=` when the schema has engine-owned arrays);
 - declare the complete Zarr schema;
 - map source values to deterministic indexes through the resolved index.
 
@@ -64,6 +65,11 @@ so a skipped window surfaces as a loud per-slot error, never as silent data
 misplacement. `TimeAxis.grid` and `TimeAxis.explicit` axes are filled from
 the declaration alone and skip this step.
 
+For a plugin with engine-owned arrays, run preallocate with `--input-data` for
+the whole product. Omit slot flags. Finish preallocation before starting
+workers. If preallocation stops, rerun it before ingest. If new source slots
+arrive, preallocate them before ingest.
+
 Add `--dry-run` to inspect the resolved index without writing any files or
 control-plane records:
 
@@ -96,8 +102,9 @@ firecube zarr slots <plugin> \
 ```
 
 Each row contains a group and a half-open range such as `[0, 144)`. The slot
-size must align with the indexed dimension's chunk size. Omit `--format table`
-to receive the JSON plan used by schedulers.
+size must cover whole stored chunks or shards of every worker-written
+time-indexed array. Omit `--format table` to receive the JSON plan used by
+schedulers.
 
 Planning is resume-aware by default: completed ranges are excluded. Use
 `--no-resume` only when the scheduler must deliberately ignore recorded
@@ -218,6 +225,20 @@ Every planned range should have a completed run. If a retry remains blocked,
 use [ChunkManager Operations](chunk-manager/index.md) to inspect the product's
 claims.
 
+## Chunk Ownership Refusals
+
+Each worker must own disjoint ranges of whole stored units. A stored unit is a
+shard for a sharded array. Otherwise, it is a chunk. Use `firecube zarr slots`
+to plan ranges. In staged mode, write every cell of each unit you touch. Use
+`--write-mode direct` for partial-unit updates.
+
+To allow one-slot ranges, create a new array without sharding and with time
+chunk 1.
+
+Firecube does not change an existing array's layout. A slot-alignment refusal
+leaves product data unchanged. A partial-unit staged refusal leaves the target
+unchanged. See [Recover A Blocked Plan](#recover-a-blocked-plan).
+
 ## Recover A Blocked Plan
 
 Firecube refuses to emit or execute ranges when it cannot prove that the writes
@@ -228,6 +249,9 @@ are disjoint and chunk-aligned.
 | The plan reports blocked ranges | Inspect the run that recorded the coverage. Delete a span only after confirming that no worker is active. |
 | Coverage cannot be read | Fix the storage, authentication, or control-plane problem. Do not use `--no-resume` as a recovery shortcut. |
 | `WriteIntentRangeError` | Fix the plugin's source filtering or index mapping; it emitted a write outside the worker's range. |
+| `the stored chunk shape (...) puts slots [...) in one chunk object` (`shard` for a sharded array) | The worker's range splits a stored chunk or shard. Plan ranges with `firecube zarr slots`. See [Chunk Ownership Refusals](#chunk-ownership-refusals). |
+| `staged promotion replaces whole chunk objects` (`shard` for a sharded array) | The staged run does not write every cell of a unit it would promote. Write every cell of the unit in one run, or use `--write-mode direct`. |
+| `engine-owned arrays [...] are not materialized` | Preallocate has not written the per-slot arrays, or stopped before it finished. Run `firecube zarr preallocate` once with `--input-data`. |
 | An overlapping range is active | Wait for the other worker, or abandon it only after confirming that the run is stale. |
 | Preallocation reports a schema mismatch | Use the intended target or align the plugin schema with the existing product. |
 

@@ -193,6 +193,9 @@ class _LocalMirrorFs:
             local_path.parent.mkdir(parents=True, exist_ok=True)
         return local_path.open(mode)
 
+    def capabilities(self) -> set[type]:
+        return set()
+
     def makedirs(self, path: Any, exist_ok: bool = False) -> None:
         self._local_path(path).mkdir(parents=True, exist_ok=exist_ok)
 

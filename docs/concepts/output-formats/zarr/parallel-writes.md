@@ -73,7 +73,7 @@ scheduler.
 
 - The global indexed extent and schema must remain fixed for the parallel run.
 - Every worker must use the same coordinate-to-index mapping.
-- Slot boundaries must align with the physical chunks of all indexed arrays.
+- Workers must own disjoint ranges of whole stored chunks or shards. Firecube rejects ranges that split these units. Engine-owned arrays do not constrain slot ranges. Run `firecube zarr preallocate` before starting workers to fill the time coordinate. Use `firecube zarr slots` to satisfy the declared time-coordinate alignment.
 - Workers may write the same group only through their assigned ranges.
 - Schema changes during the parallel run are not supported.
 
