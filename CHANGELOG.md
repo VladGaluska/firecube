@@ -42,6 +42,10 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 - `delete-span` fills CF-encoded int64 and float time arrays (`units`
   containing `since`) with NaT. Previously it wrote the array's Zarr fill
   value, normally `0`, which decodes as the reference epoch, a valid date.
+- Resuming or force-reingesting into a DirectZarr store no longer fails with
+  `IndexError` when the plugin writes a 0-d static array, such as a CF
+  `spatial_ref` grid mapping (#84). The replay check now reads static
+  arrays of any rank.
 
 ## [0.1.7] - 2026-09-19
 
