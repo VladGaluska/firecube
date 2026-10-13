@@ -1064,7 +1064,8 @@ class IndexedRegionStrategy:
         except KeyError:
             arr = None
         if arr is not None and bool(arr.attrs.get(_STATIC_WRITTEN_ATTR, False)):
-            existing = np.asarray(arr[:])
+            # ``[...]`` reads every rank; ``[:]`` raises IndexError on 0-d arrays.
+            existing = np.asarray(arr[...])
             if not _arrays_equal_missing_aware(existing, data):
                 raise SchemaDriftError(
                     f"Static array {arr_path!r} diverged from existing data on "
