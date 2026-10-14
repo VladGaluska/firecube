@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import uuid
+from collections.abc import Iterable
 from typing import Any, cast
 
 import click
@@ -65,6 +66,13 @@ from firecube.core.zarr.engine_owned import (
     is_engine_owned_reserved,
     is_engine_owned_spec,
     materialize_engine_owned_array,
+)
+from firecube.core.zarr.metadata_authority import (
+    HeldClaim,
+    MetadataAuthority,
+    adopt_held_claim,
+    ensure_group,
+    hold_authority,
 )
 from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.errors import ConfigurationError, SchemaDriftError
@@ -504,6 +512,8 @@ def preallocate(
                 mode="a",
             ).store
 
+        store_writer = RegionZarrWriter(plugin_target, store=zarr_store)
+        _ensure_ancestors(store_writer, _preallocate_claim_handle, global_expected)
         for group_spec in schema:
             group_name = group_spec.group
             expected_time_count = global_expected.get(group_name)
@@ -521,13 +531,24 @@ def preallocate(
                 category="zarr_schema_global",
                 name=f"{group_name}:setup",
             )
-            with chunk_manager.acquire_claim(
-                product=identity.product_name,
-                domain=domain,
-                owner_id=f"preallocate:{group_name}:schema_global",
-            ):
+            owner = f"preallocate:{group_name}:schema_global"
+            # The group's metadata (arrays, coordinates, markers) changes only under the
+            # setup claim's authority; it covers the group, not the root (made above).
+            with hold_authority(
+                store_writer.metadata_scope(group_name),
+                claim=chunk_manager.acquire_claim(
+                    product=identity.product_name, domain=domain, owner_id=owner
+                ),
+                claim_domain=domain.identifier,
+                owner_id=owner,
+            ) as authority:
                 coord_names = coord_names_by_group.get(group_name, frozenset({"y", "x", "channel"}))
-                writer = RegionZarrWriter(plugin_target, store=zarr_store, coord_names=coord_names)
+                writer = RegionZarrWriter(
+                    plugin_target,
+                    store=authority.scope.backing,
+                    coord_names=coord_names,
+                    authority=authority,
+                )
                 root = writer._open_root()
                 group_axis = resolved_index.axis_for(group_name)
                 for arr_spec in group_spec.arrays:
@@ -582,16 +603,7 @@ def preallocate(
 
                 axis = group_axis
                 if isinstance(axis, IrregularTimeAxis) and axis.values is not AUTO:
-                    coord_spec = next(
-                        (
-                            spec
-                            for spec in group_spec.arrays
-                            if spec.name == axis.coordinate
-                            and spec.time_indexed
-                            and len(spec.shape) == 1
-                        ),
-                        None,
-                    )
+                    coord_spec = _coord_spec(group_spec, axis)
                     materialize_irregular_coord_array(
                         writer=writer,
                         root=root,
@@ -603,16 +615,7 @@ def preallocate(
                 elif isinstance(axis, RegularTimeAxis) and axis_has_resolvable_extent(
                     axis, resolved_index, group_name
                 ):
-                    coord_spec = next(
-                        (
-                            spec
-                            for spec in group_spec.arrays
-                            if spec.name == axis.coordinate
-                            and spec.time_indexed
-                            and len(spec.shape) == 1
-                        ),
-                        None,
-                    )
+                    coord_spec = _coord_spec(group_spec, axis)
                     materialize_regular_coord_array(
                         writer=writer,
                         root=root,
@@ -629,7 +632,7 @@ def preallocate(
                         report=click.echo,
                     )
 
-                _materialize_engine_owned_arrays(root, group_name, engine_owned_values)
+                _materialize_engine_owned_arrays(root, authority, group_name, engine_owned_values)
 
         summary = {
             "status": "ok",
@@ -822,14 +825,55 @@ def _create_array(
     click.echo(f"array {array_path}: created")
 
 
+def _ensure_ancestors(writer: RegionZarrWriter, claim: Any | None, groups: Iterable[str]) -> None:
+    """Create the root and every missing ancestor of *groups* under a store-wide authority.
+
+    A group's setup authority covers that group only and cannot create the
+    root or a parent group (``parent`` of ``parent/data``). The store-wide one
+    names the materialization claim this run holds (``claim``, a held claim
+    handle); without one it excludes this process's threads only, as the
+    writer's default authority does.
+    """
+    scope = writer.metadata_scope()
+    authority_cm = (
+        adopt_held_claim(
+            scope, HeldClaim(domain_id=claim.info.domain, owner_id=claim.info.owner_id)
+        )
+        if claim is not None
+        else hold_authority(scope, claim=None)
+    )
+    with authority_cm as authority:
+        assert scope.backing is not None  # metadata_scope binds the writer's store
+        ensure_group(authority, scope.backing, "")
+        for group in groups:  # ensure_group creates each missing level, root first
+            ensure_group(authority, scope.backing, group.strip("/").rpartition("/")[0])
+
+
+def _coord_spec(group_spec: Any, axis: Any) -> Any | None:
+    """The spec of the group's rank-1 time-indexed array named after the axis coordinate."""
+    return next(
+        (
+            spec
+            for spec in group_spec.arrays
+            if spec.name == axis.coordinate and spec.time_indexed and len(spec.shape) == 1
+        ),
+        None,
+    )
+
+
 def _materialize_engine_owned_arrays(
-    root: Any, group_name: str, engine_owned_values: dict[str, dict[str, dict[int, Any]]]
+    root: Any,
+    authority: MetadataAuthority,
+    group_name: str,
+    engine_owned_values: dict[str, dict[str, dict[int, Any]]],
 ) -> None:
-    """Write each engine-owned array of *group_name* whole, from the collected values."""
+    """Write each engine-owned array of *group_name* whole, its markers under *authority*."""
     for array_name, values_by_slot in engine_owned_values.get(group_name, {}).items():
         array_path = f"{group_name}/{array_name}"
         materialize_engine_owned_array(
             arr=root[array_path],
+            root=root,
+            authority=authority,
             array_path=array_path,
             values_by_slot=values_by_slot,
             report=click.echo,

@@ -14,13 +14,24 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import warnings
 from datetime import UTC, datetime
 
 import numpy as np
 import pytest
 import zarr
+import zarr.core.array as zarr_array
+from zarr.core.sync import sync
+from zarr.storage import LocalStore
 
+from firecube.core.zarr.guarded_write import WriteResult, unit_store_key
+from firecube.core.zarr.metadata_authority import (
+    AuthorityBasis,
+    MetadataAuthorityError,
+    hold_authority,
+)
 from firecube.core.zarr.region_writer import (
     RegionZarrWriter,
     RegionZarrWriterProtocol,
@@ -362,3 +373,358 @@ class TestProtocol:
     def test_writer_satisfies_protocol(self, store_path):
         w = RegionZarrWriter(store_path)
         assert isinstance(w, RegionZarrWriterProtocol)
+
+
+def _stored(arr, unit):
+    return bool(sync(arr.store.exists(unit_store_key(arr, unit))))
+
+
+class TestOnWrite:
+    """Every payload write goes through guarded_write and reports its WriteResult."""
+
+    @pytest.mark.parametrize(
+        ("shards", "absent", "deleted"),
+        [
+            pytest.param(
+                None,
+                [((0, 0, 0),), (), (), ((1, 0, 0),), ((0, 0, 0),)],
+                [(), (), (), ((1, 0, 0),), ((0, 0, 0),)],
+                id="chunk",
+            ),
+            pytest.param(
+                (2, 2, 2),
+                [((0, 0, 0),), (), (), (), ((0, 0, 0),)],
+                [(), (), (), (), ((0, 0, 0),)],
+                id="shard",
+            ),
+        ],
+    )
+    def test_reports_absent_and_deleted_units(self, store_path, shards, absent, deleted):
+        """All-fill into a never-stored unit is absent only; emptying a stored unit deletes it.
+
+        A shard is deleted only when its last stored inner chunk becomes all-fill.
+        """
+        seen: list[WriteResult] = []
+        writer = RegionZarrWriter(
+            store_path, write_empty_chunks=False, on_write=seen.append, track_units=True
+        )
+        writer.ensure_group(
+            "grp/img",
+            shape=(4, 2, 2),
+            dtype=np.float32,
+            fill_value=0.0,
+            chunks=(1, 2, 2),
+            shards=shards,
+        )
+        arr = writer._open_root()["grp/img"]
+
+        for slot, value in [(0, 0.0), (1, 1.0), (0, 1.0), (1, 0.0), (0, 0.0)]:
+            writer.write_region(
+                "grp", "img", slot, slice(0, 2), np.full((2, 2), value, dtype=np.float32)
+            )
+            result = seen[-1]
+            assert result.absent == tuple(u for u in result.units if not _stored(arr, u))
+
+        assert [r.tracked for r in seen] == [True] * 5
+        assert [r.absent for r in seen] == absent
+        assert [r.deleted for r in seen] == deleted
+        np.testing.assert_array_equal(arr[...], np.zeros((4, 2, 2), dtype=np.float32))
+
+    def test_every_payload_site_reports(self, store_path):
+        seen: list[WriteResult] = []
+        writer = RegionZarrWriter(store_path, on_write=seen.append)
+        writer.ensure_group("grp/img", shape=(2, 2, 2), dtype=np.float32, fill_value=0.0)
+        writer.ensure_group("grp/vec", shape=(2,), dtype=np.float32, fill_value=0.0)
+        writer.ensure_group("grp/lat", shape=(2,), dtype=np.float64, fill_value=0.0)
+        ts = np.datetime64("2024-01-01T00:00:00", "s")
+
+        writer.write_region("grp", "img", 0, slice(0, 2), np.ones((2, 2), dtype=np.float32))
+        writer.write_1d("grp", "vec", 1, np.asarray(5.0, dtype=np.float32))
+        writer.write_static("grp", "lat", np.array([1.5, 2.5]))
+        writer.write_timestamp("grp", ts_index=0, timestamp_val=ts)
+
+        assert [(r.footprint.array_path, r.footprint.box) for r in seen] == [
+            ("grp/img", ((0, 1), (0, 2), (0, 2))),
+            ("grp/vec", ((1, 2),)),
+            ("grp/lat", ((0, 2),)),
+            ("grp/timestamp", ((0, 1),)),
+        ]
+        assert [r.tracked for r in seen] == [False] * 4
+        assert all(r.units for r in seen)
+        root = writer._open_root()
+        np.testing.assert_array_equal(root["grp/vec"][...], [0.0, 5.0])
+        np.testing.assert_array_equal(root["grp/lat"][...], [1.5, 2.5])
+        assert root["grp/timestamp"][0] == ts
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_write_empty_chunks_is_the_writers_not_the_process(self, store_path, keep):
+        writer = RegionZarrWriter(store_path, write_empty_chunks=keep)
+        writer.ensure_group(
+            "grp/img", shape=(2, 2, 2), dtype=np.float32, fill_value=0.0, chunks=(1, 2, 2)
+        )
+
+        with zarr.config.set({"array.write_empty_chunks": not keep}):
+            writer.write_region("grp", "img", 0, slice(0, 2), np.zeros((2, 2), dtype=np.float32))
+            assert zarr.config.get("array.write_empty_chunks") is (not keep)
+
+        assert _stored(writer._open_root()["grp/img"], (0, 0, 0)) is keep
+
+    def test_track_units_without_on_write_is_refused(self, store_path):
+        with pytest.raises(ValueError, match="on_write"):
+            RegionZarrWriter(store_path, track_units=True)
+
+    def test_results_reach_the_sink_in_write_order_when_a_sink_is_slow(self, store_path):
+        """A slow sink cannot let a later write of the same unit be recorded first.
+
+        A stores a value in the one chunk and its sink stalls; B then empties
+        the chunk. The session must end with the chunk recorded absent, as it
+        is on disk, whatever the sinks' speed.
+        """
+        from firecube.ingestor.runtime.zarr.write_session import ZarrWriteSession
+
+        session = ZarrWriteSession(
+            product="p",
+            run_id="r",
+            write_mode="staged",
+            window=None,
+            slot_group=None,
+            acquire_claim=lambda **_kw: contextlib.nullcontext(),
+            open_root=lambda _uri: None,
+            open_final_root=lambda _ctx: None,
+        )
+        recorded: list[str] = []
+        a_in_sink, release_a = threading.Event(), threading.Event()
+
+        def sink(name: str):
+            def record(result: WriteResult) -> None:
+                if name == "A":
+                    a_in_sink.set()
+                    assert release_a.wait(10)
+                recorded.append(name)
+                session.record_write_result(result, store_uri="ws")
+
+            return record
+
+        def writer_for(name: str) -> RegionZarrWriter:
+            return RegionZarrWriter(
+                store_path, write_empty_chunks=False, on_write=sink(name), track_units=True
+            )
+
+        writer_for("setup").ensure_group(
+            "grp/img", shape=(2, 2, 2), dtype=np.float32, fill_value=0.0, chunks=(2, 2, 2)
+        )
+        errors: list[BaseException] = []
+
+        def write(name: str, value: float) -> None:
+            try:
+                writer_for(name).write_region(
+                    "grp", "img", 0, slice(0, 2), np.full((2, 2), value, dtype=np.float32)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        a = threading.Thread(target=write, args=("A", 1.0))
+        a.start()
+        assert a_in_sink.wait(10), "A never reached its sink"
+        b = threading.Thread(target=write, args=("B", 0.0))
+        b.start()
+        b.join(1.0)  # B may finish here only if the sink runs outside the unit lock
+        release_a.set()
+        a.join(10)
+        b.join(10)
+
+        assert errors == []
+        assert not _stored(_on_disk(store_path, "grp/img"), (0, 0, 0))
+        assert recorded == ["A", "B"], "results reached the sink out of write order"
+        assert session.absent_units("ws") == {"grp/img": frozenset({(0, 0, 0)})}
+        assert session.written_units("ws") == {"grp/img": frozenset({(0, 0, 0)})}
+
+
+def _on_disk(store_path, path) -> zarr.Array:
+    """The array at *path* read from the store now, not through any writer's handle."""
+    return zarr.open_array(store=LocalStore(store_path), path=path, mode="r", zarr_format=3)
+
+
+def _refusal(change) -> str:
+    """The MetadataAuthorityError message *change* raised, or ``"not refused"``."""
+    try:
+        change()
+    except MetadataAuthorityError as exc:
+        return str(exc)
+    return "not refused"
+
+
+class TestMetadataAuthority:
+    """Every zarr.json change reads the node under the writer's authority, never a stale handle."""
+
+    def test_concurrent_growth_keeps_the_larger_shape(self, store_path, monkeypatch):
+        RegionZarrWriter(store_path).ensure_group("g/t", shape=(1,), dtype="int32", fill_value=0)
+        a_in_resize, b_in_resize, a_done = threading.Event(), threading.Event(), threading.Event()
+        resize = zarr_array.Array.resize
+
+        def paused(self, *args, **kwargs):
+            if threading.current_thread().name == "A":
+                a_in_resize.set()
+                b_in_resize.wait(1)  # B gets here only without per-node exclusion
+                try:
+                    return resize(self, *args, **kwargs)
+                finally:
+                    a_done.set()
+            b_in_resize.set()
+            a_done.wait(5)  # B's resize, if it comes, lands after A's
+            return resize(self, *args, **kwargs)
+
+        monkeypatch.setattr(zarr_array.Array, "resize", paused)
+
+        def grow(n):
+            RegionZarrWriter(store_path).ensure_group(
+                "g/t", shape=(n,), dtype="int32", fill_value=0, allow_grow=True
+            )
+
+        a = threading.Thread(target=grow, args=(6,), name="A")
+        b = threading.Thread(target=grow, args=(3,), name="B")
+        a.start()
+        assert a_in_resize.wait(5)
+        b.start()
+        a.join(10)
+        b.join(10)
+
+        assert _on_disk(store_path, "g/t").shape == (6,)
+
+    def test_array_creation_is_one_metadata_write(self, store_path, monkeypatch):
+        follow_ups: list[list[str]] = []
+
+        def crash(self, new_attributes):
+            follow_ups.append(sorted(new_attributes))
+            raise RuntimeError("simulated crash after the array's first metadata write")
+
+        monkeypatch.setattr(zarr_array.Array, "update_attributes", crash)
+        writer = RegionZarrWriter(store_path)
+        with contextlib.suppress(RuntimeError):
+            writer.ensure_group(
+                "g/a",
+                shape=(2,),
+                dtype="int32",
+                fill_value=7,
+                attrs={"units": "K"},
+                engine_attrs={"firecube_engine_owned": True},
+            )
+
+        assert dict(_on_disk(store_path, "g/a").attrs) == {
+            "_FillValue": 7,
+            "units": "K",
+            "firecube_engine_owned": True,
+        }
+        assert follow_ups == []
+
+    def test_no_stale_handle_is_written(self, store_path, monkeypatch):
+        """A marker stamped while a growth is in flight survives it, and the growth survives it."""
+        writer = RegionZarrWriter(store_path)
+        writer.ensure_group("g/a", shape=(2,), dtype="int32", fill_value=0)
+        in_resize, stamped = threading.Event(), threading.Event()
+        resize = zarr_array.Array.resize
+
+        def paused(self, *args, **kwargs):
+            in_resize.set()
+            stamped.wait(1)  # the stamp lands first only without per-node exclusion
+            return resize(self, *args, **kwargs)
+
+        monkeypatch.setattr(zarr_array.Array, "resize", paused)
+
+        def stamp():
+            assert in_resize.wait(5)
+            writer.update_array_attrs("g/a", {"firecube_static_written": True})
+            stamped.set()
+
+        stamper = threading.Thread(target=stamp)
+        stamper.start()
+        writer.ensure_group("g/a", shape=(5,), dtype="int32", fill_value=0, allow_grow=True)
+        stamper.join(10)
+
+        stored = _on_disk(store_path, "g/a")
+        assert stored.shape == (5,)
+        assert dict(stored.attrs) == {"_FillValue": 0, "firecube_static_written": True}
+        assert writer.update_array_attrs("g/a", {}).shape == (5,)  # the node as stored
+
+    def test_default_authority_is_process_local_over_the_whole_store(self, tmp_path):
+        writer = RegionZarrWriter(str(tmp_path / "fresh.zarr"))
+
+        assert writer.authority.basis is AuthorityBasis.PROCESS_LOCAL
+        assert writer.authority.scope.prefix == ""
+        assert writer.authority.scope.store == str((tmp_path / "fresh.zarr").resolve())
+        writer.ensure_group("g")  # creates the missing root under it
+        assert (tmp_path / "fresh.zarr" / "zarr.json").is_file()
+
+    @pytest.mark.parametrize("released", [True, False], ids=["released", "group-scoped"])
+    def test_refused_authority_leaves_a_fresh_store_without_zarr_json(self, tmp_path, released):
+        uri = str(tmp_path / "fresh.zarr")
+        scope = RegionZarrWriter(uri).metadata_scope("" if released else "g")
+        with hold_authority(scope, claim=None) as authority:
+            writer = RegionZarrWriter(uri, authority=authority)
+            if not released:  # only a store-wide authority may create the root group
+                with pytest.raises(MetadataAuthorityError, match="outside the scope"):
+                    writer.ensure_group("g/a", shape=(2,), dtype="int32", fill_value=0)
+        if released:
+            with pytest.raises(MetadataAuthorityError, match="was released"):
+                writer.ensure_group("g/a", shape=(2,), dtype="int32", fill_value=0)
+            with pytest.raises(MetadataAuthorityError, match="was released"):
+                writer.set_group_attrs("g", {"title": "t"})
+
+        assert list(tmp_path.rglob("zarr.json")) == []
+
+    @pytest.mark.parametrize(
+        ("call", "group"),
+        [
+            pytest.param(
+                lambda w, auth: w.ensure_group(
+                    "g/a", shape=(2,), dtype="int32", fill_value=0, authority=auth
+                ),
+                False,
+                id="ensure_group-array",
+            ),
+            pytest.param(lambda w, auth: w.ensure_group("g", authority=auth), False, id="group"),
+            pytest.param(lambda w, auth: w.ensure_group("", authority=auth), False, id="root"),
+            pytest.param(
+                lambda w, auth: w.set_group_attrs("g", {"title": "t"}, authority=auth),
+                False,
+                id="set_group_attrs",
+            ),
+            pytest.param(
+                lambda w, auth: w.update_array_attrs("g/a", {"k": 1}, authority=auth),
+                False,
+                id="update_array_attrs",
+            ),
+            pytest.param(
+                lambda w, auth: w.ensure_group(
+                    "g/a", shape=(2,), dtype="int32", fill_value=0, authority=auth
+                ),
+                True,
+                id="group-scoped-ensure_group-array",
+            ),
+            pytest.param(
+                lambda w, auth: w.set_group_attrs("g", {"title": "t"}, authority=auth),
+                True,
+                id="group-scoped-set_group_attrs",
+            ),
+        ],
+    )
+    def test_refused_call_authority_leaves_a_fresh_store_without_zarr_json(
+        self, tmp_path, call, group
+    ):
+        """A per-call authority is the one root creation runs under: refused, nothing is written."""
+        uri = str(tmp_path / "fresh.zarr")
+        writer = RegionZarrWriter(uri)  # its own authority is active and store-wide
+        with hold_authority(writer.metadata_scope("g" if group else ""), claim=None) as auth:
+            if group:  # active, but cannot create the root group
+                assert "outside the scope" in _refusal(lambda: call(writer, auth))
+        if not group:
+            assert "was released" in _refusal(lambda: call(writer, auth))
+
+        assert list(tmp_path.rglob("zarr.json")) == []
+
+    def test_released_call_authority_is_refused_on_an_existing_root(self, store_path):
+        writer = RegionZarrWriter(store_path)
+        with hold_authority(writer.metadata_scope(), claim=None) as auth:
+            pass
+
+        assert "was released" in _refusal(lambda: writer.ensure_group("", authority=auth))

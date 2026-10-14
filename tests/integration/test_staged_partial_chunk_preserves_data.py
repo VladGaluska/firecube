@@ -37,14 +37,26 @@ on plain resume-appends (NO ``force_reingest``):
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 import xarray as xr
+import zarr
+from click.testing import CliRunner
 
-from firecube.ingestor.api import GenericZarrIngestor, PluginContext
+from firecube.cli.main import cli
+from firecube.core.api import IndexedWrite, IndexSpec, ItemInfo, RegularTimeAxis
+from firecube.ingestor.api import (
+    DirectZarrIngestor,
+    GenericZarrIngestor,
+    PluginContext,
+    ZarrArraySpec,
+    ZarrGroupSpec,
+)
+from firecube.ingestor.registry import loader as _loader
 from tests.helpers.storage import make_test_context
 
 pytestmark = pytest.mark.integration
@@ -226,3 +238,221 @@ def test_multi_batch_resume_append_preserves_first_write_attrs_engine_driven(
             f"layout_tags should round-trip to list ['weather','eu'], got "
             f"{ds.attrs.get('layout_tags')!r}"
         )
+
+
+# --- DirectZarr staged promotion of units rewritten to the fill value -----------------
+#
+# Zarr stores no object for a unit whose every cell equals the fill value, so a
+# staged run that rewrites a whole unit to fill leaves nothing in the workspace
+# for it. Promotion must delete the target's old object rather than keep it.
+
+_FILL_SLOTS = 8
+_FILL_EPOCH = np.datetime64("2026-01-01T00:00:00", "ns")
+_FILL_STEP = np.timedelta64(300, "s").astype("timedelta64[ns]")
+# What the inline plugin writes this run: {"group", "shards", "values": {slot: value}}.
+_FILL_RUN: dict[str, Any] = {}
+
+
+class _StagedFillDirectZarr(DirectZarrIngestor):
+    """One ``values`` array (time chunk 2, fill 0.0), one region write per slot."""
+
+    PRODUCT_NAME: ClassVar[str] = "staged_fill_direct"
+
+    def discover_source_files(self, ctx: PluginContext) -> list[int]:
+        return sorted(_FILL_RUN["values"])
+
+    def index_spec(self, ctx: PluginContext) -> IndexSpec:
+        axis = RegularTimeAxis(
+            coordinate="timestamp",
+            epoch="2026-01-01T00:00:00Z",
+            cadence_s=300,
+            mode="exact",
+            slot_count=_FILL_SLOTS,
+        )
+        return IndexSpec(name="staged_fill_v1", groups={_FILL_RUN["group"]: axis})
+
+    def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo:
+        return ItemInfo(coordinate=_FILL_EPOCH + int(item) * _FILL_STEP)
+
+    def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+        values = ZarrArraySpec(
+            name="values",
+            shape=(_FILL_SLOTS, 2, 2),
+            dtype="float32",
+            chunks=(2, 2, 2),
+            shards=_FILL_RUN["shards"],
+            fill_value=0.0,
+            expected_time_count=_FILL_SLOTS,
+            time_indexed=True,
+            dimension_names=("timestamp", "y", "x"),
+        )
+        return [ZarrGroupSpec(group=_FILL_RUN["group"], arrays=[values])]
+
+    def build_write_intents(self, batch: Any, ctx: PluginContext) -> list[Any]:
+        return [
+            IndexedWrite.region(
+                group=_FILL_RUN["group"],
+                array="values",
+                coordinate=_FILL_EPOCH + int(slot) * _FILL_STEP,
+                data=np.full((2, 2), _FILL_RUN["values"][int(slot)], dtype=np.float32),
+                y_slice=slice(0, 2),
+            )
+            for slot in batch.items
+        ]
+
+
+@pytest.fixture
+def _staged_fill_plugin() -> Iterator[None]:
+    """Register the inline plugin for the CLI; restore the registry afterwards."""
+    original_loaded = _loader._LOADED
+    original_registry = dict(_loader.AVAILABLE_INGESTORS)
+    _loader._LOADED = False
+    _loader.AVAILABLE_INGESTORS.clear()
+    _loader.AVAILABLE_INGESTORS["staged_fill_direct"] = _StagedFillDirectZarr
+    _StagedFillDirectZarr.name = "staged_fill_direct"
+    _loader._LOADED = True
+    yield
+    _loader._LOADED = original_loaded
+    _loader.AVAILABLE_INGESTORS.clear()
+    _loader.AVAILABLE_INGESTORS.update(original_registry)
+
+
+def _fill_ingest(target: Path, driver: str, write_mode: str, values: dict[int, float]) -> None:
+    _FILL_RUN["values"] = values
+    args = [
+        "ingest",
+        "staged_fill_direct",
+        "--target",
+        f"file://{target}",
+        "--product-name",
+        "staged_fill_direct",
+        "--storage-type",
+        "local",
+        "--storage-driver",
+        driver,
+        "--output-format",
+        "zarr",
+        "--write-mode",
+        write_mode,
+        "--option",
+        "no_progress=true",
+    ]
+    if write_mode == "staged":
+        args += ["--option", "force_reingest=true"]
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, f"{write_mode} ingest failed:\n{result.output}"
+
+
+def _objects(root: Path) -> dict[str, tuple[int, int, int]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_ino,
+            path.stat().st_mtime_ns,
+            path.stat().st_size,
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and ".firecube" not in path.parts
+    }
+
+
+@pytest.mark.parametrize(
+    ("group", "shards", "driver", "subdir", "staged", "expected", "removed", "untouched"),
+    [
+        pytest.param(
+            "data",
+            None,
+            "fsspec",
+            "",
+            dict.fromkeys(range(8), 0.0),
+            [0.0] * 8,
+            ["c/0/0/0", "c/1/0/0", "c/2/0/0", "c/3/0/0"],
+            [],
+            id="chunk-allfill",
+        ),
+        pytest.param(
+            "data",
+            None,
+            "fsspec",
+            "",
+            # units [0,1] rewritten, [2,3] -> fill, [4,5] partly fill (kept), [6,7] untouched
+            {0: 20.0, 1: 21.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 7.0},
+            [20.0, 21.0, 0.0, 0.0, 0.0, 7.0, 16.0, 17.0],
+            ["c/1/0/0"],
+            ["c/3/0/0"],
+            id="chunk-mixed",
+        ),
+        pytest.param(
+            "data",
+            (4, 2, 2),
+            "fsspec",
+            "",
+            {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0},  # shard 0 -> fill, shard 1 untouched
+            [0.0, 0.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            ["c/0/0/0"],
+            ["c/1/0/0"],
+            id="shard-mixed",
+        ),
+        pytest.param(
+            "data",
+            None,
+            "fsspec",
+            "bucket/prefix",
+            {2: 0.0, 3: 0.0},
+            [10.0, 11.0, 0.0, 0.0, 14.0, 15.0, 16.0, 17.0],
+            ["c/1/0/0"],
+            ["c/0/0/0", "c/2/0/0", "c/3/0/0"],
+            id="chunk-prefixed-product",
+        ),
+        pytest.param(
+            "data",
+            (4, 2, 2),
+            "obstore",
+            "bucket/prefix",
+            {4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0},
+            [10.0, 11.0, 12.0, 13.0, 0.0, 0.0, 0.0, 0.0],
+            ["c/1/0/0"],
+            ["c/0/0/0"],
+            id="shard-obstore-prefixed-product",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("_staged_fill_plugin")
+def test_direct_zarr_staged_promotion_deletes_units_rewritten_to_fill(
+    tmp_path: Path,
+    group: str,
+    shards: tuple[int, ...] | None,
+    driver: str,
+    subdir: str,
+    staged: dict[int, float],
+    expected: list[float],
+    removed: list[str],
+    untouched: list[str],
+) -> None:
+    """A staged rewrite to the fill value reaches the target; nothing else moves.
+
+    Run 1 writes 10..17 directly; run 2 rewrites some slots in staged mode
+    with ``force_reingest``. Every unit run 2 turned all fill is gone from the
+    target (zarr reads the fill value there), and every target object of a
+    unit run 2 did not write keeps its inode, mtime and size, as do the
+    untouched time-coordinate chunks.
+    """
+    _FILL_RUN.update(group=group, shards=shards)
+    target = tmp_path / subdir / "t.zarr"
+    _fill_ingest(target, driver, "direct", {s: 10.0 + s for s in range(_FILL_SLOTS)})
+    before = _objects(target)
+    values_prefix = f"{group}/values/"
+    for key in removed + untouched:
+        assert values_prefix + key in before, f"setup: {values_prefix + key} missing"
+
+    _fill_ingest(target, driver, "staged", staged)
+
+    after = _objects(target)
+    got = zarr.open_array(str(target), path=f"{group}/values", mode="r")[:, 0, 0]
+    assert np.asarray(got).tolist() == expected
+    assert sorted(set(before) - set(after)) == sorted(values_prefix + k for k in removed)
+    unwritten_slots = set(range(_FILL_SLOTS)) - set(staged)
+    keep = [values_prefix + k for k in untouched] + [
+        f"{group}/timestamp/c/{slot}" for slot in sorted(unwritten_slots)
+    ]
+    for key in keep:
+        assert after.get(key) == before[key], f"{key} was rewritten by promotion"

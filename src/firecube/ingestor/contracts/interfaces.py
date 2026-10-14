@@ -34,7 +34,7 @@ import inspect
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Protocol, runtime_checkable
 
 from firecube.core.observability.telemetry import IngestionTelemetry
 from firecube.ingestor.runtime.zarr.contracts import AppendWriteStrategy, RegionWriteStrategy
@@ -47,6 +47,10 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+
+if TYPE_CHECKING:
+    from firecube.core.storage.completion import StagedPromotionUnits
+    from firecube.core.zarr.metadata_authority import MetadataAuthority
 
 
 @runtime_checkable
@@ -275,6 +279,65 @@ class PipelineHost(Protocol):
         in staged mode.
         """
         ...
+
+
+@runtime_checkable
+class _SparseWindowRefusal(Protocol):
+    """Internal: a host that refuses a staged window covering a unit only partly."""
+
+    def _refuse_sparse_staged_window(
+        self,
+        ctx: PluginContext,
+        planned_slots: frozenset[int],
+        *,
+        window: tuple[int, int],
+        slot_group: str | None,
+    ) -> None: ...
+
+
+@runtime_checkable
+class _IncompleteUnitsRefusal(Protocol):
+    """Internal: a host that refuses to promote a half-written staged unit."""
+
+    def _refuse_incomplete_staged_units(self) -> None: ...
+
+
+@runtime_checkable
+class _StagedSeedingAuthority(Protocol):
+    """Internal: a host that seeds its staged workspace metadata under its own authority."""
+
+    def _staged_seeding_authority(self) -> MetadataAuthority | None: ...
+
+
+@runtime_checkable
+class _StagedPromotionUnits(Protocol):
+    """Internal: a host that reports what its staged run wrote, for a delta promotion."""
+
+    def _staged_promotion_units(self) -> StagedPromotionUnits | None: ...
+
+
+@runtime_checkable
+class StagedPromotionHost(
+    _SparseWindowRefusal,
+    _IncompleteUnitsRefusal,
+    _StagedSeedingAuthority,
+    _StagedPromotionUnits,
+    Protocol,
+):
+    """Internal capability: a host that checks staged unit coverage.
+
+    The engine calls the two refusals for staged runs only: the first before
+    any batch exists, the second just before promotion. It asks for the
+    seeding authority before each batch of a Zarr output and seeds the
+    workspace metadata under it (``None``: seeded as for any other host).
+    After the second refusal passed it asks a staged run for its promotion
+    units and, when given some, promotes the object delta they prove
+    (deletions of units left all fill included) instead of the whole
+    workspace tree (``None``: the whole tree, as before). It checks each
+    hook independently, so a host may implement any of them alone; a host
+    without the seeding hook seeds as before, one without the units hook
+    promotes as before. Not part of the plugin contract and not exported.
+    """
 
 
 __all__ = [

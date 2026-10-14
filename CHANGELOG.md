@@ -42,6 +42,18 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Changed
 
+- When workspace cleanup is enabled and a `DirectZarrIngestor` run times out
+  waiting for its in-flight batches at shutdown, the staged workspace is now
+  left in place and an error names its path, instead of being deleted under
+  the running writes. Remove it once the writes have stopped.
+- A staged `DirectZarrIngestor` promotion is now refused, with the target
+  untouched, when the target array has grown into the last chunk or shard of
+  the run's workspace since the run started: promoting that chunk or shard
+  would overwrite cells the run never wrote. Rerun after the other writer has
+  finished. The refusal is a check made when promotion starts: if
+  another process grows the target after that check and before the files are
+  published, the promotion is not refused and can still overwrite cells the
+  run never wrote.
 - A time-indexed array that ingest workers write and that declares neither
   `chunks=` nor `shards=` is now created with one slot per chunk. Zarr's own
   chunks for the whole array are kept, without a warning, when they already
@@ -61,6 +73,13 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   files under the target and `.firecube/` can already exist. It was written
   unchecked before. Timestamp intents are exempt. Declare the array in
   `zarr_schema()` or stop emitting intents for it.
+- `firecube` now requires `zarr>=3.2.1`.
+- `firecube` now requires `xarray>=2026.2.0` (older releases lose values in
+  region writes to sharded arrays).
+- A staged `DirectZarrIngestor` promotion uploads the units the run rewrote
+  and the changed auxiliary objects, and deletes the target objects of units
+  the run emptied. It never shrinks an array, and it keeps the target's
+  existing attributes when it publishes array metadata.
 - `firecube archive create` no longer prints the codec on the size line of
   its summary. The line now reads `Size: <n> MB`.
 - `firecube chunks delete-span` now exits 1 when it reports errors. It
@@ -92,19 +111,26 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   the lock first.
 - A `GenericZarrIngestor` refill or overwrite (`force_reingest`) could lose
   values written within one stored chunk when Dask computed the pieces of that
-  chunk as separate tasks, leaving some slots with their old values. Dask
-  tasks are now aligned to chunk boundaries. Shards are not covered: on the
-  oldest supported xarray, a region write whose inner chunks share a shard can
-  still lose values.
+  chunk as separate tasks, leaving some slots with their old values. Firecube
+  now aligns the Dask tasks of a region write to the stored chunks, and xarray
+  2026.2.0 or later (now required) aligns them to shards as well, so a write
+  whose inner chunks share a shard keeps every value.
 - A payload or static write intent aimed at a preallocated or coord-managed
   time coordinate is now verified against the stored values (identical: no
   write; different: `SchemaDriftError`) instead of overwriting them.
 - Staged runs that would promote a chunk or shard they do not write completely
   (sparse windows, serial runs, partially written rows or channels) are
   refused instead of resetting the unwritten cells to the fill value. A
-  staged `force_reingest` that writes a whole stored unit with nothing but
-  fill values still leaves the previous data of that unit in place on a local
-  target.
+  staged `GenericZarrIngestor` run that rewrites a whole stored unit with
+  nothing but fill values still leaves the previous data of that unit in
+  place on a local target.
+- A staged `DirectZarrIngestor` run that rewrites a whole chunk or shard
+  with nothing but the fill value now replaces the old data of that unit in
+  the target, so it reads back as the fill value. Promotion used to keep the
+  old values.
+- `DirectZarrIngestor`'s `zarr_write_empty_chunks` option no longer changes
+  Zarr's process-wide configuration, so concurrent writers with different
+  settings no longer receive each other's.
 - Concurrent staged runs into one local target no longer fail with Zstd or
   JSON decode errors from reading a half-written file. On a local target each
   uploaded object now replaces the old one whole, so a reader sees the old or

@@ -47,7 +47,7 @@ from firecube.ingestor.types.context import (
     RuntimeIngestContext,
     StorageContext,
 )
-from tests.helpers.storage import make_test_binding, make_test_session
+from tests.helpers.storage import begin_write_session, make_test_binding, make_test_session
 
 ProductTarget = __import__(
     "firecube.core.product.target",
@@ -252,6 +252,7 @@ def test_direct_zarr_receives_storage_config_obstore_branch(
     ctx = PluginContext(runtime_ctx)
     batch = PipelineBatch(batch_id="batch-001", data_path=tmp_path, items=["input.nc"])
 
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(batch, ctx)
 
     assert result.success is True

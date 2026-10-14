@@ -27,6 +27,7 @@ from firecube.core.index_spec import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.api import ConfigurationError, DirectZarrIngestor
 from firecube.ingestor.runtime.parallel_execution_state import _ParallelExecutionState
 from firecube.ingestor.templates.direct_zarr import WriteIntent, ZarrArraySpec, ZarrGroupSpec
+from tests.helpers.storage import begin_write_session
 
 pytestmark = pytest.mark.unit
 
@@ -162,6 +163,7 @@ def _run_process_batch(
         storage=None,
         option=lambda key, default=None: default,
     )
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(cast(Any, SimpleNamespace(items=["x"])), cast(Any, ctx))
     return result, captured
 

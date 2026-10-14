@@ -27,8 +27,10 @@ ALLOWED_TEMPLATES_FIRECUBE_PREFIXES = (
     "firecube.core.slot_index",  # direct import avoids circular-load via firecube.core.api
     "firecube.core.uris",
     "firecube.core.zarr._layout",  # creation layout of DirectZarr arrays (schema setup)
+    "firecube.core.zarr._zarr_compat",  # the one place that imports zarr.core
     "firecube.core.zarr.codec_pipeline",
     "firecube.core.zarr.engine_owned",  # pod-side engine-owned checks (DirectZarr)
+    "firecube.core.zarr.metadata_authority",  # zarr.json changes under the schema setup claim
     "firecube.core.zarr.region_writer",
     "firecube.core.zarr.unit_ownership",  # stored-unit and staged-coverage checks (DirectZarr)
     "firecube.ingestor.api",
@@ -117,3 +119,30 @@ def test_import_boundaries(file_path: Path) -> None:
     visitor.visit(tree)
     if visitor.errors:
         pytest.fail(f"Architecture violation in {file_path}: {visitor.errors}")
+
+
+ZARR_COMPAT_SHIM = Path("src/firecube/core/zarr/_zarr_compat.py")
+
+
+def _zarr_core_imports(tree: ast.AST) -> list[str]:
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [a.name for a in node.names if a.name.split(".")[:2] == ["zarr", "core"]]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            parts = node.module.split(".")
+            if parts[:2] == ["zarr", "core"]:
+                found.append(node.module)
+            elif parts == ["zarr"] and any(a.name == "core" for a in node.names):
+                found.append("zarr.core")
+    return found
+
+
+def test_zarr_core_is_imported_only_by_the_compat_shim() -> None:
+    offenders = {
+        str(path): imports
+        for path in Path("src").rglob("*.py")
+        if path != ZARR_COMPAT_SHIM
+        and (imports := _zarr_core_imports(ast.parse(path.read_text(encoding="utf-8"))))
+    }
+    assert not offenders, f"zarr.core imports outside {ZARR_COMPAT_SHIM}: {offenders}"

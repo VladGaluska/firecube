@@ -25,11 +25,20 @@ storage_session_module = importlib.import_module("firecube.core.storage.session"
 StorageUri = importlib.import_module("firecube.core.storage.uri").StorageUri
 
 
+def _assert_cause_is_write_failure(error: StorageError) -> None:
+    cause = error.__cause__
+    assert isinstance(cause, OSError), f"wrong cause: {cause!r}"
+    assert str(cause) == "write failed"
+
+
 def test_local_session_upload_raises_typed_error(monkeypatch, temp_workspace):
     class _BrokenFs:
         def open(self, *args, **kwargs):
             _ = (args, kwargs)
             raise OSError("write failed")
+
+        def capabilities(self) -> set[type]:
+            return set()
 
     def _fake_create_filesystem(_binding):
         return _BrokenFs()
@@ -41,12 +50,14 @@ def test_local_session_upload_raises_typed_error(monkeypatch, temp_workspace):
 
     session = make_test_session(temp_workspace)
 
-    with pytest.raises(StorageError):
+    with pytest.raises(StorageError) as excinfo:
         session.upload_tree(
             StorageUri.from_local_path(source_file),
             StorageUri.from_local_path(temp_workspace / "output.zarr"),
             parallel_workers=1,
         )
+
+    _assert_cause_is_write_failure(excinfo.value)
 
 
 @pytest.mark.unit
@@ -55,6 +66,9 @@ def test_s3_session_upload_raises_typed_error(monkeypatch, temp_workspace):
         def open(self, *args, **kwargs):
             _ = (args, kwargs)
             raise OSError("write failed")
+
+        def capabilities(self) -> set[type]:
+            return set()
 
     def _fake_create_filesystem(_binding):
         return _BrokenFs()
@@ -66,9 +80,11 @@ def test_s3_session_upload_raises_typed_error(monkeypatch, temp_workspace):
 
     session = make_test_session(temp_workspace, protocol="s3", authority="bucket")
 
-    with pytest.raises(StorageError):
+    with pytest.raises(StorageError) as excinfo:
         session.upload_tree(
             StorageUri.from_local_path(source_file),
             StorageUri.parse("s3://bucket/product"),
             parallel_workers=1,
         )
+
+    _assert_cause_is_write_failure(excinfo.value)

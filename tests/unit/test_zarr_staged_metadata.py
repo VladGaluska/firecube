@@ -450,3 +450,301 @@ def test_seed_tolerates_group_lacking_named_coord_array(tmp_path):
     assert "G" in result
     ts_chunk_root = temp / "G" / "timestamp" / "c"
     assert not ts_chunk_root.exists() or not any(ts_chunk_root.rglob("*"))
+
+
+# --- seeding under a metadata authority (DirectZarr) -------------------------------------
+
+
+def _make_v3_target(final: Path) -> None:
+    """A real Zarr v3 target: root group, group G, a written coordinate and a data array."""
+    import numpy as np
+    import zarr
+
+    group = zarr.open_group(str(final), mode="w", zarr_format=3).require_group("G")
+    group.attrs["title"] = "target"
+    ts = group.create_array("timestamp", shape=(2,), chunks=(2,), dtype="int64")
+    ts[:] = np.array([10, 20], dtype="int64")
+    val = group.create_array("val", shape=(2, 3), chunks=(1, 3), dtype="float32")
+    val[:] = np.ones((2, 3), dtype="float32")
+    val.attrs["firecube_static_written"] = True
+
+
+_SEEDED_DOCUMENTS = {"zarr.json", "G/zarr.json", "G/timestamp/zarr.json", "G/val/zarr.json"}
+
+
+def _workspace_authority(temp: Path):
+    from firecube.core.zarr.metadata_authority import MetadataAuthority
+    from firecube.core.zarr.region_writer import RegionZarrWriter
+
+    return MetadataAuthority.process_local(RegionZarrWriter(str(temp)).metadata_scope())
+
+
+def _workspace_files(temp: Path) -> dict[str, bytes]:
+    return {p.relative_to(temp).as_posix(): p.read_bytes() for p in temp.rglob("*") if p.is_file()}
+
+
+def _seed(temp: Path, final: Path, *, strict: bool = True, authority=None) -> dict:
+    return seed_staged_store_metadata(
+        temp_store_uri=str(temp),
+        final_target_uri=str(final),
+        groups=["G"],
+        session=make_local_session(str(final)),
+        strict=strict,
+        coordinate_arrays=["timestamp"],
+        authority=authority,
+    )
+
+
+def test_seed_with_authority_writes_every_document_through_it(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Each seeded zarr.json is published under the authority; none is written as a plain file."""
+    from firecube.ingestor.runtime.zarr import staged_metadata
+
+    final = tmp_path / "final.zarr"
+    _make_v3_target(final)
+    plain = tmp_path / "plain.zarr"
+    _seed(plain, final)  # no authority: today's path
+
+    temp = tmp_path / "temp.zarr"
+    authority = _workspace_authority(temp)
+    published: list[tuple[str, object, str]] = []
+
+    def recording(name: str):
+        original = getattr(staged_metadata, name)
+
+        def record(auth, store, key, payload):
+            published.append((name, auth, key))
+            return original(auth, store, key, payload)
+
+        return record
+
+    for name in ("publish_document", "publish_document_if_absent"):
+        monkeypatch.setattr(staged_metadata, name, recording(name))
+    original_write_bytes = Path.write_bytes
+
+    def no_plain_documents(self: Path, data: bytes) -> int:
+        if self.name == "zarr.json" and self.is_relative_to(temp):
+            raise AssertionError(f"zarr.json written around the authority: {self}")
+        return original_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", no_plain_documents)
+
+    result = _seed(temp, final, authority=authority)
+
+    assert result["G"]["seeded"] is True
+    # The root is replaced as before; every other document only where absent.
+    assert sorted((name, key) for name, _, key in published) == sorted(
+        [("publish_document", "zarr.json")]
+        + [("publish_document_if_absent", key) for key in _SEEDED_DOCUMENTS - {"zarr.json"}]
+    )
+    assert all(auth is authority for _, auth, _ in published)
+    # Same bytes as the plain path, the coordinate chunk included (an object copy).
+    assert _workspace_files(temp) == _workspace_files(plain)
+    assert "G/timestamp/c/0" in _workspace_files(temp)
+    assert "G/val/c/0/0" not in _workspace_files(temp)
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_seed_with_released_authority_refuses_and_leaves_no_document(tmp_path, strict):
+    """A released authority refuses in strict and best-effort mode; no document lands."""
+    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
+
+    final = tmp_path / "final.zarr"
+    _make_v3_target(final)
+    temp = tmp_path / "temp.zarr"
+    authority = _workspace_authority(temp)
+    authority.revoke()
+
+    with pytest.raises(MetadataAuthorityError, match="released"):
+        _seed(temp, final, strict=strict, authority=authority)
+
+    # No document, and no directory created for one.
+    assert not temp.exists()
+
+
+def test_seed_for_batch_does_not_swallow_a_refused_authority(tmp_path):
+    """The best-effort batch wrapper propagates the refusal instead of logging it away."""
+    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
+    from firecube.ingestor.runtime.zarr.batch_runner import seed_staged_metadata_for_batch
+
+    final = tmp_path / "final.zarr"
+    _make_v3_target(final)
+    temp = tmp_path / "temp.zarr"
+    authority = _workspace_authority(temp)
+    authority.revoke()
+    ctx = MagicMock()
+    ctx.storage.output = make_local_session(str(final))
+
+    with pytest.raises(MetadataAuthorityError):
+        seed_staged_metadata_for_batch(
+            ctx=ctx,
+            store_uri=str(temp),
+            final_target_uri=str(final),
+            resume_existing=False,
+            force_reingest=False,
+            write_mode="staged",
+            logger=MagicMock(),
+            coordinate_arrays=["timestamp"],
+            authority=authority,
+        )
+
+    assert not temp.exists() or not list(temp.rglob("zarr.json"))
+
+
+def test_seed_without_authority_is_todays_plain_copy(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """No authority: nothing goes through publish_document and the bytes are today's copy."""
+    from firecube.ingestor.runtime.zarr import staged_metadata
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("publish_document called without an authority")
+
+    monkeypatch.setattr(staged_metadata, "publish_document", refuse)
+    monkeypatch.setattr(staged_metadata, "publish_document_if_absent", refuse)
+    final = tmp_path / "final.zarr"
+    _make_v3_target(final)
+    temp = tmp_path / "temp.zarr"
+
+    _seed(temp, final)
+
+    files = _workspace_files(temp)
+    assert files.keys() == _SEEDED_DOCUMENTS | {"G/timestamp/c/0"}
+    # Root and coordinate chunk verbatim; node documents re-serialised with the
+    # run-state marker stripped, exactly as before.
+    assert files["zarr.json"] == (final / "zarr.json").read_bytes()
+    assert files["G/timestamp/c/0"] == (final / "G/timestamp/c/0").read_bytes()
+    for key in _SEEDED_DOCUMENTS - {"zarr.json"}:
+        expected = json.loads((final / key).read_bytes())
+        expected.get("attributes", {}).pop("firecube_static_written", None)
+        assert files[key] == json.dumps(expected).encode()
+
+
+def test_staged_session_seeding_authority_is_process_local_and_released_on_close(tmp_path):
+    """The session's seeding authority covers the whole workspace and ends with the session."""
+    import contextlib
+
+    from firecube.core.zarr.metadata_authority import AuthorityBasis
+    from firecube.ingestor.runtime.zarr.write_session import ZarrWriteSession
+
+    def session(write_mode: str, workspace_uri: str | None) -> ZarrWriteSession:
+        return ZarrWriteSession(
+            product="p",
+            run_id="r",
+            write_mode=write_mode,
+            window=None,
+            slot_group=None,
+            acquire_claim=lambda **_kw: contextlib.nullcontext(),
+            open_root=lambda _uri: None,
+            open_final_root=lambda _ctx: None,
+            workspace_uri=workspace_uri,
+        )
+
+    temp = tmp_path / "temp.zarr"
+    staged = session("staged", str(temp))
+    authority = staged.staged_seeding_authority()
+    assert authority is not None
+    assert authority.basis is AuthorityBasis.PROCESS_LOCAL
+    assert authority.scope.prefix == ""
+    assert authority.scope.store == str(temp.resolve())
+    assert authority.active
+    assert session("direct", str(temp)).staged_seeding_authority() is None
+
+    staged.close()
+    assert not authority.active
+
+
+def test_engine_seeds_under_the_host_seeding_authority(monkeypatch: pytest.MonkeyPatch):
+    """A host with the seeding hook gets its authority passed to the pre-batch seeding."""
+    from types import SimpleNamespace
+
+    from firecube.ingestor.runtime import engine
+    from firecube.ingestor.runtime.zarr import batch_runner
+
+    seed = MagicMock()
+    monkeypatch.setattr(batch_runner, "seed_staged_metadata_pre_batch", seed)
+    authority = object()
+    host = SimpleNamespace(
+        _log=MagicMock(),
+        _resolve_time_dim_name=lambda: "time",
+        _staged_seeding_authority=lambda: authority,
+    )
+    ctx = SimpleNamespace(output_format="zarr")
+
+    hook = engine._zarr_pre_batch_hook(host, ctx)  # type: ignore[arg-type]
+    assert hook is not None
+    hook()
+
+    seed.assert_called_once_with(
+        host=host, ctx=ctx, logger=host._log, coordinate_arrays=["time"], authority=authority
+    )
+
+
+class _PausingFilesystem:
+    """Delegates to a real filesystem; pauses once after reading the source at *suffix*."""
+
+    def __init__(self, inner, suffix: str, paused, resume) -> None:
+        self._inner, self._suffix, self._paused, self._resume = inner, suffix, paused, resume
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def open(self, uri, mode: str = "rb"):
+        handle = self._inner.open(uri, mode)
+        if uri.path.endswith(self._suffix):
+            self._paused.set()
+            assert self._resume.wait(10), "seeder A was never resumed"
+        return handle
+
+
+def test_concurrent_seed_never_replaces_a_document_a_writer_changed(tmp_path):
+    """Seeder A decides to copy a document; B seeds it and the writer stamps it; A must not revert it.
+
+    Order: A finds G/val/zarr.json absent in the workspace and reads the target
+    copy, then pauses. B seeds the same document and the writer stamps the
+    static marker on it under the workspace authority. A resumes. The marker
+    must survive: a reverted marker lets a divergent static write through.
+    """
+    import threading
+
+    from zarr.storage import LocalStore
+
+    from firecube.core.zarr.metadata_authority import set_attributes
+
+    final = tmp_path / "final.zarr"
+    _make_v3_target(final)
+    temp = tmp_path / "temp.zarr"
+    authority = _workspace_authority(temp)
+    paused, resume = threading.Event(), threading.Event()
+    session_a = make_local_session(str(final))
+    pausing_fs = _PausingFilesystem(session_a.fs(), "G/val/zarr.json", paused, resume)
+    session_a.fs = lambda: pausing_fs  # type: ignore[method-assign]
+    errors: list[BaseException] = []
+
+    def seeder_a() -> None:
+        try:
+            seed_staged_store_metadata(
+                temp_store_uri=str(temp),
+                final_target_uri=str(final),
+                groups=["G"],
+                session=session_a,
+                coordinate_arrays=["timestamp"],
+                authority=authority,
+            )
+        except BaseException as exc:  # reported below
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=seeder_a)
+    thread_a.start()
+    try:
+        assert paused.wait(10), "seeder A never reached the document read"
+        _seed(temp, final, authority=authority)  # seeder B
+        set_attributes(authority, LocalStore(temp), "G/val", {"firecube_static_written": True})
+    finally:
+        resume.set()
+        thread_a.join(10)
+
+    assert errors == []
+    stored = json.loads((temp / "G" / "val" / "zarr.json").read_bytes())
+    assert stored["attributes"].get("firecube_static_written") is True, (
+        "seeder A replaced the document the writer had stamped"
+    )

@@ -30,7 +30,7 @@ from firecube.ingestor.api import (
     RuntimeIngestContext,
 )
 from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor, WriteIntent
-from tests.helpers.storage import make_test_context
+from tests.helpers.storage import begin_write_session, make_test_context
 
 pytestmark = pytest.mark.unit
 
@@ -131,5 +131,6 @@ def test_direct_zarr_process_batch_defense_in_depth_raises_configuration_error(
     monkeypatch.setattr(ingestor, "cleanup_batch_data", lambda batch, ctx: None)
     monkeypatch.setattr(ingestor, "batch_teardown", lambda ctx: None)
 
+    begin_write_session(ingestor, ctx)
     with pytest.raises(ConfigurationError, match=re.escape(UNBOUNDED_AXIS_MESSAGE)):
         ingestor._process_batch(batch, ctx)

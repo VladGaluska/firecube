@@ -16,21 +16,27 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import zarr
-from zarr.storage import LocalStore
+from zarr.storage import FsspecStore, LocalStore, MemoryStore
 
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import (
     SLOT_INDEX_CURRENT_FILENAME,
     SLOT_INDEX_DIRNAME,
+    ResolvedIndexRecord,
     SlotIndexModelRecord,
     WriteDomain,
+    canonical_index_bytes,
 )
 from firecube.core.errors import ManifestError, SlotIndexModelConflictError
 from firecube.core.filesystem import StorageFilesystem
@@ -44,6 +50,7 @@ from firecube.core.slot_index import (
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
+from firecube.core.zarr.metadata_authority import _NODE_LOCKS
 
 
 def _make_manager(tmp_path: Path) -> ChunkManager:
@@ -205,20 +212,17 @@ def test_mirror_attrs_for_remote_product_uses_driver_aware_zarr_store(
         recorded_at="2026-01-01T00:00:00Z",
         recorded_by_run_id="run-1",
     )
-    root_attrs: dict[str, str] = {}
-    sentinel_store = object()
+    remote_store = MemoryStore()  # no root group yet: the mirror creates it
     sentinel_storage_options = {"client_kwargs": {"endpoint_url": "https://example.invalid"}}
     create_calls: list[dict[str, object]] = []
-    open_calls: list[dict[str, object]] = []
-
-    class _Root:
-        def __init__(self) -> None:
-            self.attrs = root_attrs
+    from_url_calls: list[tuple[str, object, bool]] = []
 
     class _StoreHandle:
+        """Shaped like the fsspec driver's handle: a URI string plus options."""
+
         def zarr_kwargs(self) -> dict[str, object]:
             return {
-                "store": sentinel_store,
+                "store": "s3://bucket/prod1.zarr",
                 "storage_options": sentinel_storage_options,
             }
 
@@ -231,10 +235,6 @@ def test_mirror_attrs_for_remote_product_uses_driver_aware_zarr_store(
         raise AssertionError(
             "slot-index root attrs must use create_zarr_store, not create_obstore_store directly"
         )
-
-    def fake_open_group(**kwargs: object):
-        open_calls.append(dict(kwargs))
-        return _Root()
 
     monkeypatch.setattr(
         ChunkManager,
@@ -249,7 +249,14 @@ def test_mirror_attrs_for_remote_product_uses_driver_aware_zarr_store(
         "firecube.core.filesystem.store_factory.create_obstore_store",
         fail_create_obstore_store,
     )
-    monkeypatch.setattr(zarr, "open_group", fake_open_group)
+
+    def fake_from_url(
+        url: str, storage_options: object = None, read_only: bool = False
+    ) -> MemoryStore:
+        from_url_calls.append((url, storage_options, read_only))
+        return remote_store
+
+    monkeypatch.setattr(FsspecStore, "from_url", fake_from_url)
 
     cm._mirror_attrs("prod1", record)
 
@@ -260,16 +267,92 @@ def test_mirror_attrs_for_remote_product_uses_driver_aware_zarr_store(
             "mode": "a",
         }
     ]
-    assert open_calls == [
-        {
-            "store": sentinel_store,
-            "storage_options": sentinel_storage_options,
-            "mode": "a",
-            "zarr_format": 3,
-        }
-    ]
-    assert root_attrs[SLOT_INDEX_MODEL_ATTR] == model.canonical_bytes().decode("utf-8")
-    assert root_attrs[SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR] == model.identity_hash
+    assert from_url_calls == [("s3://bucket/prod1.zarr", sentinel_storage_options, False)]
+    stored = zarr.open_group(store=remote_store, mode="r", zarr_format=3).attrs
+    assert stored[SLOT_INDEX_MODEL_ATTR] == model.canonical_bytes().decode("utf-8")
+    assert stored[SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR] == model.identity_hash
+
+
+@pytest.mark.unit
+def test_root_creation_by_a_paused_mirror_does_not_erase_a_completed_mirror(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two mirrors meet an absent root; the first pauses as it creates the root.
+
+    The second completes its whole mirror in that pause. Creating the root must
+    not replace the document the second one wrote, or the second's attrs vanish.
+    """
+    cm = _make_manager(tmp_path)
+    model = _model()
+    legacy = SlotIndexModelRecord(
+        model=model,
+        identity_hash=model.identity_hash,
+        schema_version="v1",
+        recorded_at="2026-01-01T00:00:00Z",
+        recorded_by_run_id="run-1",
+    )
+    index = {"schema_version": "v1", "name": "idx", "groups": {}}
+    resolved = ResolvedIndexRecord(
+        recorded_at="2026-01-01T00:00:00+00:00",
+        recorded_by_run_id="run-2",
+        identity_hash=hashlib.sha256(canonical_index_bytes(index)).hexdigest(),
+        index=index,
+    )
+    paused = False
+    second_done = threading.Event()
+    second_errors: list[BaseException] = []
+
+    def run_second_mirror() -> None:
+        try:
+            cm._mirror_resolved_index_attrs("prod1", resolved)
+        except BaseException as exc:  # reported by the test thread
+            second_errors.append(exc)
+        finally:
+            second_done.set()
+
+    second = threading.Thread(target=run_second_mirror)
+
+    def second_settled() -> bool:
+        """The second mirror finished, or is queued behind the first on a node lock."""
+        with _NODE_LOCKS._guard:
+            queued = any(entry.users >= 2 for entry in _NODE_LOCKS._entries.values())
+        return second_done.is_set() or queued
+
+    def wait_until_second_settled(timeout_s: float = 30.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if second_settled():
+                return True
+            time.sleep(0.005)
+        return False
+
+    def pause_at_root_creation(original: Any) -> Any:
+        async def put(self: LocalStore, key: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal paused
+            if key == "zarr.json" and not paused:
+                paused = True
+                second.start()
+                # Guarded creation holds the root's node lock, so the second
+                # mirror queues behind it; unguarded creation lets it run to
+                # the end. Resume only once one of the two is observed.
+                assert await asyncio.to_thread(wait_until_second_settled)
+            return await original(self, key, *args, **kwargs)
+
+        return put
+
+    monkeypatch.setattr(LocalStore, "set", pause_at_root_creation(LocalStore.set))
+    monkeypatch.setattr(
+        LocalStore, "set_if_not_exists", pause_at_root_creation(LocalStore.set_if_not_exists)
+    )
+
+    cm._mirror_attrs("prod1", legacy)
+
+    second.join(timeout=30)
+    assert paused
+    assert second_errors == []
+    stored = zarr.open_group(store=LocalStore(str(tmp_path / "prod1")), mode="r", zarr_format=3)
+    assert stored.attrs[SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR] == model.identity_hash
+    assert stored.attrs["firecube_resolved_index_identity_hash"] == resolved.identity_hash
 
 
 @pytest.mark.unit

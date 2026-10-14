@@ -45,7 +45,13 @@ from typing import TYPE_CHECKING, Any, cast
 from firecube.core.controlplane.repo import describe_control_plane
 from firecube.core.observability import attach_context, capture_context, detach_context
 from firecube.ingestor.config.engine import EngineConfig
-from firecube.ingestor.contracts.interfaces import PipelineHost
+from firecube.ingestor.contracts.interfaces import (
+    PipelineHost,
+    _IncompleteUnitsRefusal,
+    _SparseWindowRefusal,
+    _StagedPromotionUnits,
+    _StagedSeedingAuthority,
+)
 from firecube.ingestor.runtime._metrics_helpers import _extract_timestamps_skipped
 from firecube.ingestor.runtime.aggregation import normalize_plugin_aggregate_metrics
 from firecube.ingestor.runtime.index_binding import (
@@ -561,11 +567,23 @@ def _zarr_pre_batch_hook(
 
     coordinate_arrays: list[str] = [ingestor._resolve_time_dim_name()]
 
+    if not isinstance(ingestor, _StagedSeedingAuthority):
+        return lambda: seed_staged_metadata_pre_batch(
+            host=ingestor,
+            ctx=ctx,
+            logger=ingestor._log,
+            coordinate_arrays=coordinate_arrays,
+        )
+
+    # The host names the authority its workspace metadata is seeded under,
+    # asked afresh before each batch.
+    seeding_host = ingestor
     return lambda: seed_staged_metadata_pre_batch(
         host=ingestor,
         ctx=ctx,
         logger=ingestor._log,
         coordinate_arrays=coordinate_arrays,
+        authority=seeding_host._staged_seeding_authority(),
     )
 
 
@@ -712,8 +730,7 @@ def _refuse_sparse_staged_window(
     comes before any payload write. Skipped when the host has no such check
     or an item's inspection result is unknown.
     """
-    check = getattr(host, "_refuse_sparse_staged_window", None)
-    if not callable(check) or not items:
+    if not isinstance(host, _SparseWindowRefusal) or not items:
         return
     if any(id(item) not in inspected for item in items):
         return
@@ -724,7 +741,7 @@ def _refuse_sparse_staged_window(
         info = inspected[id(item)]
         coordinate = info.coordinate if hasattr(info, "coordinate") else info
         planned.add(int(resolved.position(group, coordinate)))
-    check(ctx, frozenset(planned), window=window, slot_group=slot_group)
+    host._refuse_sparse_staged_window(ctx, frozenset(planned), window=window, slot_group=slot_group)
 
 
 class PipelineExecutor:
@@ -927,15 +944,21 @@ class PipelineExecutor:
         run_id = ctx.run_id or ""
         output_name = _output_product_name(ctx)
 
-        if effective_write_mode == "staged":
-            # Promotion replaces whole objects: a host that tracks its staged
-            # writes refuses here, before the target is touched, when a unit
-            # would be promoted half-written.
-            refuse_incomplete = getattr(host, "_refuse_incomplete_staged_units", None)
-            if callable(refuse_incomplete):
-                refuse_incomplete()
+        # Promotion replaces whole objects: a host that tracks its staged
+        # writes refuses here, before the target is touched, when a unit
+        # would be promoted half-written.
+        if effective_write_mode == "staged" and isinstance(host, _IncompleteUnitsRefusal):
+            host._refuse_incomplete_staged_units()
 
-        stored = _storage_completer().complete_output(result, ctx)
+        # A host that reports the units its staged run proved written gets an
+        # object-delta promotion (deletions included); others upload the tree.
+        staged_units = None
+        if effective_write_mode == "staged" and isinstance(host, _StagedPromotionUnits):
+            staged_units = host._staged_promotion_units()
+        if staged_units is None:
+            stored = _storage_completer().complete_output(result, ctx)
+        else:
+            stored = _storage_completer().complete_output(result, ctx, staged_units=staged_units)
 
         result.storage_result = stored
         result.write_mode_applied = effective_write_mode

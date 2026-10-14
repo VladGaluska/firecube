@@ -21,7 +21,7 @@ promotes. These functions read the stored layout and refuse; they write nothing.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from operator import index as operator_index
 from typing import Any
@@ -34,10 +34,40 @@ from firecube.core.zarr.chunk_geometry import (
     staged_partial_unit_refusal,
     unit_bounds,
     unit_ownership_refusal,
+    units_touched,
     window_straddling_units,
     write_unit_shape,
 )
 from firecube.core.zarr.engine_owned import _array_or_none
+
+
+@dataclass(frozen=True)
+class WriteFootprint:
+    """The cells one write may change: an array and a box of its cells.
+
+    Attributes:
+        array_path: ``group/array`` written, relative to the store root;
+            spelled zarr's one way on construction (``canonical_array_path``),
+            so two spellings of one array cannot take different locks.
+        box: Half-open ``(start, stop)`` per dimension of the stored array,
+            any rank. An empty interval selects no cell.
+
+    Raises:
+        TypeError: A bound is not an integer.
+        ValueError: A bound is negative or a stop lies before its start, or
+            the path has a ``.`` or ``..`` segment.
+    """
+
+    array_path: str
+    box: Bounds
+
+    def __post_init__(self) -> None:
+        box = tuple((operator_index(start), operator_index(stop)) for start, stop in self.box)
+        for start, stop in box:
+            if start < 0 or stop < start:
+                raise ValueError(f"footprint box {box} has an interval outside 0 <= start <= stop")
+        object.__setattr__(self, "array_path", canonical_array_path(self.array_path))
+        object.__setattr__(self, "box", box)
 
 
 def stored_write_unit(arr: Any) -> tuple[tuple[int, ...], str]:
@@ -180,6 +210,114 @@ def require_staged_units_fully_written(
             )
     if problems:
         raise ConfigurationError("\n".join(problems))
+
+
+def _touched_units_per_array(
+    root: Any | None, touched: Sequence[StagedSlotWrite]
+) -> Iterator[tuple[Any, tuple[int, ...], tuple[int, ...], str, set[tuple[int, ...]]]]:
+    """``(array, shape, unit_shape, unit_kind, units)`` per workspace array *touched* names.
+
+    Arrays the workspace lacks and rank-0 arrays are skipped.
+    """
+    for path in sorted({write.array_path for write in touched}):
+        arr = _array_or_none(root, path)
+        if arr is None or arr.ndim == 0:
+            continue
+        shape = tuple(int(n) for n in arr.shape)
+        unit_shape, unit_kind = stored_write_unit(arr)
+        units = {
+            unit
+            for write in touched
+            if write.array_path == path
+            for unit in units_touched(write.bounds(shape), unit_shape)
+        }
+        yield arr, shape, unit_shape, unit_kind, units
+
+
+def _unit_object_key(arr: Any, unit: tuple[int, ...]) -> str:
+    return f"{arr.path}/{arr.metadata.chunk_key_encoding.encode_chunk_key(unit)}"
+
+
+def staged_unit_object_keys(root: Any | None, touched: Sequence[StagedSlotWrite]) -> frozenset[str]:
+    """Store key of the object of every stored unit a staged run touched.
+
+    Only meaningful after :func:`require_staged_units_fully_written` has
+    passed: every key returned then belongs to a unit the run wrote in every
+    cell of the workspace extent, whether or not zarr left an object for it
+    in the workspace. A unit the workspace array ends inside is proved only
+    up to that extent; see :func:`require_target_within_clipped_units`.
+
+    Args:
+        root: The staged workspace, opened (``None``: no keys).
+        touched: Every slot write the run attempted.
+    """
+    return frozenset(
+        _unit_object_key(arr, unit)
+        for arr, _, _, _, units in _touched_units_per_array(root, touched)
+        for unit in units
+    )
+
+
+def require_target_within_clipped_units(
+    root: Any | None,
+    touched: Sequence[StagedSlotWrite],
+    target_shape: Callable[[str], Sequence[int] | None],
+) -> None:
+    """Refuse promotion of a unit the workspace ends inside when the target reaches further into it.
+
+    The staged coverage check proves a unit written only within the workspace
+    array's shape. Promotion puts or deletes the whole target object, so when
+    the target array grew past the workspace extent along an axis that ends
+    inside the unit (another writer grew it after the workspace was seeded),
+    the target cells past that extent would be replaced by fill although the
+    run never wrote them. Units wholly inside the workspace extent pass, as
+    do arrays the target lacks, holds no longer on those axes, or holds with
+    another rank (a structural difference this check does not judge).
+
+    Limit: a target that grows between this check and the put is not
+    detected; closing it needs a cross-process claim.
+
+    Args:
+        root: The staged workspace, opened (``None``: nothing to check).
+        touched: Every slot write the run attempted.
+        target_shape: Shape of the target array at a ``group/array`` path,
+            or ``None`` when the target holds no array there. Called once per
+            array that has a clipped unit, and for no other.
+
+    Raises:
+        ConfigurationError: One line per array with such a unit, naming the
+            array, the unit's object key and both extents.
+    """
+    problems: list[str] = []
+    for arr, shape, unit_shape, unit_kind, units in _touched_units_per_array(root, touched):
+        clipped = sorted(
+            unit
+            for unit in units
+            if any((i + 1) * s > n for i, s, n in zip(unit, unit_shape, shape, strict=True))
+        )
+        if not clipped:
+            continue
+        target = target_shape(arr.path)
+        if target is None or len(target) != len(shape):
+            continue
+        target = tuple(int(n) for n in target)
+        for unit in clipped:
+            if any(
+                (i + 1) * s > n and t > n
+                for i, s, n, t in zip(unit, unit_shape, shape, target, strict=True)
+            ):
+                problems.append(
+                    f"{arr.path}: {unit_kind} {_unit_object_key(arr, unit)} ends past the "
+                    f"workspace array's extent {shape} and the target array has grown into it "
+                    f"(target extent {target}) since the workspace was seeded; promotion "
+                    "replaces the whole object and would erase target cells this run never "
+                    "wrote. Rerun once the writer that grew the target has finished."
+                )
+                break
+    if problems:
+        raise ConfigurationError(
+            "staged promotion refused, target untouched: " + "\n".join(problems)
+        )
 
 
 def require_planned_slots_fill_units(

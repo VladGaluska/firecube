@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.product import write_mode_policy
@@ -30,6 +30,9 @@ from firecube.ingestor.runtime.zarr.alignment import AlignmentMonitor
 from firecube.ingestor.runtime.zarr.append_order import AppendOrder
 from firecube.ingestor.runtime.zarr.strategies.append import AppendStrategy
 from firecube.ingestor.runtime.zarr.write_context import ZarrWriteContext
+
+if TYPE_CHECKING:
+    from firecube.core.zarr.metadata_authority import MetadataAuthority
 
 
 def seed_staged_metadata_for_batch(
@@ -43,11 +46,17 @@ def seed_staged_metadata_for_batch(
     write_mode: str,
     logger: logging.Logger,
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> None:
-    """Seed staged temp-store metadata from the final target when applicable."""
+    """Seed staged temp-store metadata from the final target when applicable.
+
+    With ``authority``, the workspace ``zarr.json`` documents are written
+    under it, and its refusal propagates like ``StagedMetadataError``.
+    """
     if not write_mode_policy(write_mode).seeds_staged_metadata or final_target_uri is None:
         return
 
+    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
     from firecube.ingestor.runtime.zarr.staged_metadata import (
         StagedMetadataError,
         seed_staged_store_metadata,
@@ -68,8 +77,9 @@ def seed_staged_metadata_for_batch(
             session=output_session,
             strict=strict,
             coordinate_arrays=coordinate_arrays,
+            authority=authority,
         )
-    except StagedMetadataError:
+    except (StagedMetadataError, MetadataAuthorityError):
         raise
     except Exception as seed_exc:
         logger.debug("Staged metadata seeding skipped: %s", seed_exc)
@@ -81,8 +91,13 @@ def seed_staged_metadata_pre_batch(
     ctx: Any,
     logger: logging.Logger,
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> None:
-    """Runtime-level staged metadata seeding hook for Zarr batch execution."""
+    """Runtime-level staged metadata seeding hook for Zarr batch execution.
+
+    ``authority`` is the host's seeding authority (DirectZarr: its session's
+    ``PROCESS_LOCAL`` authority over the workspace); ``None`` seeds as before.
+    """
     engine_config = getattr(host, "engine_config", None)
     write_mode = str(getattr(engine_config, "write_mode", ""))
     if not write_mode_policy(write_mode).seeds_staged_metadata:
@@ -106,6 +121,7 @@ def seed_staged_metadata_pre_batch(
         write_mode=write_mode,
         logger=logger,
         coordinate_arrays=coordinate_arrays,
+        authority=authority,
     )
 
 

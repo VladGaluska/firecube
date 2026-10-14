@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 from zarr.abc.store import Store
-from zarr.core.buffer import default_buffer_prototype
+from zarr.buffer import default_buffer_prototype
 
 from firecube.core.config import StorageConfig
 from firecube.core.filesystem.ops import (

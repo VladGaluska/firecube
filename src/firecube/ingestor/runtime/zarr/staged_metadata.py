@@ -23,6 +23,17 @@ temp-store shape overwrites the cumulative target shape.
 
 Best-effort for fresh ingests (no final target yet); strict (raises
 ``StagedMetadataError``) when resuming into an existing target.
+
+With a metadata authority (DirectZarr), every ``zarr.json`` document written
+into the workspace is put under it, serialised per node with the run's other
+metadata changes: a group or array document only where the workspace holds
+none, decided under the node lock (`publish_document_if_absent`), so a
+document a concurrent batch's writer created or changed is never reverted;
+the root document is replaced, as without an authority (`publish_document`).
+A refused authority (`MetadataAuthorityError`) always propagates, in strict
+and best-effort mode alike, and leaves no document or directory behind.
+Without one, the documents are written as plain files. Coordinate chunks are
+object copies either way.
 """
 
 from __future__ import annotations
@@ -30,14 +41,22 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import zarr
-from zarr.core.sync import sync
+from zarr.storage import LocalStore
 
 from firecube.core.storage.uri import StorageUri
+from firecube.core.zarr._zarr_compat import sync
 from firecube.core.zarr.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr.metadata_authority import (
+    MetadataAuthority,
+    MetadataAuthorityError,
+    publish_document,
+    publish_document_if_absent,
+)
 from firecube.ingestor.errors import SeedingFailedError, StagedMetadataError
 
 if TYPE_CHECKING:
@@ -239,6 +258,7 @@ def seed_staged_store_metadata(
     strict: bool = True,
     session: StorageSession,
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> dict[str, Any]:
     """Copy zarr.json metadata files (and optionally named coordinate-array chunks) from final_target_uri into temp_store_uri.
 
@@ -266,6 +286,13 @@ def seed_staged_store_metadata(
     semantically identical and both preserve exact legacy metadata-only
     behavior.
 
+    With ``authority``, every ``zarr.json`` written into the workspace goes
+    through it (a ``PROCESS_LOCAL`` authority over the workspace store, for a
+    DirectZarr run); group and array documents are put only where none
+    exists, decided under the node lock. A refusal raises
+    `MetadataAuthorityError` whatever ``strict`` is, and the refused document
+    is not written. ``None`` writes the documents as plain files.
+
     Returns {group: {"seeded": bool, "files": int}} for logging.
     """
     if groups is None:
@@ -278,6 +305,7 @@ def seed_staged_store_metadata(
             temp_store_uri=temp_store_uri,
             final_target_uri=final_target_uri,
             strict=strict,
+            authority=authority,
         )
 
     for group in groups:
@@ -291,6 +319,7 @@ def seed_staged_store_metadata(
                 strict=strict,
                 results=results,
                 coordinate_arrays=coordinate_arrays,
+                authority=authority,
             )
 
             if results[group]["files"] > 0:
@@ -301,7 +330,7 @@ def seed_staged_store_metadata(
                     "metadata + coord files" if coordinate_arrays else "zarr.json files",
                     group,
                 )
-        except StagedMetadataError:
+        except (StagedMetadataError, MetadataAuthorityError):
             raise
         # Boundary: strict mode wraps any failure as StagedMetadataError (docstring contract).
         except Exception as e:
@@ -320,6 +349,7 @@ def _seed_root_metadata(
     temp_store_uri: str,
     final_target_uri: str,
     strict: bool,
+    authority: MetadataAuthority | None = None,
 ) -> None:
     """Copy root Zarr group metadata needed for handle-based reads of seeded groups."""
     from firecube.core.uris import is_remote_target, local_path_from_target
@@ -337,9 +367,20 @@ def _seed_root_metadata(
             continue
         dst_path = temp_root / name
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            if authority is None or name != "zarr.json":
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
             with fs.open(src_uri, "rb") as fh:
-                dst_path.write_bytes(fh.read())
+                raw = fh.read()
+            if name == "zarr.json":
+                # Replaced on every seed, as without an authority: a root the
+                # writer created empty takes the target's root metadata.
+                _write_document(
+                    dst_path, raw, temp_root=temp_root, key=name, authority=authority, replace=True
+                )
+            else:
+                dst_path.write_bytes(raw)
+        except MetadataAuthorityError:
+            raise
         # Boundary: strict mode wraps any failure as StagedMetadataError (docstring contract).
         except Exception as e:
             if strict:
@@ -433,6 +474,7 @@ def _seed_group_via_session(
     strict: bool,
     results: dict[str, Any],
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> None:
     from firecube.core.uris import is_remote_target, local_path_from_target
 
@@ -477,7 +519,10 @@ def _seed_group_via_session(
             results[group]["files"] += 1
             continue
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            # Under an authority the store creates a document's directory
+            # once the put is admitted, so a refusal leaves none behind.
+            if authority is None or not rel.endswith("zarr.json"):
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
             with fs.open(src_uri, "rb") as fh:
                 raw = fh.read()
             if rel.endswith("zarr.json"):
@@ -496,13 +541,47 @@ def _seed_group_via_session(
                         # negotiated at preallocate time and MUST survive staged seeding so
                         # ingest startup can verify per-group identity on the temp store.
                         attrs.pop("firecube_static_written", None)
-                dst_path.write_bytes(json.dumps(payload).encode())
+                _write_document(
+                    dst_path,
+                    json.dumps(payload).encode(),
+                    temp_root=temp_root,
+                    key=rel,
+                    authority=authority,
+                    replace=False,
+                )
             else:
                 dst_path.write_bytes(raw)
             results[group]["files"] += 1
+        except MetadataAuthorityError:
+            raise
         except Exception as e:
             if strict:
                 raise StagedMetadataError(
                     f"Failed to seed staged metadata {src_uri.to_str()} -> {dst_path}: {e}"
                 ) from e
             log.warning("Failed to seed staged metadata %s: %s", src_uri.to_str(), e)
+
+
+def _write_document(
+    dst_path: Path,
+    data: bytes,
+    *,
+    temp_root: Path,
+    key: str,
+    authority: MetadataAuthority | None,
+    replace: bool,
+) -> None:
+    """Write one seeded ``zarr.json``: under *authority* when there is one, else as a file.
+
+    *key* is the document's key in the workspace store rooted at *temp_root*
+    (``dst_path`` is that key's file). Under an authority, ``replace=False``
+    puts the document only if the workspace still holds none when the node
+    lock is held: the caller's earlier absence check is only a shortcut.
+    """
+    if authority is None:
+        dst_path.write_bytes(data)
+        return
+    if replace:
+        publish_document(authority, LocalStore(temp_root), key, data)
+    else:
+        publish_document_if_absent(authority, LocalStore(temp_root), key, data)

@@ -620,6 +620,14 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
         _ = ctx
         return
 
+    def _close_run_state(self) -> None:
+        """Optional lifecycle hook: end of every run, whatever its outcome (main thread).
+
+        Raise when the run's writes are still in flight: ``run`` then logs it
+        and leaves the workspace in place instead of deleting it.
+        """
+        return
+
     def _resolve_index_binding_at_startup(self, ctx: PluginContext) -> Any:
         """Internal helper: resolve index binding at pod startup.
 
@@ -1035,10 +1043,26 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
 
         finally:
             self._discovered_source_files = None
+            close_failed = False
+            try:
+                self._close_run_state()
+            except Exception as exc:
+                # Never masks the run's own outcome.
+                close_failed = True
+                self._log.warning("Closing the run state failed: %s", exc)
             # Teardown
             should_cleanup = (
                 self.engine_config.cleanup_workspace if hasattr(self, "engine_config") else False
             )
+            if should_cleanup and close_failed:
+                # The run's writes may still be landing in the staged store
+                # inside the workspace; deleting it would race them.
+                should_cleanup = False
+                self._log.error(
+                    "Workspace %s left in place: the run's writes were still in flight "
+                    "when its run state was closed",
+                    self._workspace.temp_root,
+                )
             with contextlib.suppress(Exception):
                 # Engine finalization populates metrics["pipeline"] via
                 # compute_run_summary(); emit that canonical run snapshot once.

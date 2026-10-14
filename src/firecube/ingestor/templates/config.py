@@ -78,8 +78,9 @@ def _validate_zarr_codecs(codecs: list[dict] | None) -> None:
         # including an ArrayBytesCodec, so skip it for the single-entry case.
         return
 
-    from zarr.core.codec_pipeline import codecs_from_list
     from zarr.registry import get_codec_class
+
+    from firecube.core.zarr._zarr_compat import codecs_from_list
 
     resolved_codecs = []
     for entry in normalized_codecs:

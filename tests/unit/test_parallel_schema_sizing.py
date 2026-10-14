@@ -35,6 +35,7 @@ from firecube.ingestor.templates.direct_zarr import (
     ZarrGroupSpec,
     _setup_global_zarr_schema,
 )
+from tests.helpers.storage import begin_write_session
 
 pytestmark = pytest.mark.unit
 
@@ -155,6 +156,7 @@ def test_parallel_schema_uses_global_expected_not_batch_local(
         storage=None,
         option=lambda key, default=None: default,
     )
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(cast(Any, SimpleNamespace(items=["x"])), cast(Any, ctx))
 
     assert result.success is True
@@ -260,6 +262,7 @@ def test_no_slot_range_uses_phase2_batch_local_path(
         storage=None,
         option=lambda key, default=None: default,
     )
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(cast(Any, SimpleNamespace(items=["x"])), cast(Any, ctx))
 
     assert result.success is True

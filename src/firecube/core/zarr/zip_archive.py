@@ -32,13 +32,13 @@ from typing import Any, cast
 import xarray as xr
 import zarr
 from zarr.buffer import default_buffer_prototype
-from zarr.core.sync import sync
 from zarr.storage import LocalStore
 
 from firecube.core.controlplane.types import CLAIMS_DIRNAME, CONTROL_DIRNAME
 from firecube.core.filesystem.store_factory import create_zip_store
 from firecube.core.storage.session import StorageSession
 from firecube.core.uris import is_remote_target, local_path_from_target
+from firecube.core.zarr._zarr_compat import sync
 
 _CLAIMS_PREFIX = f"{CONTROL_DIRNAME}/{CLAIMS_DIRNAME}/"
 _CONTROL_PREFIX = f"{CONTROL_DIRNAME}/"

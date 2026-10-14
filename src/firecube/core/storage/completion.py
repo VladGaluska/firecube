@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -53,8 +55,96 @@ def _storage_config_from_ctx(ctx: Any) -> StorageConfig | None:
     return storage_config_from_binding(session._binding)
 
 
+@dataclass(frozen=True, slots=True)
+class StagedPromotionUnits:
+    """What a staged run proved it wrote: promotion publishes it as an object delta.
+
+    Keys are store keys relative to the product root (``group/array/c/0/1``),
+    the same in the workspace and in the target.
+
+    Attributes:
+        workspace: URI of the workspace product root the keys are relative to.
+        target: URI of the target product root the delta is published onto.
+        written: Object key of every stored unit the run wrote in every cell.
+        absent: The written units whose object the write left absent (every
+            cell equals the fill value); promotion deletes them from the target.
+        publish_metadata: Puts one promoted ``zarr.json`` document (key
+            relative to ``target``) under the run's authority over the target;
+            returns ``False`` when it wrote nothing, which promotion then
+            does not count as written.
+    """
+
+    workspace: str
+    target: str
+    written: frozenset[str]
+    absent: frozenset[str]
+    publish_metadata: Callable[[str, bytes], bool | None]
+
+
+def _same_root(left: str, right: StorageUri) -> bool:
+    """Whether the URI *left* names the product root *right*."""
+    if not is_remote_target(left) and not right.is_remote():
+        return local_path_from_target(left).resolve() == Path(right.path).resolve()
+    return StorageUri.parse(left).to_str().rstrip("/") == right.to_str().rstrip("/")
+
+
+def _promote(
+    session: Any,
+    src: StorageUri,
+    dst: StorageUri,
+    *,
+    staged_units: StagedPromotionUnits | None,
+    parallel_workers: int,
+) -> StorageWriteResult:
+    """Publish a staged tree: as a delta when the run reported its units, else the whole tree.
+
+    A delta is refused, before anything is written to ``dst``, when the
+    units name other roots than ``src`` and ``dst`` (their keys would land on
+    other objects) or when the plan cannot be proved (a written unit neither
+    in the workspace nor reported absent).
+    """
+    if staged_units is None:
+        return session.upload_tree(src, dst, parallel_workers=parallel_workers)
+    if not _same_root(staged_units.workspace, src) or not _same_root(staged_units.target, dst):
+        raise StorageError(
+            f"staged promotion refused, target untouched: the run's units are relative to "
+            f"{staged_units.workspace} -> {staged_units.target}, promotion is "
+            f"{src.to_str()} -> {dst.to_str()}"
+        )
+    try:
+        plan = session.plan_promotion(
+            src, dst, written_units=staged_units.written, absent_units=staged_units.absent
+        )
+    except ValueError as exc:
+        raise StorageError(f"staged promotion refused, target untouched: {exc}") from exc
+    return session.publish_plan(
+        plan,
+        src,
+        dst,
+        parallel_workers=parallel_workers,
+        publish_metadata=staged_units.publish_metadata,
+    )
+
+
 class StorageCompleter:
-    def complete_output(self, result: Any, ctx: Any) -> StorageWriteResult:
+    def complete_output(
+        self, result: Any, ctx: Any, *, staged_units: StagedPromotionUnits | None = None
+    ) -> StorageWriteResult:
+        """Publish the run's output to the product target.
+
+        Args:
+            result: The run's result; ``outputs`` names the staged output.
+            ctx: The run context; ``ctx.storage.output`` is the target session.
+            staged_units: Given by a staged run that proved what it wrote:
+                promotion then publishes the object delta (puts, deletes of
+                units the run left all fill, ``zarr.json`` documents through
+                ``staged_units.publish_metadata``) instead of uploading the
+                whole workspace tree. ``None``: the whole tree, as always.
+
+        Raises:
+            StorageError: No target session, the staged output is missing,
+                the delta is refused (nothing written), or an upload fails.
+        """
         session = _output_session(ctx)
         if session is None:
             raise StorageError("Storage completion requires ctx.storage.output.")
@@ -62,11 +152,19 @@ class StorageCompleter:
 
         effective_write_mode = str(result.metrics.write_mode or ctx.option("write_mode") or "")
         product_uri = session.product.product_uri
+        if staged_units is None:
+            if not product_uri.is_remote():
+                return self.complete_local_storage(result, ctx)
+            return self.complete_s3_storage(result, ctx, storage_config, effective_write_mode)
         if not product_uri.is_remote():
-            return self.complete_local_storage(result, ctx)
-        return self.complete_s3_storage(result, ctx, storage_config, effective_write_mode)
+            return self.complete_local_storage(result, ctx, staged_units=staged_units)
+        return self.complete_s3_storage(
+            result, ctx, storage_config, effective_write_mode, staged_units=staged_units
+        )
 
-    def complete_local_storage(self, result: Any, ctx: Any) -> StorageWriteResult:
+    def complete_local_storage(
+        self, result: Any, ctx: Any, *, staged_units: StagedPromotionUnits | None = None
+    ) -> StorageWriteResult:
         session = _output_session(ctx)
         if session is None:
             raise StorageError("Local completion requires ctx.storage.output.")
@@ -102,9 +200,11 @@ class StorageCompleter:
             raise StorageError(f"Local staged output not found at {source_path}")
 
         upload_workers = int(ctx.option("upload_workers", 4))
-        return session.upload_tree(
+        return _promote(
+            session,
             StorageUri.from_local_path(source_path),
             StorageUri.from_local_path(final_target),
+            staged_units=staged_units,
             parallel_workers=upload_workers,
         )
 
@@ -114,6 +214,8 @@ class StorageCompleter:
         ctx: Any,
         storage_config: StorageConfig,
         effective_write_mode: str,
+        *,
+        staged_units: StagedPromotionUnits | None = None,
     ) -> StorageWriteResult:
         session = _output_session(ctx)
         if session is None:
@@ -124,7 +226,9 @@ class StorageCompleter:
         if route is CompletionRoute.DIRECT:
             return self.complete_s3_direct(result, storage_config, final_target_uri)
 
-        return self.complete_s3_staged(result, ctx, final_target_uri)
+        if staged_units is None:
+            return self.complete_s3_staged(result, ctx, final_target_uri)
+        return self.complete_s3_staged(result, ctx, final_target_uri, staged_units=staged_units)
 
     def complete_s3_direct(
         self,
@@ -169,6 +273,8 @@ class StorageCompleter:
         result: Any,
         ctx: Any,
         final_target_uri: str,
+        *,
+        staged_units: StagedPromotionUnits | None = None,
     ) -> StorageWriteResult:
         source_path = Path(str(result.outputs.primary or ""))
         if result.output_format == "zarr":
@@ -240,9 +346,11 @@ class StorageCompleter:
         upload_workers = int(ctx.option("upload_workers", 4))
         source_uri = StorageUri.from_local_path(source_path)
         with upload_span:
-            stored = session.upload_tree(
+            stored = _promote(
+                session,
                 source_uri,
                 StorageUri.parse(effective_target_uri),
+                staged_units=staged_units,
                 parallel_workers=upload_workers,
             )
 

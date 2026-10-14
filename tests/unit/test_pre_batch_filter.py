@@ -32,6 +32,7 @@ from firecube.ingestor.api import (
 from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.runtime import engine as engine_module
 from firecube.ingestor.runtime.engine import _create_batches_with_parallel_filter
+from tests.helpers.storage import begin_write_session
 
 pytestmark = pytest.mark.unit
 
@@ -164,6 +165,7 @@ def test_parallel_mode_filters_items() -> None:
     ctx = _make_runtime_ctx()
     cfg = EngineConfig(slot_start=0, slot_end=100)
     host._bind_index_at_startup(PluginContext(ctx))
+    begin_write_session(host, PluginContext(ctx), engine_config=cfg)
 
     result = _create_batches_with_parallel_filter(
         host=host, ctx=ctx, batch_size=10, engine_config=cfg, log=_log()

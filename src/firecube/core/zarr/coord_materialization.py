@@ -21,6 +21,12 @@ Callers hold the global coord-materialization claim for the duration of a
 materialization run. Pods only verify a coordinate that carries a preallocate
 marker (via ``RegionZarrWriter``); an unmarked coordinate is written by pods.
 
+Every payload write goes through `guarded_write` under this process's
+whole-array lock of the coordinate (`hold_array`), keyed as the pods key
+theirs. Every attribute and marker is written through the writer's
+``update_array_attrs``, under the writer's metadata authority, from the node
+read from the store, never through an older handle.
+
 Progress reporting is caller-injected: functions accept a
 ``report`` callable (the CLI passes ``click.echo``) so the module stays
 free of any CLI dependency. Failures raise ``SchemaDriftError`` for
@@ -30,11 +36,14 @@ problems.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from typing import Any
 
 import numpy as np
+from zarr.storage import LocalStore
 
 from firecube.core.errors import ConfigurationError, SchemaDriftError
 from firecube.core.index_resolve import (
@@ -57,7 +66,10 @@ from firecube.core.zarr._reserved_attrs import (
     RESERVED_ARRAY_ATTRS,
 )
 from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
+from firecube.core.zarr._unit_locks import _store_identity
+from firecube.core.zarr.guarded_write import ArrayHold, guarded_write, hold_array, selection_box
 from firecube.core.zarr.region_writer import RegionZarrWriter
+from firecube.core.zarr.unit_ownership import WriteFootprint
 
 log = logging.getLogger("firecube.core.zarr.coord_materialization")
 
@@ -68,6 +80,53 @@ logging.addLevelName(NOTICE_LEVEL, "NOTICE")
 def _noop_report(message: str) -> None:
     """Default progress sink: discard the message."""
     del message
+
+
+def _hold_coord(writer: Any, coord_path: str) -> AbstractContextManager[ArrayHold]:
+    """Hold the whole-array lock of *coord_path* in *writer*'s store (`hold_array`).
+
+    Keyed by the store identity of the writer's metadata authority, which is
+    spelled as the stored-unit locks spell it.
+    """
+    return hold_array(writer.authority.scope.store, coord_path)
+
+
+@contextlib.contextmanager
+def _slot_writes(arr: Any, coord_path: str, hold: ArrayHold | None) -> Iterator[ArrayHold]:
+    """Yield *hold*, or the whole-array lock of *coord_path* taken here when it is ``None``.
+
+    Without the caller's hold only a local store can be keyed (its resolved
+    path is its identity); any other store is refused, so the lock is never
+    keyed by a spelling the other writers of the array do not use.
+    """
+    if hold is not None:
+        yield hold
+        return
+    if not isinstance(arr.store, LocalStore):
+        raise ValueError(
+            f"writing {coord_path!r} in a {type(arr.store).__name__} needs the caller's "
+            "hold_array hold of it"
+        )
+    with hold_array(_store_identity("", arr.store), coord_path) as taken:
+        yield taken
+
+
+def _write_coord(arr: Any, hold: ArrayHold, selection: Any, payload: Any) -> None:
+    """``arr[selection] = payload`` through `guarded_write` under the whole-array *hold*.
+
+    The footprint is the box *selection* covers (an integer, a slice or ``...``).
+    """
+    shape = tuple(int(n) for n in arr.shape)
+    box = selection_box(selection, shape) or tuple((0, n) for n in shape)
+    guarded_write(
+        arr,
+        WriteFootprint(hold.array_path, box),
+        selection,
+        payload,
+        store=hold.store,
+        write_empty_chunks=None,
+        hold=hold,
+    )
 
 
 def existing_array(root: Any, array_path: str) -> Any | None:
@@ -180,24 +239,20 @@ def materialize_irregular_coord_array(
                 f"Existing coord array '{coord_path}' carries {ATTR_COORD_MANAGED}; "
                 "refusing to seal engine-managed observed coordinates as an irregular axis."
             )
-        existing_values = np.asarray(existing[:])
-        if np.array_equal(existing_values, coord_data):
-            if not bool(existing.attrs.get(ATTR_PREALLOCATED, False)):
-                existing.attrs[ATTR_PREALLOCATED] = True
-            existing.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
-            report(f"array {coord_path}: existing irregular coord array matches; no-op")
-            return
-        if not values_all_nat(existing_values):
-            raise SchemaDriftError(
-                f"Existing coord array '{coord_path}' has values that differ from the "
-                "resolved IrregularTimeAxis. Delete it or align the plugin's axis values."
-            )
-        existing[...] = coord_data
-        merged_attrs = dict(existing.attrs)
-        merged_attrs.update(attrs)
-        existing.attrs.update(merged_attrs)
-        existing.attrs[ATTR_PREALLOCATED] = True
-        existing.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
+        stamps = {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash}
+        with _hold_coord(writer, coord_path) as hold:
+            existing_values = np.asarray(existing[:])
+            if np.array_equal(existing_values, coord_data):
+                writer.update_array_attrs(coord_path, stamps)
+                report(f"array {coord_path}: existing irregular coord array matches; no-op")
+                return
+            if not values_all_nat(existing_values):
+                raise SchemaDriftError(
+                    f"Existing coord array '{coord_path}' has values that differ from the "
+                    "resolved IrregularTimeAxis. Delete it or align the plugin's axis values."
+                )
+            _write_coord(existing, hold, ..., coord_data)
+        writer.update_array_attrs(coord_path, {**attrs, **stamps})
         report(f"array {coord_path}: filled existing irregular coord array")
         return
 
@@ -210,9 +265,12 @@ def materialize_irregular_coord_array(
         attrs=attrs,
         dimension_names=dim_names,
     )
-    coord_arr[...] = coord_data
-    coord_arr.attrs[ATTR_PREALLOCATED] = True
-    coord_arr.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
+    with _hold_coord(writer, coord_path) as hold:
+        _write_coord(coord_arr, hold, ..., coord_data)
+    writer.update_array_attrs(
+        coord_path,
+        {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
+    )
     report(f"array {coord_path}: created (irregular coord materialization)")
 
 
@@ -300,25 +358,34 @@ def write_observed_regular_coord_values(
     coord_path: str,
     values_by_slot: dict[int, Any],
     target_dtype: np.dtype[Any],
+    hold: ArrayHold | None = None,
 ) -> tuple[int, int]:
+    """Fill NaT slots of a fresh observed coordinate; refuse a slot holding another value.
+
+    Runs under *hold*, the caller's whole-array lock of *coord_path*; without
+    one the lock is taken here (a local store only, see `_slot_writes`).
+    """
     written = 0
     matched = 0
-    for slot_index, coordinate in sorted(values_by_slot.items()):
-        desired = RegionZarrWriter._normalize_for_coord_compare(
-            coord_to_datetime64(coordinate), target_dtype
-        )
-        current_norm = RegionZarrWriter._normalize_for_coord_compare(arr[slot_index], target_dtype)
-        if np.isnat(current_norm):
-            arr[slot_index] = desired
-            written += 1
-            continue
-        if current_norm == desired:
-            matched += 1
-            continue
-        raise SchemaDriftError(
-            f"coordinate array {coord_path} slot {slot_index} drift: "
-            f"stored value {current_norm!r}, discovered value {desired!r}"
-        )
+    with _slot_writes(arr, coord_path, hold) as held:
+        for slot_index, coordinate in sorted(values_by_slot.items()):
+            desired = RegionZarrWriter._normalize_for_coord_compare(
+                coord_to_datetime64(coordinate), target_dtype
+            )
+            current_norm = RegionZarrWriter._normalize_for_coord_compare(
+                arr[slot_index], target_dtype
+            )
+            if np.isnat(current_norm):
+                _write_coord(arr, held, slot_index, desired)
+                written += 1
+                continue
+            if current_norm == desired:
+                matched += 1
+                continue
+            raise SchemaDriftError(
+                f"coordinate array {coord_path} slot {slot_index} drift: "
+                f"stored value {current_norm!r}, discovered value {desired!r}"
+            )
     return written, matched
 
 
@@ -328,27 +395,33 @@ def reconcile_observed_regular_coord_values(
     coord_path: str,
     values_by_slot: dict[int, Any],
     target_dtype: np.dtype[Any],
+    hold: ArrayHold | None = None,
 ) -> tuple[int, int]:
-    """Fill NaT observed slots, no-op matching slots, and refuse drift."""
+    """Fill NaT observed slots, no-op matching slots, and refuse drift.
+
+    Runs under *hold*, the caller's whole-array lock of *coord_path*; without
+    one the lock is taken here (a local store only, see `_slot_writes`).
+    """
     written = 0
     matched = 0
-    for slot_index, coordinate in sorted(values_by_slot.items()):
-        desired = RegionZarrWriter._normalize_for_coord_compare(
-            coord_to_datetime64(coordinate), target_dtype
-        )
-        stored = arr[slot_index]
-        stored_norm = RegionZarrWriter._normalize_for_coord_compare(stored, target_dtype)
-        if np.isnat(stored_norm):
-            arr[slot_index] = desired
-            written += 1
-            continue
-        if stored_norm == desired:
-            matched += 1
-            continue
-        raise SchemaDriftError(
-            f"coordinate array {coord_path} slot {slot_index} drift: "
-            f"stored value {stored_norm!r}, incoming value {desired!r}"
-        )
+    with _slot_writes(arr, coord_path, hold) as held:
+        for slot_index, coordinate in sorted(values_by_slot.items()):
+            desired = RegionZarrWriter._normalize_for_coord_compare(
+                coord_to_datetime64(coordinate), target_dtype
+            )
+            stored = arr[slot_index]
+            stored_norm = RegionZarrWriter._normalize_for_coord_compare(stored, target_dtype)
+            if np.isnat(stored_norm):
+                _write_coord(arr, held, slot_index, desired)
+                written += 1
+                continue
+            if stored_norm == desired:
+                matched += 1
+                continue
+            raise SchemaDriftError(
+                f"coordinate array {coord_path} slot {slot_index} drift: "
+                f"stored value {stored_norm!r}, incoming value {desired!r}"
+            )
     if written:
         log.log(
             NOTICE_LEVEL,
@@ -359,9 +432,14 @@ def reconcile_observed_regular_coord_values(
     return written, matched
 
 
-def stamp_coord_managed_marker(arr: Any, coord_path: str) -> None:
+def stamp_coord_managed_marker(writer: Any, coord_path: str) -> Any:
+    """Stamp ``ATTR_COORD_MANAGED`` through *writer*'s authority; return the node as written.
+
+    Raises:
+        SchemaDriftError: The marker could not be written; names the cleanup.
+    """
     try:
-        arr.attrs[ATTR_COORD_MANAGED] = True
+        return writer.update_array_attrs(coord_path, {ATTR_COORD_MANAGED: True})
     except Exception as exc:
         raise SchemaDriftError(
             f"failed to stamp {ATTR_COORD_MANAGED} on coordinate array {coord_path}; "
@@ -462,9 +540,7 @@ def materialize_regular_coord_array(
                 f"expected {expected_shape}. Refuse to resize silently."
             )
         assert_coord_markers_consistent(dict(existing.attrs), coord_path)
-        existing_attrs = dict(existing.attrs)
-        existing_attrs.update(attrs)
-        existing.attrs.update(existing_attrs)
+        existing = writer.update_array_attrs(coord_path, attrs)
         window_slice = slice(slot_start, effective_slot_end)
         window_label = (
             ""
@@ -483,33 +559,35 @@ def materialize_regular_coord_array(
             # value is always safe: windowed and full prefills converge to the
             # same array. Only a stored non-NaT value that differs from the
             # nominal grid is drift.
-            stored_window = np.asarray(existing[window_slice])
-            expected_window = np.asarray(values[window_slice])
-            filled = 0
-            for offset, (stored_value, incoming_value) in enumerate(
-                zip(stored_window.flat, expected_window.flat, strict=True)
-            ):
-                stored_norm = RegionZarrWriter._normalize_for_coord_compare(
-                    stored_value, target_dtype
-                )
-                if np.isnat(stored_norm):
-                    stored_window[offset] = incoming_value
-                    filled += 1
-                    continue
-                incoming_norm = RegionZarrWriter._normalize_for_coord_compare(
-                    incoming_value, target_dtype
-                )
-                if stored_norm != incoming_norm:
-                    slot_index = slot_start + offset
-                    raise SchemaDriftError(
-                        f"coordinate array {coord_path} diverged from nominal grid at slot "
-                        f"{slot_index}: stored {stored_value!r}, incoming {incoming_value!r}"
+            with _hold_coord(writer, coord_path) as hold:
+                stored_window = np.asarray(existing[window_slice])
+                expected_window = np.asarray(values[window_slice])
+                filled = 0
+                for offset, (stored_value, incoming_value) in enumerate(
+                    zip(stored_window.flat, expected_window.flat, strict=True)
+                ):
+                    stored_norm = RegionZarrWriter._normalize_for_coord_compare(
+                        stored_value, target_dtype
                     )
-            if filled:
-                existing[window_slice] = stored_window
-            if not bool(existing.attrs.get(ATTR_PREALLOCATED, False)):
-                existing.attrs[ATTR_PREALLOCATED] = True
-            existing.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
+                    if np.isnat(stored_norm):
+                        stored_window[offset] = incoming_value
+                        filled += 1
+                        continue
+                    incoming_norm = RegionZarrWriter._normalize_for_coord_compare(
+                        incoming_value, target_dtype
+                    )
+                    if stored_norm != incoming_norm:
+                        slot_index = slot_start + offset
+                        raise SchemaDriftError(
+                            f"coordinate array {coord_path} diverged from nominal grid at slot "
+                            f"{slot_index}: stored {stored_value!r}, incoming {incoming_value!r}"
+                        )
+                if filled:
+                    _write_coord(existing, hold, window_slice, stored_window)
+            writer.update_array_attrs(
+                coord_path,
+                {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
+            )
             if filled == len(stored_window):
                 report(f"array {coord_path}: filled existing regular coord array{window_label}")
             elif filled:
@@ -540,13 +618,17 @@ def materialize_regular_coord_array(
                     "legacy coordinate shell with existing `firecube chunks` tooling "
                     "before retrying."
                 )
-            written, matched = reconcile_observed_regular_coord_values(
-                arr=existing,
-                coord_path=coord_path,
-                values_by_slot=observed_values,
-                target_dtype=target_dtype,
+            with _hold_coord(writer, coord_path) as hold:
+                written, matched = reconcile_observed_regular_coord_values(
+                    arr=existing,
+                    coord_path=coord_path,
+                    values_by_slot=observed_values,
+                    target_dtype=target_dtype,
+                    hold=hold,
+                )
+            writer.update_array_attrs(
+                coord_path, {FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash}
             )
-            existing.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
             if observed_values and written == 0 and matched == len(observed_values):
                 report(
                     f"array {coord_path}: observed coord values already match in window "
@@ -582,12 +664,16 @@ def materialize_regular_coord_array(
         dimension_names=(axis.coordinate,),
     )
     if prefill:
-        if slot_start == 0 and effective_slot_end == slot_count:
-            arr[...] = values
-        else:
-            arr[slice(slot_start, effective_slot_end)] = values[slot_start:effective_slot_end]
-        arr.attrs[ATTR_PREALLOCATED] = True
-        arr.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
+        with _hold_coord(writer, coord_path) as hold:
+            if slot_start == 0 and effective_slot_end == slot_count:
+                _write_coord(arr, hold, ..., values)
+            else:
+                window = slice(slot_start, effective_slot_end)
+                _write_coord(arr, hold, window, values[slot_start:effective_slot_end])
+        writer.update_array_attrs(
+            coord_path,
+            {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
+        )
         if slot_start == 0 and effective_slot_end == slot_count:
             report(f"array {coord_path}: created (regular coord materialization)")
         else:
@@ -596,21 +682,27 @@ def materialize_regular_coord_array(
                 f"[{slot_start}, {effective_slot_end})"
             )
     elif manage_observed:
-        stamp_coord_managed_marker(arr, coord_path)
-        write_observed_regular_coord_values(
-            arr=arr,
-            coord_path=coord_path,
-            values_by_slot=observed_values,
-            target_dtype=target_dtype,
+        arr = stamp_coord_managed_marker(writer, coord_path)
+        with _hold_coord(writer, coord_path) as hold:
+            write_observed_regular_coord_values(
+                arr=arr,
+                coord_path=coord_path,
+                values_by_slot=observed_values,
+                target_dtype=target_dtype,
+                hold=hold,
+            )
+        writer.update_array_attrs(
+            coord_path, {FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash}
         )
-        arr.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
         report(
             f"array {coord_path}: created and materialized {len(observed_values)} "
             f"observed coord values in window [{slot_start}, {effective_slot_end})"
         )
     elif observed_regime:
-        stamp_coord_managed_marker(arr, coord_path)
-        arr.attrs[FIRECUBE_GROUP_IDENTITY_HASH_ATTR] = group_identity_hash
+        stamp_coord_managed_marker(writer, coord_path)
+        writer.update_array_attrs(
+            coord_path, {FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash}
+        )
         report(
             f"array {coord_path}: created (dense chunking, coord-managed; values "
             "written at ingest under observed-value reconciliation)"

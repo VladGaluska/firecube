@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 # pyright: reportCallIssue=false, reportAttributeAccessIssue=false
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -74,8 +76,22 @@ from firecube.core.slot_index import (
     SlotIndexModel,
 )
 from firecube.core.storage.binding import StorageBinding
+from firecube.core.zarr._unit_locks import _store_identity
+from firecube.core.zarr.metadata_authority import (
+    HeldClaim,
+    MetadataScope,
+    adopt_held_claim,
+    ensure_group,
+    hold_authority,
+    set_attributes,
+)
 
 log = logging.getLogger(__name__)
+
+# The claim a winner holds while it mirrors; unset for the Row-1 losers.
+_HELD_CLAIM: contextvars.ContextVar[HeldClaim | None] = contextvars.ContextVar(
+    "firecube_held_mirror_claim", default=None
+)
 
 
 def _format_duration(seconds: float) -> str:
@@ -1048,8 +1064,11 @@ class ChunkManager:
         backoff = float(initial_backoff_s)
         for attempt in range(int(max_retries) + 1):
             try:
-                with self.acquire_claim(
-                    product=product, domain=domain, owner_id=record.recorded_by_run_id
+                with (
+                    self.acquire_claim(
+                        product=product, domain=domain, owner_id=record.recorded_by_run_id
+                    ),
+                    self._holding(domain, record.recorded_by_run_id),
                 ):
                     return self._apply_resolved_index_precedence(product, record)
             except ClaimConflictError:
@@ -1305,7 +1324,10 @@ class ChunkManager:
         backoff = float(initial_backoff_s)
         for attempt in range(int(max_retries) + 1):
             try:
-                with self.acquire_claim(product=product, domain=domain, owner_id=run_id):
+                with (
+                    self.acquire_claim(product=product, domain=domain, owner_id=run_id),
+                    self._holding(domain, run_id),
+                ):
                     return self._apply_slot_model_precedence(product, model, run_id)
             except ClaimConflictError:
                 # Unified 5-row convergence policy (mirrors
@@ -1505,18 +1527,13 @@ class ChunkManager:
                 f"cp_record={cp_record!r} attrs_hash={attrs_hash!r}"
             )
 
-    def _open_zarr_root_for_mirror(self, product: str) -> Any:
-        """Open the zarr root group for attribute mirroring, tolerating the
-        ``open_group(mode="a")`` check-then-create race that surfaces when
-        the claim-holding winner and Row-1 re-mirror losers race
-        to create the group. Returns the opened zarr group.
+    def _open_store_for_mirror(self, product: str) -> Any:
+        """Build the store behind the zarr root for attribute mirroring.
 
-        The retry is safe because ``mode="a"`` opens the group in place once
-        it exists — no divergent state can be written between attempts.
+        Only constructs the store: nothing is read or created here. A missing
+        root group is created later, under the mirror's metadata authority.
         """
-        import zarr
-        from zarr.errors import ContainsGroupError
-        from zarr.storage import LocalStore
+        from zarr.storage import FsspecStore, LocalStore
 
         from firecube.core.filesystem.store_factory import create_zarr_store
         from firecube.core.uris import is_remote_target, local_path_from_target
@@ -1529,21 +1546,52 @@ class ChunkManager:
                     "storage_config is required to open the remote zarr root for attr mirroring"
                 )
             handle = create_zarr_store(uri=product_root, storage_config=storage_config, mode="a")
-            open_kwargs: dict[str, Any] = {**handle.zarr_kwargs(), "mode": "a", "zarr_format": 3}
-        else:
-            store = LocalStore(str(local_path_from_target(product_root)))
-            open_kwargs = {"store": store, "mode": "a", "zarr_format": 3}
+            kwargs = handle.zarr_kwargs()
+            store = kwargs["store"]
+            if isinstance(store, str):
+                # The fsspec driver hands back a URL plus options; the metadata
+                # authority needs the configured Store object itself.
+                return FsspecStore.from_url(
+                    store, storage_options=kwargs.get("storage_options"), read_only=False
+                )
+            return store
+        return LocalStore(str(local_path_from_target(product_root)))
 
-        last_exc: BaseException | None = None
-        for attempt in range(4):
-            try:
-                return zarr.open_group(**open_kwargs)
-            except ContainsGroupError as exc:
-                last_exc = exc
-                if attempt == 3:
-                    raise
-                time.sleep(0.005 * (attempt + 1))
-        raise RuntimeError("failed to open zarr root for mirror after retries") from last_exc
+    @contextlib.contextmanager
+    def _holding(self, domain: WriteDomain, owner_id: str) -> Generator[None, None, None]:
+        """Name the claim the calling winner holds, for the root mirrors inside it.
+
+        Only a winner, inside its ``with acquire_claim(...)`` block, enters this.
+        The mirrors read it to build their authority; code outside it (the
+        Row-1 losers) sees nothing and mirrors under a process-local authority.
+        """
+        token = _HELD_CLAIM.set(HeldClaim(domain_id=domain.identifier, owner_id=owner_id))
+        try:
+            yield
+        finally:
+            _HELD_CLAIM.reset(token)
+
+    def _write_root_mirror(self, product: str, category: str, attrs: Mapping[str, Any]) -> None:
+        """Write *attrs* to the zarr root through a metadata authority.
+
+        The authority adopts the ``<category>:current`` claim when the caller is
+        a winner holding it (see `_holding`); otherwise it is PROCESS_LOCAL (no claim is held).
+        """
+        store = self._open_store_for_mirror(product)
+        scope = MetadataScope(
+            _store_identity(str(self.get_product_root(product)), store),
+            backing=store,
+        )
+        held = _HELD_CLAIM.get()
+        expected = WriteDomain(product=product, category=category, name="current").identifier
+        authority_cm = (
+            adopt_held_claim(scope, held)
+            if held is not None and held.domain_id == expected
+            else hold_authority(scope, claim=None)
+        )
+        with authority_cm as authority:
+            ensure_group(authority, store, "")
+            set_attributes(authority, store, "", attrs)
 
     def _mirror_attrs(self, product: str, record: SlotIndexModelRecord) -> None:
         """Write the slot-index model attrs to the zarr root group.
@@ -1557,12 +1605,13 @@ class ChunkManager:
         same value deterministically from the CP record, so concurrent
         invocations converge on identical attrs.
         """
-        root = self._open_zarr_root_for_mirror(product)
-        root.attrs.update(
+        self._write_root_mirror(
+            product,
+            "slot_index_model",
             {
                 SLOT_INDEX_MODEL_ATTR: record.model.canonical_bytes().decode("utf-8"),
                 SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR: record.identity_hash,
-            }
+            },
         )
 
     def _mirror_resolved_index_attrs(self, product: str, record: ResolvedIndexRecord) -> None:
@@ -1577,12 +1626,13 @@ class ChunkManager:
         same value deterministically from the CP record, so concurrent
         invocations converge on identical attrs.
         """
-        root = self._open_zarr_root_for_mirror(product)
-        root.attrs.update(
+        self._write_root_mirror(
+            product,
+            "resolved_index",
             {
                 RESOLVED_INDEX_ATTR: canonical_index_bytes(record.index).decode("utf-8"),
                 RESOLVED_INDEX_IDENTITY_HASH_ATTR: record.identity_hash,
-            }
+            },
         )
 
     def _read_root_index_attrs_hash(

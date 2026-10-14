@@ -30,6 +30,7 @@ from firecube.ingestor.config.engine import EngineConfig
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import IndexedRegionStrategy
 from firecube.ingestor.templates.direct_zarr import _setup_global_zarr_schema
 from firecube.ingestor.types.context import PipelineBatch
+from tests.helpers.storage import begin_write_session
 
 
 class _TimeDirectIngestor(DirectZarrIngestor):
@@ -124,6 +125,7 @@ def test_process_batch_builds_region_strategy_with_declared_time_dim(
         MagicMock(return_value=str(tmp_path / "out.zarr")),
     )
 
+    begin_write_session(ingestor, _plugin_ctx())
     result = ingestor._process_batch(
         PipelineBatch(batch_id="batch-1", data_path=tmp_path, items=["source.nc"]),
         _plugin_ctx(),

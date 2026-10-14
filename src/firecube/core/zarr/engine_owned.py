@@ -49,6 +49,7 @@ from firecube.core.zarr._sealing_markers import (
     ATTR_ENGINE_OWNED_COMPLETE,
     ATTR_ENGINE_OWNED_SLOTS,
 )
+from firecube.core.zarr.metadata_authority import MetadataAuthority, set_attributes
 
 PREALLOCATE_COMMAND = (
     "firecube zarr preallocate <plugin> --target <uri> --product-name <name> "
@@ -345,6 +346,8 @@ def _slot_ranges(slots: Iterable[int]) -> list[list[int]]:
 def materialize_engine_owned_array(
     *,
     arr: Any,
+    root: Any,
+    authority: MetadataAuthority,
     array_path: str,
     values_by_slot: Mapping[int, Any],
     report: Callable[[str], None],
@@ -369,57 +372,73 @@ def materialize_engine_owned_array(
     cleared before anything changes and stamped last, so ingest never takes
     an interrupted run for a finished one. The
     caller holds the global coord-materialization claim, so no other writer
-    touches the array.
+    process touches the array.
+
+    The read, merge and write run under this process's whole-array lock of
+    *array_path* (`hold_array`), the payload write through `guarded_write`.
+    *arr* is used for that payload only: every marker is written under
+    *authority* through `metadata_authority.set_attributes`, which reads the
+    node below *root* from the store first, never through *arr*.
     """
+    # Function-scope import: guarded_write imports unit_ownership, which imports this module.
+    from firecube.core.zarr.guarded_write import WriteFootprint, guarded_write, hold_array
+
+    def stamp(attrs: Mapping[str, Any]) -> None:
+        set_attributes(authority, root, array_path, attrs)
+
     if not is_engine_owned_reserved(arr):
         raise engine_owned_adoption_error(array_path)
-    stored = np.asarray(arr[...])
-    fill_value = arr.fill_value
-    written_slots = _written_slots(arr)
-    merged = stored.copy()
-    added: set[int] = set()
-    changed = False
-    for slot, desired in sorted(values_by_slot.items()):
-        current = stored[slot]
-        if slot in written_slots:
-            if not engine_owned_values_equal(current, desired):
+    with hold_array(authority.scope.store, array_path) as hold:
+        stored = np.asarray(arr[...])
+        fill_value = arr.fill_value
+        written_slots = _written_slots(arr)
+        merged = stored.copy()
+        added: set[int] = set()
+        changed = False
+        for slot, desired in sorted(values_by_slot.items()):
+            current = stored[slot]
+            if slot in written_slots:
+                if not engine_owned_values_equal(current, desired):
+                    raise SchemaDriftError(
+                        f"engine-owned array {array_path!r} slot {slot} drift: stored {current}, "
+                        f"sources give {desired}. Delete the array or fix the plugin's values."
+                    )
+                continue
+            if not (
+                engine_owned_values_equal(current, desired)
+                or engine_owned_values_equal(current, fill_value)
+            ):
                 raise SchemaDriftError(
-                    f"engine-owned array {array_path!r} slot {slot} drift: stored {current}, "
-                    f"sources give {desired}. Delete the array or fix the plugin's values."
+                    f"engine-owned array {array_path!r} slot {slot} drift: stored {current} "
+                    f"outside the written slots, sources give {desired}"
                 )
-            continue
-        if not (
-            engine_owned_values_equal(current, desired)
-            or engine_owned_values_equal(current, fill_value)
-        ):
-            raise SchemaDriftError(
-                f"engine-owned array {array_path!r} slot {slot} drift: stored {current} "
-                f"outside the written slots, sources give {desired}"
+            changed = changed or not engine_owned_values_equal(current, desired)
+            merged[slot] = desired
+            added.add(slot)
+        # Slots already holding their final value (a fill-valued value such as NaN
+        # included) are listed BEFORE the payload write, so no crash leaves them
+        # looking like holes. Slots that still need a write are listed after it:
+        # interrupted before, they hold the fill value and stay fillable; after, their
+        # non-fill value is guarded by the "stored outside the written slots" rule.
+        settled = {slot for slot in added if engine_owned_values_equal(stored[slot], merged[slot])}
+        complete = is_engine_owned_materialized(arr)
+        if complete and added:
+            stamp({ATTR_ENGINE_OWNED_COMPLETE: False})
+            complete = False
+        # The marker and an empty list were written with the array's creation
+        # metadata, so an array preallocate created is never marked without a list
+        # (which counts as every slot written); only the list grows here.
+        if settled:
+            stamp({ATTR_ENGINE_OWNED_SLOTS: _slot_ranges(written_slots | settled)})
+        if changed:
+            whole = WriteFootprint(hold.array_path, tuple((0, int(n)) for n in arr.shape))
+            guarded_write(
+                arr, whole, ..., merged, store=hold.store, write_empty_chunks=None, hold=hold
             )
-        changed = changed or not engine_owned_values_equal(current, desired)
-        merged[slot] = desired
-        added.add(slot)
-    # Slots already holding their final value (a fill-valued value such as NaN
-    # included) are listed BEFORE the payload write, so no crash leaves them
-    # looking like holes. Slots that still need a write are listed after it:
-    # interrupted before, they hold the fill value and stay fillable; after, their
-    # non-fill value is guarded by the "stored outside the written slots" rule.
-    settled = {slot for slot in added if engine_owned_values_equal(stored[slot], merged[slot])}
-    complete = is_engine_owned_materialized(arr)
-    if complete and added:
-        arr.attrs[ATTR_ENGINE_OWNED_COMPLETE] = False
-        complete = False
-    # The marker and an empty list were written with the array's creation
-    # metadata, so an array preallocate created is never marked without a list
-    # (which counts as every slot written); only the list grows here.
-    if settled:
-        arr.attrs[ATTR_ENGINE_OWNED_SLOTS] = _slot_ranges(written_slots | settled)
-    if changed:
-        arr[...] = merged
-    if added - settled:
-        arr.attrs[ATTR_ENGINE_OWNED_SLOTS] = _slot_ranges(written_slots | added)
-    if not complete:
-        arr.attrs[ATTR_ENGINE_OWNED_COMPLETE] = True
+        if added - settled:
+            stamp({ATTR_ENGINE_OWNED_SLOTS: _slot_ranges(written_slots | added)})
+        if not complete:
+            stamp({ATTR_ENGINE_OWNED_COMPLETE: True})
     report(
         f"array {array_path}: engine-owned values written for {len(added)} slot(s), "
         f"{len(values_by_slot) - len(added)} already stored"

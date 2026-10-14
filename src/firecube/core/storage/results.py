@@ -28,3 +28,4 @@ class StorageWriteResult:
     files_written: int
     duration_s: float
     storage_type: str
+    files_deleted: int = 0

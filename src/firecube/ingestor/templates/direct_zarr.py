@@ -30,17 +30,17 @@ The template handles store opening, claim coordination, coverage tracking, and m
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import logging
 import random
-import threading
 import time
 from abc import abstractmethod
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -58,20 +58,8 @@ from firecube.core.api import (
 from firecube.core.errors import ClaimConflictError, IndexedWriteCompilationError
 from firecube.core.indexed_write import IndexedWrite
 from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
-from firecube.core.zarr.engine_owned import (
-    is_engine_owned_spec,
-    is_pod_written_slot_array,
-    require_engine_owned_ownership,
-    require_engine_owned_slots,
-    verify_engine_owned_writes,
-)
-from firecube.core.zarr.unit_ownership import (
-    StagedSlotWrite,
-    require_planned_slots_fill_units,
-    require_staged_units_fully_written,
-    require_window_owns_stored_units,
-    stored_write_unit,
-)
+from firecube.core.zarr.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.metadata_authority import MetadataAuthority, hold_authority
 from firecube.ingestor.api import (
     BaseIngestor,
     ConfigurationError,
@@ -88,12 +76,20 @@ from firecube.ingestor.api import (
     ZarrTemplateConfig,
     merge_batch_metrics,
 )
+from firecube.ingestor.runtime.zarr.direct_region_adapter import (
+    DirectRegionAdapter,
+    open_zarr_array,
+)
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import (
     RegionZarrWriter,
-    require_intents_in_slot_window,
+    ensure_group_ancestors,
 )
 from firecube.ingestor.runtime.zarr.write import derive_effective_codecs_for_spec
+from firecube.ingestor.runtime.zarr.write_session import ZarrWriteSession
 from firecube.ingestor.types import write_mode_policy
+
+if TYPE_CHECKING:
+    from firecube.core.storage.completion import StagedPromotionUnits
 
 log = logging.getLogger(__name__)
 
@@ -192,42 +188,6 @@ def _compute_schema_hash(schema: Sequence[Any], global_expected: dict[str, int])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _require_declared_targets(
-    intents: Sequence[WriteIntent], schema: Sequence[ZarrGroupSpec]
-) -> None:
-    """Refuse write intents aimed at an array ``zarr_schema()`` does not declare.
-
-    The ownership checks, the staged ledger and schema setup judge declared
-    arrays only, so an undeclared target would be written unchecked. A
-    ``timestamp`` intent always writes its group's time coordinate, whatever
-    its ``array`` field holds, and is exempt.
-    """
-    declared: dict[str, set[str]] = {}
-    for group_spec in schema:
-        declared.setdefault(group_spec.group, set()).update(a.name for a in group_spec.arrays)
-    undeclared = sorted(
-        {
-            (intent.group, intent.array, intent.kind)
-            for intent in intents
-            if intent.kind != "timestamp" and intent.array not in declared.get(intent.group, ())
-        }
-    )
-    if not undeclared:
-        return
-    group, array, kind = undeclared[0]
-    arrays = declared.get(group)
-    group_note = (
-        f"group {group!r} is not declared"
-        if arrays is None
-        else f"group {group!r} declares {sorted(arrays)}"
-    )
-    raise ConfigurationError(
-        f"WriteIntent.{kind} targets '{group}/{array}', which zarr_schema() does not "
-        f"declare ({group_note}); declare the array in zarr_schema() or stop emitting "
-        "write intents for it"
-    )
-
-
 def _schema_dimension_names(arr_spec: Any, time_coord_name: str) -> tuple[str, ...] | None:
     explicit = getattr(arr_spec, "dimension_names", None)
     if explicit is not None:
@@ -236,6 +196,34 @@ def _schema_dimension_names(arr_spec: Any, time_coord_name: str) -> tuple[str, .
     if getattr(arr_spec, "name", None) == time_coord_name and len(shape) == 1:
         return (time_coord_name,)
     return None
+
+
+def _hold_setup_authority(
+    writer: RegionZarrWriter,
+    group_name: str,
+    *,
+    chunk_manager: Any,
+    product: str,
+    domain: WriteDomain,
+    owner_id: str,
+) -> contextlib.AbstractContextManager[MetadataAuthority]:
+    """Take the setup claim of *group_name* and the authority over its subtree it entitles.
+
+    The authority is released before the claim. Without a control plane
+    (``chunk_manager`` is ``None``) it is explicitly ``PROCESS_LOCAL``: it
+    excludes the threads of this process only.
+    """
+    claim = (
+        chunk_manager.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        if chunk_manager is not None
+        else None
+    )
+    return hold_authority(
+        writer.metadata_scope(group_name),
+        claim=claim,
+        claim_domain=domain.identifier,
+        owner_id=owner_id,
+    )
 
 
 def _setup_global_zarr_schema(
@@ -352,16 +340,17 @@ def _setup_global_zarr_schema(
         _schema_backoff = 0.1
         for _schema_attempt in range(_schema_max_retries + 1):
             try:
-                claim_ctx = (
-                    chunk_manager.acquire_claim(
-                        product=product,
-                        domain=domain,
-                        owner_id=f"{run_id}:{group_name}:schema_global",
-                    )
-                    if chunk_manager is not None
-                    else contextlib.nullcontext()
-                )
-                with claim_ctx:
+                writer = _make_writer(group_name)
+                # Every metadata change below is made under the authority this
+                # claim entitles, over the group's subtree.
+                with _hold_setup_authority(
+                    writer,
+                    group_name,
+                    chunk_manager=chunk_manager,
+                    product=product,
+                    domain=domain,
+                    owner_id=f"{run_id}:{group_name}:schema_global",
+                ) as authority:
                     # Re-check INSIDE the claim: another pod may have converged
                     # between the outer satisfied-check and claim acquisition.
                     if group_schema_satisfied(
@@ -377,7 +366,8 @@ def _setup_global_zarr_schema(
                             "converged_under_claim",
                         )
                         break
-                    writer = _make_writer(group_name)
+                    # The group's authority may not create nodes above it.
+                    ensure_group_ancestors(writer, group_name)
                     existing_shape: tuple[int, ...] | None = None
                     newly_created = False
                     for arr_spec in group_spec.arrays:
@@ -417,6 +407,7 @@ def _setup_global_zarr_schema(
                             filters=_eff_filters,
                             serializer=_eff_serializer,
                             compressors=_eff_compressors,
+                            authority=authority,
                         )
                         if not array_exists:
                             newly_created = True
@@ -438,7 +429,9 @@ def _setup_global_zarr_schema(
                                         f"< global_expected={expected_time_count}. Run `firecube zarr preallocate` first."
                                     ) from exc
                                 raise
-                    writer.set_group_attrs(group_name, getattr(group_spec, "attrs", None))
+                    writer.set_group_attrs(
+                        group_name, getattr(group_spec, "attrs", None), authority=authority
+                    )
                     log.warning(
                         "Parallel evidence: stage=schema_verify group=%s existing_shape=%s expected_shape=%s status=%s",
                         group_name,
@@ -982,83 +975,30 @@ def _open_zarr_root_for_read(store_uri: str, storage_config: Any) -> Any | None:
     return open_root_read_only(store_uri, **handle.zarr_kwargs())
 
 
-def _open_zarr_array(root: Any, path: str) -> Any | None:
-    try:
-        return root[path]
-    except (KeyError, FileNotFoundError):
-        return None
+def _open_zarr_store_for_write(store_uri: str, storage_config: Any) -> Any:
+    """A writable zarr Store at *store_uri* through the configured driver; no I/O.
 
+    The fsspec driver hands back a URL plus options for a remote target; the
+    metadata authority needs the configured Store object itself.
 
-_SCHEMA_SETUP_GUARD = threading.Lock()
-
-
-class _RunSchemaClaims:
-    """Schema claims of one run, shared by its concurrent batches.
-
-    The ``zarr_region:<group>:schema`` claim is exclusive and not re-entrant,
-    so ``pipeline_workers`` batches of one run used to fail each other on it.
-    The first batch acquires it; batches that arrive while it is held share
-    it (refcount) and it is released when the last one leaves. Another run
-    still meets the claim and conflicts as before. Schema setup itself runs
-    one batch at a time under a lock taken on ``with`` entry.
+    Raises:
+        ConfigurationError: A remote target without a storage configuration.
     """
+    from zarr.storage import FsspecStore, LocalStore
 
-    def __init__(self) -> None:
-        self._guard = threading.Lock()
-        self._held: dict[tuple[str, str], list[Any]] = {}
+    from firecube.core.filesystem.store_factory import create_zarr_store
+    from firecube.core.uris import is_remote_target, local_path_from_target
 
-    def acquire(
-        self, key: tuple[str, str], acquire_claim: Callable[[], Any]
-    ) -> contextlib.AbstractContextManager[None]:
-        """Take or share the claim now (like the claim itself); release on exit."""
-        with self._guard:
-            entry = self._held.get(key)
-            if entry is None:
-                handle = acquire_claim()  # a conflict raises; nothing is recorded
-                handle.__enter__()
-                entry = self._held[key] = [handle, 0, threading.Lock()]
-            entry[1] += 1
-        return self._use(key, entry[2])
-
-    @contextlib.contextmanager
-    def _use(self, key: tuple[str, str], setup_lock: threading.Lock) -> Iterator[None]:
-        try:
-            with setup_lock:
-                yield
-        finally:
-            self._release(key)
-
-    def _release(self, key: tuple[str, str]) -> None:
-        # The claim is released under the guard: a batch arriving meanwhile
-        # waits, then acquires afresh, instead of meeting its own run's claim.
-        with self._guard:
-            entry = self._held[key]
-            entry[1] -= 1
-            if entry[1] > 0:
-                return
-            try:
-                entry[0].__exit__(None, None, None)
-            finally:
-                del self._held[key]
-
-
-class _StagedWriteLedger:
-    """Slot writes of one staged run: touched before dispatch, written after success.
-
-    Promotion copies whole workspace objects over the target, so before it
-    every touched unit must have been written in every cell.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.store_uri: str | None = None
-        self.touched: list[StagedSlotWrite] = []
-        self.written: list[StagedSlotWrite] = []
-
-    def record(self, store_uri: str, writes: Sequence[StagedSlotWrite], *, written: bool) -> None:
-        with self._lock:
-            self.store_uri = store_uri
-            (self.written if written else self.touched).extend(writes)
+    if storage_config is None:
+        if is_remote_target(store_uri):
+            raise ConfigurationError(f"no storage configuration to open {store_uri} for writing")
+        return LocalStore(str(local_path_from_target(store_uri)))
+    handle = create_zarr_store(uri=store_uri, storage_config=storage_config, mode="a")
+    if isinstance(handle.store, str):
+        return FsspecStore.from_url(
+            handle.store, storage_options=handle.storage_options, read_only=False
+        )
+    return handle.store
 
 
 class DirectZarrIngestor(BaseIngestor):
@@ -1075,6 +1015,7 @@ class DirectZarrIngestor(BaseIngestor):
     """
 
     template_config_class = ZarrTemplateConfig
+    _zarr_write_session: ZarrWriteSession | None = None
 
     def index_spec(self, ctx: PluginContext) -> IndexSpec | None:
         """Override to enable slot-range parallel ingestion.
@@ -1414,7 +1355,7 @@ class DirectZarrIngestor(BaseIngestor):
             if coord_name is None:
                 continue
             coord_array_path = f"{group_name}/{coord_name}"
-            coord_arr = _open_zarr_array(root, coord_array_path)
+            coord_arr = open_zarr_array(root, coord_array_path)
             if coord_arr is None:
                 continue  # coord array not yet created — skip verification
             stamped = coord_arr.attrs.get(FIRECUBE_GROUP_IDENTITY_HASH_ATTR)
@@ -1432,26 +1373,26 @@ class DirectZarrIngestor(BaseIngestor):
         """Verify global direct-Zarr schema once per pod process before batches run."""
         from firecube.ingestor.api import IndexedRegionStrategy
 
-        # Called once per run, before any batch: a staged run's ledger starts empty.
-        with _SCHEMA_SETUP_GUARD:
-            self._staged_write_ledger = _StagedWriteLedger()
-        # Ownership is checked against each run's own target, also on a reused instance.
-        self._engine_owned_materialized = False
+        # Called once per run, on the main thread before any batch: every run
+        # kind gets its own session here (empty ledger, ownership unchecked),
+        # serial runs included.
+        session = self._begin_write_session(ctx)
 
         if self._parallel_execution_state is None:
             return
 
         write_mode = self.engine_config.write_mode
         store_uri = self.resolve_output_uri(ctx, write_mode=write_mode)
-        product = _ctx_product_name(ctx, self.name)
-        run_id = str(ctx.run_id or ctx.option("run_id", "unknown"))
+        product = session.product
+        run_id = session.run_id
 
         schema = self._cached_zarr_schema(ctx)
+        adapter = self._write_adapter(schema)
         # Before any array is created: pods never create or write engine-owned arrays.
-        self._require_engine_owned_materialized(ctx, schema)
+        adapter.require_engine_owned_materialized(ctx)
         # Before schema setup touches the store: the window must own every
         # stored unit it writes into.
-        self._require_window_owns_stored_units(ctx, schema)
+        adapter.require_window_owns_stored_units(ctx)
         coord_names_by_group = {spec.group: spec.coord_names for spec in schema}
         strategy = IndexedRegionStrategy(
             store_uri=store_uri,
@@ -1506,164 +1447,82 @@ class DirectZarrIngestor(BaseIngestor):
                     exc,
                 )
 
-    def _engine_owned_target_root(self, ctx: PluginContext) -> Any | None:
-        """Open the FINAL target read-only; engine-owned values live only there.
+    # --- Write session --------------------------------------------------------------------
 
-        In staged mode the workspace never holds engine-owned chunks, so
-        promotion has nothing of them to copy back over the target.
+    def _begin_write_session(self, ctx: PluginContext) -> ZarrWriteSession:
+        """Build this run's write session, closing any earlier run's.
+
+        Called on the main thread before any batch or worker. Window, slot
+        group and write mode come from ``engine_config``; a staged session
+        also gets the workspace URI, for its seeding authority, and the final
+        target, opened at promotion for the authority promoted metadata is
+        published under. An earlier session whose close still fails (its
+        writes in flight) refuses this run and stays in place.
         """
-        target_uri = self.resolve_output_uri(ctx, write_mode="direct")
-        return _open_zarr_root_for_read(target_uri, self._chunk_manager.storage_config)
-
-    def _require_engine_owned_materialized(
-        self, ctx: PluginContext, schema: Sequence[ZarrGroupSpec]
-    ) -> None:
-        """Refuse the run on an ownership change or an unmaterialized engine-owned array.
-
-        Compares every declared array with the ownership marker stored in the
-        final target, so a plugin that drops ``engine_owned=True`` cannot write
-        over a materialized array.
-        """
-        if getattr(self, "_engine_owned_materialized", False):
-            return
-        declared = [
-            (f"{group_spec.group}/{arr_spec.name}", is_engine_owned_spec(arr_spec))
-            for group_spec in schema
-            for arr_spec in group_spec.arrays
-        ]
-        require_engine_owned_ownership(self._engine_owned_target_root(ctx), declared)
-        # Preallocate cannot rewrite them while this run is live (its claim
-        # conflicts with every live ranged run), so one check per run holds.
-        self._engine_owned_materialized = True
-
-    def _require_engine_owned_slots(
-        self, ctx: PluginContext, schema: Sequence[ZarrGroupSpec], intents: Sequence[WriteIntent]
-    ) -> None:
-        """Refuse writes to a slot the engine-owned arrays of its group do not hold.
-
-        Every slot-addressed intent counts, whether or not its item also emits
-        an intent for the engine-owned array: a payload must not land in a
-        slot preallocate never materialized. Read from the final target.
-        """
-        owned_by_group: dict[str, list[str]] = {}
-        for group_spec in schema:
-            for arr_spec in group_spec.arrays:
-                if is_engine_owned_spec(arr_spec):
-                    owned_by_group.setdefault(group_spec.group, []).append(arr_spec.name)
-        slots = sorted(
-            {
-                (f"{intent.group}/{name}", int(intent.ts_index))
-                for intent in intents
-                if intent.kind in ("region", "1d", "timestamp") and intent.ts_index is not None
-                for name in owned_by_group.get(intent.group, ())
-            }
+        previous = self._zarr_write_session
+        if previous is not None:
+            previous.close()
+            self._zarr_write_session = None
+        engine_config = self.engine_config
+        start = getattr(engine_config, "slot_start", None)
+        end = getattr(engine_config, "slot_end", None)
+        write_mode = str(engine_config.write_mode)
+        session = ZarrWriteSession(
+            product=_ctx_product_name(ctx, self.name),
+            run_id=str(ctx.run_id or ctx.option("run_id", "unknown")),
+            write_mode=write_mode,
+            window=(start, end) if isinstance(start, int) and isinstance(end, int) else None,
+            slot_group=getattr(engine_config, "slot_group", None),
+            acquire_claim=lambda **kwargs: self._chunk_manager.acquire_claim(**kwargs),
+            open_root=lambda uri: _open_zarr_root_for_read(uri, self._chunk_manager.storage_config),
+            # In staged mode the workspace never holds engine-owned chunks:
+            # their values, and the stored layout, live in the final target.
+            open_final_root=lambda c: _open_zarr_root_for_read(
+                self.resolve_output_uri(c, write_mode="direct"),
+                self._chunk_manager.storage_config,
+            ),
+            workspace_uri=self.resolve_output_uri(ctx, write_mode=write_mode)
+            if write_mode == "staged"
+            else None,
+            open_final_store=lambda: self._final_store(ctx),
         )
-        if slots:
-            require_engine_owned_slots(self._engine_owned_target_root(ctx), slots)
+        self._zarr_write_session = session
+        return session
 
-    # --- Ownership of stored write units --------------------------------------------------
+    def _final_store(self, ctx: PluginContext) -> tuple[str, Any]:
+        """The final target's URI and a writable zarr Store over it; no I/O."""
+        final_uri = self.resolve_output_uri(ctx, write_mode="direct")
+        return final_uri, _open_zarr_store_for_write(final_uri, self._chunk_manager.storage_config)
 
-    def _slot_window(self) -> tuple[int, int] | None:
-        start = getattr(self.engine_config, "slot_start", None)
-        end = getattr(self.engine_config, "slot_end", None)
-        if isinstance(start, int) and isinstance(end, int):
-            return (start, end)
-        return None
-
-    def _pod_written_specs(
-        self, schema: Sequence[ZarrGroupSpec], slot_group: str | None
-    ) -> list[tuple[str, ZarrGroupSpec, ZarrArraySpec]]:
-        """Time-indexed arrays this run writes slots of, in the groups its window covers.
-
-        Engine-owned arrays and the time coordinate are left out: pods only
-        verify engine-owned arrays, and a time coordinate that carries a
-        preallocate marker. An unmarked coordinate, which pods do write, is
-        left out as well. Static arrays have no slots.
-        """
-        coord_name = self._resolve_time_dim_name()
-        return [
-            (f"{group_spec.group}/{arr_spec.name}", group_spec, arr_spec)
-            for group_spec in schema
-            if slot_group is None or group_spec.group == slot_group
-            for arr_spec in group_spec.arrays
-            if is_pod_written_slot_array(arr_spec, time_coord_name=coord_name)
-        ]
-
-    def _require_window_owns_stored_units(
-        self, ctx: PluginContext, schema: Sequence[ZarrGroupSpec]
-    ) -> None:
-        """Refuse a slot window that holds part of a stored chunk or shard of the target.
-
-        Runs at pod startup before schema setup, so a refused run leaves every
-        file outside ``.firecube/`` as it was. Judged on the layout actually
-        stored (declared or not); arrays the target lacks are created later
-        with the engine's layout, which the capability gate has aligned.
-        """
-        window = self._slot_window()
-        if window is None:
-            return
-        slot_group = getattr(self.engine_config, "slot_group", None)
-        paths = [path for path, _, _ in self._pod_written_specs(schema, slot_group)]
-        require_window_owns_stored_units(self._engine_owned_target_root(ctx), paths, window)
-
-    def _run_schema_claims(self) -> _RunSchemaClaims:
-        with _SCHEMA_SETUP_GUARD:
-            claims = getattr(self, "_schema_claims", None)
-            if claims is None:
-                claims = self._schema_claims = _RunSchemaClaims()
-            return claims
-
-    def _staged_ledger(self) -> _StagedWriteLedger:
-        with _SCHEMA_SETUP_GUARD:
-            ledger = getattr(self, "_staged_write_ledger", None)
-            if ledger is None:
-                ledger = self._staged_write_ledger = _StagedWriteLedger()
-            return ledger
-
-    def _staged_writes(
-        self,
-        intents: Sequence[WriteIntent],
-        schema: Sequence[ZarrGroupSpec],
-        slot_range: tuple[int, int] | None,
-    ) -> tuple[list[StagedSlotWrite], list[StagedSlotWrite]]:
-        """Slot writes of a staged batch: ``(touched, written on success)``.
-
-        A strided row selection is touched but never counts as written, so a
-        unit it lands in is refused rather than promoted half-filled.
-        """
-        slot_group = getattr(self.engine_config, "slot_group", None)
-        # Same groups the strategy writes: slot_group narrows them only in a slot window.
-        pod_written = {
-            (group_spec.group, arr_spec.name)
-            for _, group_spec, arr_spec in self._pod_written_specs(
-                schema, slot_group if slot_range is not None else None
+    def _write_session(self) -> ZarrWriteSession:
+        """The run's write session; a run that never built one is refused."""
+        session = self._zarr_write_session
+        if session is None:
+            raise ConfigurationError(
+                f"{type(self).__name__} holds no write session: _verify_schema_at_pod_startup "
+                "builds it before any batch, and a subclass overriding that hook must call super()"
             )
-        }
-        touched: list[StagedSlotWrite] = []
-        written: list[StagedSlotWrite] = []
-        for intent in intents:
-            if intent.kind not in ("region", "1d") or intent.ts_index is None:
-                continue
-            if slot_range is not None and slot_group is not None and intent.group != slot_group:
-                continue  # the strategy skips other groups' intents in a slot window
-            if (intent.group, intent.array) not in pod_written:
-                continue
-            rows: tuple[int | None, int | None] | None = None
-            contiguous = True
-            if intent.kind == "region" and isinstance(intent.y_slice, slice):
-                rows = (intent.y_slice.start, intent.y_slice.stop)
-                contiguous = intent.y_slice.step in (None, 1)
-            channel = intent.channel_index if intent.kind == "region" else None
-            write = StagedSlotWrite(
-                array_path=f"{intent.group}/{intent.array}",
-                ts_index=int(intent.ts_index),
-                rows=rows,
-                channel=None if channel is None else int(channel),
-            )
-            touched.append(write)
-            if contiguous:
-                written.append(write)
-        return touched, written
+        return session
+
+    def _write_adapter(self, schema: Sequence[ZarrGroupSpec]) -> DirectRegionAdapter:
+        return DirectRegionAdapter(
+            self._write_session(),
+            schema,
+            time_coord_name=self._resolve_time_dim_name(),
+            index_binding=getattr(self, "_index_binding", None),
+        )
+
+    def _close_run_state(self) -> None:
+        """End of run, whatever its outcome: the session turns terminal and is dropped.
+
+        It is dropped only once `ZarrWriteSession.close` succeeded: a close
+        that raises (writes still in flight) leaves it in place, so a retry
+        and `_write_session` see the same, terminal session.
+        """
+        session = self._zarr_write_session
+        if session is not None:
+            session.close()
+            self._zarr_write_session = None
 
     def _refuse_sparse_staged_window(
         self,
@@ -1676,40 +1535,20 @@ class DirectZarrIngestor(BaseIngestor):
         """Refuse, before any batch, a staged window that fills only part of a unit.
 
         Called by the engine, for staged runs only, with the slot of every
-        source item the window keeps. Promotion replaces whole objects, so
-        every stored unit those slots touch must have all its slots in the run
-        (target layout when the array exists there, else the layout the array
-        will be created with).
+        source item the window keeps.
         """
-        specs = self._pod_written_specs(self._cached_zarr_schema(ctx), slot_group)
-        if not planned_slots or not specs:
-            return
-        root = self._engine_owned_target_root(ctx)
-        binding = getattr(self, "_index_binding", None)
-        coord_name = self._resolve_time_dim_name()
-        units: list[tuple[str, tuple[int, ...], str, int]] = []
-        for path, group_spec, arr_spec in specs:
-            arr = _open_zarr_array(root, path) if root is not None else None
-            if arr is not None:
-                if arr.ndim == 0:
-                    continue
-                unit_shape, unit_kind = stored_write_unit(arr)
-                units.append((path, unit_shape, unit_kind, int(arr.shape[0])))
-                continue
-            try:
-                time_len = (
-                    int(binding.resolved.size(group_spec.group))
-                    if binding is not None
-                    else int(arr_spec.shape[0])
-                )
-            except ExtentUnknownError:
-                continue
-            layout = resolve_effective_layout(arr_spec, coord_name=coord_name, time_count=time_len)
-            unit = layout.shards if layout.shards is not None else layout.chunks
-            if unit is not None:
-                kind = "shard" if layout.shards is not None else "chunk"
-                units.append((path, tuple(int(n) for n in unit), kind, time_len))
-        require_planned_slots_fill_units(units, planned_slots, window)
+        self._write_adapter(self._cached_zarr_schema(ctx)).refuse_sparse_staged_window(
+            ctx, planned_slots, window=window, slot_group=slot_group
+        )
+
+    def _staged_seeding_authority(self) -> MetadataAuthority | None:
+        """The authority the engine seeds this run's staged workspace metadata under.
+
+        Called by the engine before each batch of a Zarr output. The session's
+        ``PROCESS_LOCAL`` authority over the whole workspace store in a staged
+        run; ``None`` otherwise.
+        """
+        return self._write_session().staged_seeding_authority()
 
     def _refuse_incomplete_staged_units(self) -> None:
         """Refuse promotion of a workspace unit this run did not write in every cell.
@@ -1719,14 +1558,18 @@ class DirectZarrIngestor(BaseIngestor):
         what the window check cannot see before writing: serial runs, and rows
         or channels a slot's writes leave out.
         """
-        ledger = getattr(self, "_staged_write_ledger", None)
-        if ledger is None or ledger.store_uri is None or not ledger.touched:
-            return
-        require_staged_units_fully_written(
-            _open_zarr_root_for_read(ledger.store_uri, self._chunk_manager.storage_config),
-            list(ledger.touched),
-            list(ledger.written),
-        )
+        self._write_session().verify_promotion()
+
+    def _staged_promotion_units(self) -> StagedPromotionUnits | None:
+        """The units this staged run proved written, for an object-delta promotion.
+
+        Called by the engine after `_refuse_incomplete_staged_units` passed,
+        for staged runs only. Promotion then puts the units the run wrote,
+        deletes from the target the ones it left all fill (zarr stores no
+        object for them) and publishes the ``zarr.json`` documents under the
+        session's authority over the target.
+        """
+        return self._write_session().staged_promotion_units()
 
     def _aggregate_metrics(
         self, ctx: RuntimeIngestContext, state: PipelineRunState
@@ -1749,12 +1592,11 @@ class DirectZarrIngestor(BaseIngestor):
         self.batch_setup(ctx)
 
         try:
+            session = self._write_session()
             prep_metrics = self.prepare_batch_data(batch, ctx) or {}
 
             write_mode = self.engine_config.write_mode
             store_uri = self.resolve_output_uri(ctx, write_mode=write_mode)
-            product = _ctx_product_name(ctx, self.name)
-            run_id = str(ctx.run_id or ctx.option("run_id", "unknown"))
 
             schema = self._cached_zarr_schema(ctx)
 
@@ -1770,7 +1612,8 @@ class DirectZarrIngestor(BaseIngestor):
                 validate_zarr_specs_against_template(all_specs, template_cfg)
 
             coord_names_by_group = {spec.group: spec.coord_names for spec in schema}
-            self._require_engine_owned_materialized(ctx, schema)
+            adapter = self._write_adapter(schema)
+            adapter.require_engine_owned_materialized(ctx)
 
             intents = self._compile_write_intents(self.build_write_intents(batch, ctx), ctx)
             if not intents:
@@ -1781,62 +1624,11 @@ class DirectZarrIngestor(BaseIngestor):
                     success=True,
                 )
 
-            # Pods never write engine-owned arrays: verify those intents against
-            # the target before any payload write, and drop them from the writes.
-            engine_owned_paths = {
-                (group_spec.group, arr_spec.name)
-                for group_spec in schema
-                for arr_spec in group_spec.arrays
-                if is_engine_owned_spec(arr_spec)
-            }
-            owned_intents: list[WriteIntent] = []
-            intents_to_write: list[WriteIntent] = []
-            for intent in intents:
-                if (intent.group, intent.array) not in engine_owned_paths:
-                    intents_to_write.append(intent)
-                elif intent.kind == "static":
-                    raise ConfigurationError(
-                        f"WriteIntent.static targets engine-owned array "
-                        f"'{intent.group}/{intent.array}'; preallocate writes it from "
-                        "ItemInfo.values and pods only verify it per slot"
-                    )
-                else:
-                    owned_intents.append(intent)
-            slot_start = getattr(self.engine_config, "slot_start", None)
-            slot_end = getattr(self.engine_config, "slot_end", None)
-            slot_range = (
-                (slot_start, slot_end)
-                if isinstance(slot_start, int) and isinstance(slot_end, int)
-                else None
-            )
-
-            # A slot window with a slot_group writes that group only, so the
-            # strategy skips the other groups' intents: so does the slot check.
-            slot_scope = (
-                getattr(self.engine_config, "slot_group", None) if slot_range is not None else None
-            )
-            # The strategy sees only the pod-written intents: owned intents get
-            # the same assigned-window / slot_group assertion here, whether or
-            # not the batch also holds pod-written ones.
-            if slot_range is not None and owned_intents:
-                owned_by_group: dict[str, list[WriteIntent]] = {}
-                for intent in owned_intents:
-                    owned_by_group.setdefault(intent.group, []).append(intent)
-                require_intents_in_slot_window(
-                    owned_by_group, slot_range, getattr(self.engine_config, "slot_group", None)
-                )
-            scoped_owned = [i for i in owned_intents if slot_scope is None or i.group == slot_scope]
-            if scoped_owned:
-                verify_engine_owned_writes(
-                    self._engine_owned_target_root(ctx),
-                    [(i.group, i.array, i.ts_index, i.data) for i in scoped_owned],
-                )
+            # Pods never write engine-owned arrays: the adapter verifies those
+            # intents against the target and drops them from the writes.
+            owned_intents, intents_to_write = adapter.split_engine_owned(ctx, intents)
             if not intents_to_write:
-                self._require_engine_owned_slots(
-                    ctx,
-                    schema,
-                    scoped_owned,
-                )
+                adapter.require_engine_owned_slots(ctx, owned_intents)
                 return PipelineResult(
                     batch=batch,
                     outputs=OutputPaths(primary=str(store_uri)),
@@ -1864,44 +1656,11 @@ class DirectZarrIngestor(BaseIngestor):
             for intent in intents_to_write:
                 group_to_intents.setdefault(intent.group, []).append(intent)
 
-            def claim_for_group(group_name: str):
-                """Acquire a schema setup claim for a group; released when the result exits.
-
-                Shared by this run's concurrent batches (see `_RunSchemaClaims`);
-                any other run still conflicts on the exclusive claim.
-                """
-                domain = WriteDomain(
-                    product=product,
-                    category="zarr_region",
-                    name=f"{group_name}:schema",
-                )
-                return self._run_schema_claims().acquire(
-                    (run_id, group_name),
-                    lambda: self._chunk_manager.acquire_claim(
-                        product=product,
-                        domain=domain,
-                        owner_id=f"{run_id}:{group_name}",
-                    ),
-                )
-
-            def claim_for_slot(group_name: str, ts_index: int):
-                """Acquire an intent-dispatch claim for a group timestamp slot."""
-                domain = WriteDomain(
-                    product=product,
-                    category="zarr_region",
-                    name=f"{group_name}:slot={ts_index}",
-                )
-                return self._chunk_manager.acquire_claim(
-                    product=product,
-                    domain=domain,
-                    owner_id=f"{run_id}:{group_name}:slot={ts_index}",
-                )
-
             if not hasattr(self, "_index_binding"):
                 self._bind_index_at_startup(ctx)
 
             binding = self._index_binding
-            if slot_range is not None and binding is not None:
+            if session.window is not None and binding is not None:
                 # Defense in depth: serial-mode plugins should already be gated upstream,
                 # but this keeps the failure a ConfigurationError if the gate is bypassed.
                 global_expected: dict[str, int] = {}
@@ -1942,16 +1701,7 @@ class DirectZarrIngestor(BaseIngestor):
 
             # Before the staged ledger and any write: pods write declared arrays
             # only, and only slots whose engine-owned values preallocate wrote.
-            _require_declared_targets(intents_to_write, schema)
-            self._require_engine_owned_slots(
-                ctx,
-                schema,
-                [
-                    intent
-                    for intent in (*owned_intents, *intents_to_write)
-                    if slot_scope is None or intent.group == slot_scope
-                ],
-            )
+            adapter.admit(ctx, owned_intents, intents_to_write)
 
             ctx_config = getattr(ctx, "config", None)
             concurrency_template_config = getattr(
@@ -1969,36 +1719,32 @@ class DirectZarrIngestor(BaseIngestor):
                 "zarr_write_empty_chunks",
                 False,
             )
-            staged_touched: list[StagedSlotWrite] = []
-            staged_written: list[StagedSlotWrite] = []
-            if str(write_mode) == "staged":
-                staged_touched, staged_written = self._staged_writes(
-                    intents_to_write, schema, slot_range
+            with adapter.writing(str(store_uri), intents_to_write):
+                metrics = strategy.write_groups(
+                    group_to_intents=group_to_intents,
+                    schema=schema,
+                    claim_for_group=session.schema_claim,
+                    claim_for_slot=session.slot_claim,
+                    slot_range=session.window,
+                    slot_group=session.slot_group,
+                    codec_pipelines_by_array=codec_pipelines_by_array,
+                    region_write_concurrency=region_write_concurrency,
+                    suppress_static_emission_for_non_owner=getattr(
+                        self.engine_config,
+                        "suppress_static_emission_for_non_owner",
+                        False,
+                    ),
+                    static_owner_slot_start=getattr(
+                        self.engine_config,
+                        "static_owner_slot_start",
+                        None,
+                    ),
+                    zarr_write_empty_chunks=zarr_write_empty_chunks,
+                    on_write=functools.partial(
+                        session.record_write_result, store_uri=str(store_uri)
+                    ),
+                    track_units=session.staged,
                 )
-                self._staged_ledger().record(str(store_uri), staged_touched, written=False)
-            metrics = strategy.write_groups(
-                group_to_intents=group_to_intents,
-                schema=schema,
-                claim_for_group=claim_for_group,
-                claim_for_slot=claim_for_slot,
-                slot_range=slot_range,
-                slot_group=getattr(self.engine_config, "slot_group", None),
-                codec_pipelines_by_array=codec_pipelines_by_array,
-                region_write_concurrency=region_write_concurrency,
-                suppress_static_emission_for_non_owner=getattr(
-                    self.engine_config,
-                    "suppress_static_emission_for_non_owner",
-                    False,
-                ),
-                static_owner_slot_start=getattr(
-                    self.engine_config,
-                    "static_owner_slot_start",
-                    None,
-                ),
-                zarr_write_empty_chunks=zarr_write_empty_chunks,
-            )
-            if staged_written:
-                self._staged_ledger().record(str(store_uri), staged_written, written=True)
 
             # prep_metrics unpacked first so template-owned keys win on collision;
             # reversing would let plugin prep silently clobber reported metrics.
