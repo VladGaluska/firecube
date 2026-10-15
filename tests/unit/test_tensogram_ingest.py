@@ -122,13 +122,3 @@ class TestTensogramWriteStrategy:
         strategy.close()
         assert call_count == 2
         assert metrics["messages_written"] == 2
-
-
-class TestOutputFormatRouting:
-    """Output format routing and public API import checks."""
-
-    def test_generic_tensogram_ingestor_importable(self):
-        """GenericTensogramIngestor is importable from the public api."""
-        from firecube.ingestor.api import GenericTensogramIngestor
-
-        assert GenericTensogramIngestor is not None

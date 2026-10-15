@@ -32,34 +32,23 @@ fixture plugins installed from `tests/fixtures/`.
 
 ## Setup
 
-Install test dependencies and fixture plugins before running the full suite:
+Install test dependencies and the fixture plugins before running the suite:
 
 ```bash
 uv sync --extra test
-uv pip install -e tests/fixtures/cli_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_capable_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_non_capable_test_plugin
-uv pip install -e tests/fixtures/multi_group_capable_test_plugin
-uv pip install -e tests/fixtures/cf_time_dim_test_plugin
+uv pip install -e tests/fixtures/firecube_test_plugins
 ```
+
+That single editable distribution installs every fixture module and entry point.
 
 ## Common Commands
 
+Every lane command (fast, docs/static, S3, slow, full run, race) is stated once,
+in [plans/TEST.md](../plans/TEST.md#lanes). Do not copy them here. Two shortcuts:
+
 ```bash
-# Local full suite
+# Local full suite (pyproject addopts excludes the race-marked tests)
 uv run pytest -q
-
-# Strict dependency gate
-uv run pytest --strict-deps -q --tb=short
-
-# Warning gate used before merge/release
-uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning
-
-# Focused development loop
-uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot" -q --tb=short
-
-# Docs/help/static lane
-uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short
 
 # Single file
 uv run pytest tests/unit/test_chunk_manager.py -q
@@ -79,6 +68,8 @@ Markers are defined in `pyproject.toml`; use only registered markers.
 - `s3`: live or mocked S3 endpoint coverage
 - `slow`: long-running tests
 - `concurrency`: parallel or concurrent behavior
+- `race`: red-by-design legacy race characterization; excluded by default, run with `-m race`
+- `gate`: promoted regression gates that must stay green
 
 Markers select lanes; they do not make weak tests acceptable.
 

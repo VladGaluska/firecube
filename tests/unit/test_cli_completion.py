@@ -15,31 +15,33 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
+from tests.helpers.rows import table_row
 
 
-def test_completion_bash_script_to_stdout():
-    runner = CliRunner()
-    result = runner.invoke(cli, ["completion", "bash"], catch_exceptions=False)
-    assert result.exit_code == 0
-    assert "_FIRECUBE_COMPLETE" in result.output
-    assert "complete -o" in result.output
-    assert "firecube" in result.output
-
-
-def test_completion_zsh_script_to_file():
-    runner = CliRunner()
-    with runner.isolated_filesystem():
-        target = Path("completion/_firecube")
-        result = runner.invoke(
-            cli,
-            ["completion", "zsh", "--output", str(target)],
-            catch_exceptions=False,
-        )
+def test_cli_completion_scripts(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "completion_bash_script_to_stdout", tmp_path):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["completion", "bash"], catch_exceptions=False)
         assert result.exit_code == 0
-        assert target.exists()
-        content = target.read_text()
-        assert "_FIRECUBE_COMPLETE" in content
+        assert "_FIRECUBE_COMPLETE" in result.output
+        assert "complete -o" in result.output
+        assert "firecube" in result.output
+
+    with table_row(subtests, "completion_zsh_script_to_file", tmp_path):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            target = Path("completion/_firecube")
+            result = runner.invoke(
+                cli,
+                ["completion", "zsh", "--output", str(target)],
+                catch_exceptions=False,
+            )
+            assert result.exit_code == 0
+            assert target.exists()
+            content = target.read_text()
+            assert "_FIRECUBE_COMPLETE" in content

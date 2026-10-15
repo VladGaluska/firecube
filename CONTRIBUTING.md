@@ -87,7 +87,7 @@ uv run pytest tests/path_or_file.py -q
 Run the main behavior lane before review:
 
 ```bash
-uv run pytest --strict-deps -m "not slow and not s3" -q
+uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q
 ```
 
 Run the warning gate before merge when the change touches runtime behavior,

@@ -114,41 +114,70 @@ def _root(target_path: Path) -> Any:
     return zarr.open_group(store=str(target_path), mode="r", zarr_format=3)
 
 
-def test_irregular_preallocate_materializes_coord_array(tmp_path: Path) -> None:
+def test_irregular_coord_lifecycle(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """Dry run, creation, reserved attrs and replay on one irregular-axis target.
+
+    Each step is a former test of this module (step id = old test name) and
+    starts from the state the previous step left behind.
+    """
+    from firecube.core.zarr._reserved_attrs import (
+        FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
+        RESERVED_ARRAY_ATTRS,
+    )
+    from firecube.core.zarr._sealing_markers import ATTR_PREALLOCATED
+
     target_path = tmp_path / "out.zarr"
+    args = _preallocate_args("irregular_axis_safe", "irregular_axis_safe", target_path)
 
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args("irregular_axis_safe", "irregular_axis_safe", target_path),
-    )
+    with subtests.test(msg="test_dry_run_does_not_write_any_zarr_metadata"):
+        result = CliRunner().invoke(
+            cli,
+            _preallocate_args(
+                "irregular_axis_safe",
+                "irregular_axis_safe",
+                target_path,
+                dry_run=True,
+            ),
+        )
 
-    assert result.exit_code == 0, result.output
-    root = _root(target_path)
-    coord = cast(Any, root["data/timestamp"])
-    assert coord.shape == (_EXPECTED_SLOT_COUNT,)
-    assert coord.dtype == np.dtype("datetime64[ns]")
-    values = np.asarray(coord[:])
-    assert np.array_equal(values, _EXPECTED_TIMESTAMPS)
-    assert coord.metadata.dimension_names == ("timestamp",)
+        assert result.exit_code == 0, result.output
+        assert not target_path.exists(), (
+            f"dry-run must not create the target store; found {list(target_path.iterdir())}"
+        )
 
+    with subtests.test(msg="test_irregular_preallocate_materializes_coord_array"):
+        result = CliRunner().invoke(cli, args)
 
-def test_irregular_preallocate_is_idempotent_on_matching_coord_array(tmp_path: Path) -> None:
-    target_path = tmp_path / "out.zarr"
+        assert result.exit_code == 0, result.output
+        root = _root(target_path)
+        coord = cast(Any, root["data/timestamp"])
+        assert coord.shape == (_EXPECTED_SLOT_COUNT,)
+        assert coord.dtype == np.dtype("datetime64[ns]")
+        values = np.asarray(coord[:])
+        assert np.array_equal(values, _EXPECTED_TIMESTAMPS)
+        assert coord.metadata.dimension_names == ("timestamp",)
 
-    first = CliRunner().invoke(
-        cli,
-        _preallocate_args("irregular_axis_safe", "irregular_axis_safe", target_path),
-    )
-    second = CliRunner().invoke(
-        cli,
-        _preallocate_args("irregular_axis_safe", "irregular_axis_safe", target_path),
-    )
+    with subtests.test(msg="test_coord_array_carries_only_expected_reserved_attrs"):
+        coord = cast(Any, _root(target_path)["data/timestamp"])
+        user_attr_keys = set(coord.attrs)
+        assert coord.attrs[ATTR_PREALLOCATED] is True
+        disallowed = RESERVED_ARRAY_ATTRS - {
+            "_ARRAY_DIMENSIONS",
+            "_FillValue",
+            ATTR_PREALLOCATED,
+            FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
+        }
+        assert user_attr_keys.isdisjoint(disallowed), (
+            f"coord attrs {user_attr_keys!r} intersect disallowed reserved names {disallowed!r}"
+        )
 
-    assert first.exit_code == 0, first.output
-    assert second.exit_code == 0, second.output
-    assert "existing irregular coord array matches; no-op" in second.output
-    values = np.asarray(cast(Any, _root(target_path)["data/timestamp"])[:])
-    assert np.array_equal(values, _EXPECTED_TIMESTAMPS)
+    with subtests.test(msg="test_irregular_preallocate_is_idempotent_on_matching_coord_array"):
+        second = CliRunner().invoke(cli, args)
+
+        assert second.exit_code == 0, second.output
+        assert "existing irregular coord array matches; no-op" in second.output
+        values = np.asarray(cast(Any, _root(target_path)["data/timestamp"])[:])
+        assert np.array_equal(values, _EXPECTED_TIMESTAMPS)
 
 
 def test_regular_axis_preallocate_materializes_coords_via_no_spec_fallback(
@@ -176,25 +205,6 @@ def test_regular_axis_preallocate_materializes_coords_via_no_spec_fallback(
     assert np.array_equal(np.asarray(coord[:]), expected)
 
 
-def test_dry_run_does_not_write_any_zarr_metadata(tmp_path: Path) -> None:
-    target_path = tmp_path / "out.zarr"
-
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args(
-            "irregular_axis_safe",
-            "irregular_axis_safe",
-            target_path,
-            dry_run=True,
-        ),
-    )
-
-    assert result.exit_code == 0, result.output
-    assert not target_path.exists(), (
-        f"dry-run must not create the target store; found {list(target_path.iterdir())}"
-    )
-
-
 def test_concrete_irregular_axis_materializes_same_values_as_auto(tmp_path: Path) -> None:
     auto_target = tmp_path / "auto.zarr"
     concrete_target = tmp_path / "concrete.zarr"
@@ -218,34 +228,6 @@ def test_concrete_irregular_axis_materializes_same_values_as_auto(tmp_path: Path
     concrete_values = np.asarray(cast(Any, _root(concrete_target)["data/timestamp"])[:])
     assert np.array_equal(auto_values, concrete_values)
     assert np.array_equal(auto_values, _EXPECTED_TIMESTAMPS)
-
-
-def test_coord_array_carries_only_expected_reserved_attrs(tmp_path: Path) -> None:
-    from firecube.core.zarr._reserved_attrs import (
-        FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
-        RESERVED_ARRAY_ATTRS,
-    )
-    from firecube.core.zarr._sealing_markers import ATTR_PREALLOCATED
-
-    target_path = tmp_path / "out.zarr"
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args("irregular_axis_safe", "irregular_axis_safe", target_path),
-    )
-
-    assert result.exit_code == 0, result.output
-    coord = cast(Any, _root(target_path)["data/timestamp"])
-    user_attr_keys = set(coord.attrs)
-    assert coord.attrs[ATTR_PREALLOCATED] is True
-    disallowed = RESERVED_ARRAY_ATTRS - {
-        "_ARRAY_DIMENSIONS",
-        "_FillValue",
-        ATTR_PREALLOCATED,
-        FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
-    }
-    assert user_attr_keys.isdisjoint(disallowed), (
-        f"coord attrs {user_attr_keys!r} intersect disallowed reserved names {disallowed!r}"
-    )
 
 
 def test_reverse_order_input_produces_sorted_coord_array(tmp_path: Path) -> None:

@@ -36,7 +36,7 @@ Keep pull requests focused: one logical change per PR.
 - [ ] `uv run ruff format --check .`
 - [ ] `uv run pyright`
 - [ ] `uv run --with bandit bandit -c pyproject.toml -r src scripts -lll`
-- [ ] `uv run pytest --strict-deps -m "not slow and not s3" -q`
+- [ ] `uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q`
 - [ ] Docs build (if docs changed): `uv run mkdocs build --strict`
 
 ## Follow-up work

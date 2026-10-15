@@ -16,22 +16,17 @@ import pytest
 
 from firecube.ingestor.runtime.resume_guard import _ranges_overlap_inclusive_vs_halfopen
 
-
-@pytest.mark.unit
-def test_back_to_back_disjoint():
-    assert not _ranges_overlap_inclusive_vs_halfopen((0, 9), (10, 20))
-
-
-@pytest.mark.unit
-def test_boundary_overlap_inclusive_end_meets_halfopen_start():
-    assert _ranges_overlap_inclusive_vs_halfopen((0, 10), (10, 20))
+_OVERLAP_ROWS = (
+    # (row id, inclusive range, half-open range, overlaps)
+    ("back_to_back_disjoint", (0, 9), (10, 20), False),
+    ("boundary_overlap_inclusive_end_meets_halfopen_start", (0, 10), (10, 20), True),
+    ("complete_overlap", (5, 15), (0, 20), True),
+    ("completely_disjoint_high", (100, 200), (0, 50), False),
+)
 
 
 @pytest.mark.unit
-def test_complete_overlap():
-    assert _ranges_overlap_inclusive_vs_halfopen((5, 15), (0, 20))
-
-
-@pytest.mark.unit
-def test_completely_disjoint_high():
-    assert not _ranges_overlap_inclusive_vs_halfopen((100, 200), (0, 50))
+def test_ranges_overlap_inclusive_vs_halfopen(subtests):
+    for row_id, inclusive, half_open, expected in _OVERLAP_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            assert _ranges_overlap_inclusive_vs_halfopen(inclusive, half_open) is expected

@@ -69,15 +69,11 @@ def test_storage_uri_from_target_handles_remote_and_local_targets() -> None:
 
 
 @pytest.mark.unit
-def test_local_path_from_target_handles_file_localhost() -> None:
-    assert local_path_from_target("file://localhost/tmp/x.zarr") == Path("/tmp/x.zarr")
-
-
-@pytest.mark.unit
-def test_local_path_from_target_handles_file_empty_authority() -> None:
-    assert local_path_from_target("file:///tmp/x.zarr") == Path("/tmp/x.zarr")
-
-
-@pytest.mark.unit
-def test_local_path_from_target_handles_bare_path() -> None:
-    assert local_path_from_target("/tmp/x.zarr") == Path("/tmp/x.zarr")
+def test_local_path_from_target_resolves_every_local_form(subtests) -> None:
+    for row_id, target in (
+        ("local_path_from_target_handles_file_localhost", "file://localhost/tmp/x.zarr"),
+        ("local_path_from_target_handles_file_empty_authority", "file:///tmp/x.zarr"),
+        ("local_path_from_target_handles_bare_path", "/tmp/x.zarr"),
+    ):
+        with subtests.test(msg=f"test_{row_id}"):
+            assert local_path_from_target(target) == Path("/tmp/x.zarr")

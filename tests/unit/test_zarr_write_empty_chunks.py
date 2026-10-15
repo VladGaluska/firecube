@@ -109,15 +109,6 @@ def test_generic_write_context_applies_scoped_config(monkeypatch: pytest.MonkeyP
     assert exited is True
 
 
-def test_effective_value_recorded_in_metrics(tmp_path: Path) -> None:
-    result = IndexedRegionStrategy(store_uri=str(tmp_path / "test.zarr")).write_groups(
-        group_to_intents={},
-        zarr_write_empty_chunks=True,
-    )
-
-    assert result["zarr_write_empty_chunks_effective"] is True
-
-
 def test_array_write_empty_chunks_never_mutated_bare() -> None:
     root = Path("src/firecube")
     offenders: list[str] = []

@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from firecube.core.controlplane import ChunkInfo, ChunkManager, SpanCoverage, build_span_entry
@@ -23,6 +26,7 @@ from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.rows import table_row
 
 
 def _chunk_manager(workspace, base_uri: str | None = None) -> ChunkManager:
@@ -233,122 +237,49 @@ class TestChunkManager:
         assert len(run_entries) == 1
         assert run_entries[0].chunk_type == "run"
 
-    def test_list_chunks_time_range_time_min_after(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
+    def test_list_chunks_time_range_filters(self, subtests: Any, temp_workspace: Path) -> None:
+        # Q2 ends exactly on the time_max_before bound and starts exactly on the
+        # time_min_after bound: both bounds are inclusive.
+        quarters = (
+            ("Q1", "2024-01-01T00:00:00", "2024-03-31T23:59:59"),
+            ("Q2", "2024-04-01T00:00:00", "2024-06-01T00:00:00"),
+            ("Q3", "2024-07-01T00:00:00", "2024-09-30T23:59:59"),
         )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-30T23:59:59",
+        rows: tuple[tuple[str, dict[str, Any], set[str]], ...] = (
+            (
+                "test_list_chunks_time_range_time_min_after",
+                {"time_min_after": "2024-04-01T00:00:00"},
+                {"Q2", "Q3"},
+            ),
+            (
+                "test_list_chunks_time_range_time_max_before",
+                {"time_max_before": "2024-06-01T00:00:00"},
+                {"Q1", "Q2"},
+            ),
+            (
+                "test_list_chunks_time_overlap_returns_partial_matches",
+                {"time_overlaps": ("2024-02-01T00:00:00", "2024-05-01T00:00:00")},
+                {"Q1", "Q2"},
+            ),
         )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
+        for row_id, query, expected in rows:
+            with table_row(subtests, row_id, temp_workspace) as (workdir, _):
+                manager = _chunk_manager(workdir)
+                for n, (group, time_min, time_max) in enumerate(quarters, start=1):
+                    _record_completed_span_run(
+                        manager,
+                        product="test_product",
+                        run_id=f"run-00{n}",
+                        group=group,
+                        batch_id=f"batch-00{n}",
+                        time_min=time_min,
+                        time_max=time_max,
+                    )
 
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_min_after="2024-04-01T00:00:00",
-        )
+                chunks = manager.list_chunks(product="test_product", chunk_type="span", **query)
 
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q2", "Q3"}
-
-    def test_list_chunks_time_range_time_max_before(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-01T00:00:00",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
-
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_max_before="2024-06-01T00:00:00",
-        )
-
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q1", "Q2"}
-
-    def test_list_chunks_time_overlap_returns_partial_matches(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-30T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
-
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_overlaps=("2024-02-01T00:00:00", "2024-05-01T00:00:00"),
-        )
-
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q1", "Q2"}
+                assert len(chunks) == 2
+                assert {_chunk_group(chunk) for chunk in chunks} == expected
 
     def test_list_chunks_time_overlap_excludes_non_overlapping_spans(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)
@@ -454,20 +385,17 @@ class TestChunkManager:
         assert _chunk_group(chunks[0]) == "F024"
         assert chunks[0].status == "active"
 
-    def test_span_coverage_timestamps_written_counts_ranges(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[[0, 9], [20, 29]])
+    def test_span_coverage_timestamps_written(self, subtests: Any, temp_workspace: Path) -> None:
+        rows = (
+            ("test_span_coverage_timestamps_written_counts_ranges", [[0, 9], [20, 29]], 20),
+            ("test_span_coverage_timestamps_written_single_timestamp", [[0, 0]], 1),
+            ("test_span_coverage_timestamps_written_empty_ranges", [], 0),
+        )
+        for row_id, ranges, expected in rows:
+            with table_row(subtests, row_id, temp_workspace):
+                coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=ranges)
 
-        assert coverage.timestamps_written == 20
-
-    def test_span_coverage_timestamps_written_single_timestamp(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[[0, 0]])
-
-        assert coverage.timestamps_written == 1
-
-    def test_span_coverage_timestamps_written_empty_ranges(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[])
-
-        assert coverage.timestamps_written == 0
+                assert coverage.timestamps_written == expected
 
     def test_build_span_entry_includes_timestamps_written(self):
         entry = build_span_entry(
@@ -494,134 +422,65 @@ class TestChunkManager:
 
         assert chunk.timestamps_written == 20
 
-    def test_list_runs_filters_by_status_started(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
+    def test_list_runs_filters(self, subtests: Any, temp_workspace: Path) -> None:
+        # (row id, list_runs filter, expected run id, expected status, expected is_terminal)
+        rows: tuple[tuple[str, dict[str, Any], str, str, bool], ...] = (
+            (
+                "test_list_runs_filters_by_status_started",
+                {"status": "started"},
+                "run-started",
+                "started",
+                False,
+            ),
+            (
+                "test_list_runs_filters_non_terminal_runs",
+                {"non_terminal": True},
+                "run-started",
+                "started",
+                False,
+            ),
+            (
+                "test_list_runs_filters_by_status_complete",
+                {"status": "complete"},
+                "run-complete",
+                "complete",
+                True,
+            ),
         )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
+        for row_id, query, run_id, status, terminal in rows:
+            with table_row(subtests, row_id, temp_workspace) as (workdir, _):
+                manager = _chunk_manager(workdir)
+                _record_started_run(manager, product="P", run_id="run-started")
+                _record_completed_span_run(
+                    manager,
+                    product="P",
+                    run_id="run-complete",
+                    group="F024",
+                    batch_id="batch-001",
+                )
+                manager.record_run_terminal(
+                    product="P",
+                    run_id="run-failed",
+                    output_path=str(manager.workspace / "P"),
+                    output_format="zarr",
+                    size=0,
+                    meta={"plugin": "test"},
+                    status="failed",
+                    error="boom",
+                )
+                _record_started_run(manager, product="P", run_id="run-abandoned")
+                manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
 
-        runs = manager.list_runs(product="P", status="started")
+                runs = manager.list_runs(product="P", **query)
 
-        assert [run.status for run in runs] == ["started"]
-        assert [run.run_id for run in runs] == ["run-started"]
-
-    def test_list_runs_filters_non_terminal_runs(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", non_terminal=True)
-
-        assert [run.status for run in runs] == ["started"]
-        assert [run.run_id for run in runs] == ["run-started"]
-
-    def test_list_runs_filters_by_status_complete(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", status="complete")
-
-        assert [run.status for run in runs] == ["complete"]
-        assert [run.run_id for run in runs] == ["run-complete"]
+                assert [run.status for run in runs] == [status]
+                assert [run.run_id for run in runs] == [run_id]
+                assert [run.is_terminal for run in runs] == [terminal]
 
     def test_list_runs_empty_product_returns_empty_list(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)
 
         assert manager.list_runs(product="P") == []
-
-    def test_list_runs_non_terminal_excludes_terminal_runs(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", non_terminal=True)
-
-        assert [run.run_id for run in runs] == ["run-started"]
-        assert all(not run.is_terminal for run in runs)
-
-    def test_time_coverage_summary_returns_expected_shape(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-001",
-            group="G1",
-            batch_id="batch-001",
-        )
-
-        time_coverage_summary = manager.time_coverage_summary
-        summary = time_coverage_summary(product="P")
-
-        assert isinstance(summary, list)
-        assert summary == [
-            {
-                "group": "G1",
-                "time_min": "2024-01-01T00:00:00",
-                "time_max": "2024-01-02T00:00:00",
-                "span_count": 1,
-                "total_timestamps_written": 2,
-            }
-        ]
 
     def test_time_coverage_summary_aggregates_per_group(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)

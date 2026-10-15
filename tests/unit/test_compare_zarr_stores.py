@@ -23,6 +23,7 @@ import zarr
 
 from firecube.core.api import FIRECUBE_STATIC_WRITTEN_ATTR, compare_zarr_stores
 from firecube.core.zarr import validation
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -106,42 +107,27 @@ def test_zero_dimensional_arrays_compare(tmp_path: Path) -> None:
     assert any("values differ" in m for m in report.mismatches)
 
 
-def test_shape_mismatch_detected(tmp_path: Path) -> None:
-    a = _make_store(tmp_path / "a.zarr", shape=(2, 2), chunks=(1, 2))
-    b = _make_store(tmp_path / "b.zarr", shape=(3, 2), chunks=(1, 2))
-
-    report = _compare(a, b)
-
-    assert report.equivalent is False
-    assert any("shape" in mismatch for mismatch in report.mismatches)
-
-
-def test_dtype_mismatch_detected(tmp_path: Path) -> None:
-    a = _make_store(tmp_path / "a.zarr", dtype="float32")
-    b = _make_store(tmp_path / "b.zarr", dtype="int16")
-
-    report = _compare(a, b)
-
-    assert report.equivalent is False
-    assert any("dtype" in mismatch for mismatch in report.mismatches)
+METADATA_MISMATCHES: tuple[tuple[str, str, dict[str, Any], dict[str, Any]], ...] = (
+    ("test_shape_mismatch_detected", "shape", {"shape": (2, 2)}, {"shape": (3, 2)}),
+    ("test_dtype_mismatch_detected", "dtype", {"dtype": "float32"}, {"dtype": "int16"}),
+    ("test_chunks_mismatch_detected", "chunks", {"chunks": (1, 2)}, {"chunks": (2, 1)}),
+    (
+        "test_attrs_mismatch_detected",
+        "attrs",
+        {"attrs": {"units": "K"}},
+        {"attrs": {"units": "C"}},
+    ),
+)
 
 
-def test_chunks_mismatch_detected(tmp_path: Path) -> None:
-    a = _make_store(tmp_path / "a.zarr", chunks=(1, 2))
-    b = _make_store(tmp_path / "b.zarr", chunks=(2, 1))
-
-    report = _compare(a, b)
-    assert report.equivalent is False
-    assert any("chunks" in mismatch for mismatch in report.mismatches)
-
-
-def test_attrs_mismatch_detected(tmp_path: Path) -> None:
-    a = _make_store(tmp_path / "a.zarr", attrs={"units": "K"})
-    b = _make_store(tmp_path / "b.zarr", attrs={"units": "C"})
-
-    report = _compare(a, b)
-    assert report.equivalent is False
-    assert any("attrs" in mismatch for mismatch in report.mismatches)
+def test_metadata_mismatch_detected(subtests, tmp_path: Path) -> None:
+    for row_id, word, left, right in METADATA_MISMATCHES:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            report = _compare(
+                _make_store(workdir / "a.zarr", **left), _make_store(workdir / "b.zarr", **right)
+            )
+            assert report.equivalent is False
+            assert any(word in mismatch for mismatch in report.mismatches)
 
 
 def test_nan_values_at_same_positions_equal(tmp_path: Path) -> None:

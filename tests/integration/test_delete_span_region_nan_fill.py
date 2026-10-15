@@ -481,40 +481,25 @@ def _replaced_span_meta(tmp_path: Path, run_id: str) -> dict:
     raise AssertionError(f"replaced span for run_id={run_id!r} not found")
 
 
-def test_delete_span_on_append_store_no_collateral(tmp_path: Path) -> None:
-    """delete-span on append store does not touch neighbouring chunk slots."""
-    _seed_append_store(tmp_path)
-    hash_before = _hash_run_a_slots(tmp_path)
-    chunk_key = _append_chunk_key(tmp_path)
-    assert chunk_key.exists()
-
-    _delete_run_with_cli(tmp_path, "run-b")
-
-    assert _hash_run_a_slots(tmp_path) == hash_before
-    assert chunk_key.exists(), "append-store deletion must not remove shared physical chunk keys"
-
-
-def test_delete_span_sets_state_to_2(tmp_path: Path) -> None:
-    """state[30:60] == [2]*30 after delete-span run_B."""
-    _seed_append_store(tmp_path)
-
-    _delete_run_with_cli(tmp_path, "run-b")
-
-    group = _open_group(tmp_path)
-    assert group[STATE_NAME][30:60].tolist() == [2] * 30
-    assert group[STATE_NAME][0:30].tolist() == [1] * 30
-
-
 def test_delete_span_data_is_nan_or_fill_value(tmp_path: Path) -> None:
-    """data[30:60] is NaN/fill after deletion; CF bounds read as NaT; statics untouched."""
+    """Region fill of run-b: data NaN, CF bounds NaT, state 2, WAL strategy; nothing else touched."""
     _seed_append_store(tmp_path)
     span_key = _span_key(tmp_path, "run-b")
     group_dir = _group_dir(tmp_path)
     lat_before = _hash_files(group_dir / LAT_BNDS)
     lon_before = _hash_files(group_dir / LON_BNDS)
     time_bnds_attrs_before = dict(_open_group(tmp_path)[TIME_BNDS].attrs)
+    hash_before = _hash_run_a_slots(tmp_path)
+    chunk_key = _append_chunk_key(tmp_path)
+    assert chunk_key.exists()
 
     result = _delete_run_with_cli(tmp_path, "run-b")
+
+    assert _hash_run_a_slots(tmp_path) == hash_before
+    assert chunk_key.exists(), "append-store deletion must not remove shared physical chunk keys"
+    assert _open_group(tmp_path)[STATE_NAME][30:60].tolist() == [2] * 30
+    assert _open_group(tmp_path)[STATE_NAME][0:30].tolist() == [1] * 30
+    assert _replaced_span_meta(tmp_path, "run-b")["write_strategy"] == "region_nan_fill"
 
     assert "NaN-filled 1 spans" in result.output
     assert "Warnings: 1" in result.output
@@ -544,15 +529,6 @@ def test_delete_span_data_is_nan_or_fill_value(tmp_path: Path) -> None:
     assert _hash_files(group_dir / LAT_BNDS) == lat_before
     assert _hash_files(group_dir / LON_BNDS) == lon_before
     assert dict(group[TIME_BNDS].attrs) == time_bnds_attrs_before
-
-
-def test_delete_span_recorded_in_wal_as_region_nan_fill(tmp_path: Path) -> None:
-    """WAL replacement event has meta.write_strategy == region_nan_fill."""
-    _seed_append_store(tmp_path)
-
-    _delete_run_with_cli(tmp_path, "run-b")
-
-    assert _replaced_span_meta(tmp_path, "run-b")["write_strategy"] == "region_nan_fill"
 
 
 def test_delete_span_on_non_append_store_still_uses_chunk_delete(tmp_path: Path) -> None:

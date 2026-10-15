@@ -15,10 +15,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
+from tests.helpers.rows import table_row
 
 _CONFIG_TEMPLATE = """\
 [storage]
@@ -43,113 +45,73 @@ def _stub_list_chunks(monkeypatch) -> None:
     )
 
 
-def test_chunks_banner_shown_with_config_source(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    product_path = tmp_path / "product.zarr"
-    config_file = _write_config(tmp_path, target_path=product_path)
-
-    monkeypatch.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
-    monkeypatch.delenv("FIRECUBE_BUCKET", raising=False)
-    monkeypatch.setenv("FIRECUBE_CONFIG", str(config_file))
-    _stub_list_chunks(monkeypatch)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "chunks",
-            "--workspace",
-            str(workspace),
-            "list",
-            "--format",
-            "json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.stderr
-    assert "[chunks] storage: type=local" in result.stderr
-    assert "(from config)" in result.stderr
-
-
-def test_chunks_banner_suppressed_with_quiet(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    product_path = tmp_path / "product.zarr"
-    config_file = _write_config(tmp_path, target_path=product_path)
-
-    monkeypatch.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
-    monkeypatch.delenv("FIRECUBE_BUCKET", raising=False)
-    monkeypatch.setenv("FIRECUBE_CONFIG", str(config_file))
-    _stub_list_chunks(monkeypatch)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "chunks",
-            "--quiet",
-            "--workspace",
-            str(workspace),
-            "list",
-            "--format",
-            "json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.stderr
-    assert "[chunks] storage:" not in result.stderr
+_ROWS = [
+    (
+        "test_chunks_banner_shown_with_config_source",
+        "config",
+        [],
+        True,
+        ["[chunks] storage: type=local", "(from config)"],
+        [],
+    ),
+    (
+        "test_chunks_banner_suppressed_with_quiet",
+        "config",
+        ["--quiet"],
+        True,
+        [],
+        ["[chunks] storage:"],
+    ),
+    (
+        "test_chunks_banner_shown_with_env_source",
+        "env",
+        [],
+        True,
+        ["[chunks] storage: type=s3", "(from env)"],
+        [],
+    ),
+    (
+        "test_chunks_no_banner_when_neither_config_nor_env",
+        "none",
+        [],
+        False,
+        ["Chunk operations require a full product URI or a [storage] configuration"],
+        ["[chunks] storage:"],
+    ),
+]
 
 
-def test_chunks_banner_shown_with_env_source(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    missing_config = tmp_path / "missing.toml"
+def test_chunks_storage_banner(subtests: Any, monkeypatch, tmp_path: Path) -> None:
+    for row_id, source, extra_args, exit_ok, present, absent in _ROWS:
+        with table_row(subtests, row_id, tmp_path, monkeypatch) as (workdir, mp):
+            assert mp is not None
+            config_file = _write_config(workdir, target_path=workdir / "product.zarr")
+            mp.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
+            mp.delenv("FIRECUBE_BUCKET", raising=False)
+            mp.setenv(
+                "FIRECUBE_CONFIG",
+                str(config_file if source == "config" else workdir / "missing.toml"),
+            )
+            if source == "env":
+                mp.setenv("FIRECUBE_STORAGE_TYPE", "s3")
+                mp.setenv("FIRECUBE_BUCKET", "test")
+            _stub_list_chunks(mp)
 
-    monkeypatch.setenv("FIRECUBE_CONFIG", str(missing_config))
-    monkeypatch.setenv("FIRECUBE_STORAGE_TYPE", "s3")
-    monkeypatch.setenv("FIRECUBE_BUCKET", "test")
-    _stub_list_chunks(monkeypatch)
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "chunks",
+                    *extra_args,
+                    "--workspace",
+                    str(workdir / "ws"),
+                    "list",
+                    "--format",
+                    "json",
+                ],
+            )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "chunks",
-            "--workspace",
-            str(workspace),
-            "list",
-            "--format",
-            "json",
-        ],
-    )
-
-    assert result.exit_code == 0, result.stderr
-    assert "[chunks] storage: type=s3" in result.stderr
-    assert "(from env)" in result.stderr
-
-
-def test_chunks_no_banner_when_neither_config_nor_env(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    missing_config = tmp_path / "missing.toml"
-
-    monkeypatch.setenv("FIRECUBE_CONFIG", str(missing_config))
-    monkeypatch.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
-    monkeypatch.delenv("FIRECUBE_BUCKET", raising=False)
-    _stub_list_chunks(monkeypatch)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        [
-            "chunks",
-            "--workspace",
-            str(workspace),
-            "list",
-            "--format",
-            "json",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert (
-        "Chunk operations require a full product URI or a [storage] configuration" in result.stderr
-    )
-    assert "[chunks] storage:" not in result.stderr
+            assert (result.exit_code == 0) is exit_ok, result.stderr
+            for text in present:
+                assert text in result.stderr
+            for text in absent:
+                assert text not in result.stderr

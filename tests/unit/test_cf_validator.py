@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import xarray as xr
 
@@ -26,6 +30,7 @@ from tests.fixtures.cf_dataset_fixtures import (
     make_cf_compliant_dataset,
     make_legacy_timestamp_dataset,
 )
+from tests.helpers.rows import table_row
 
 
 def _ids(report: CFReport, check_id: str) -> list[str]:
@@ -90,73 +95,170 @@ def test_compliant_dataset_zero_errors() -> None:
     assert report.summary.errors == 0
 
 
-def test_cf001_missing_conventions_error() -> None:
-    ds = make_broken_dataset("conventions")
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF001")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
-
-
-def test_cf001_compliant_no_finding() -> None:
-    ds = make_cf_compliant_dataset()
-    report = validate_cf18(ds, "p", "g")
-
-    assert _ids(report, "CF001") == []
-
-
-def test_cf002_missing_title_warning() -> None:
-    ds = make_cf_compliant_dataset()
-    ds.attrs = {k: v for k, v in ds.attrs.items() if k != "title"}
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF002")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.warning
+def _time_only_dataset() -> xr.Dataset:
+    """A CF time axis and one variable, no latitude or longitude coordinate."""
+    time_attrs = {
+        "units": "days since 2000-01-01",
+        "standard_name": "time",
+        "axis": "T",
+        "calendar": "standard",
+    }
+    return xr.Dataset(
+        {"v": (("time",), np.zeros(2), {"units": "K", "long_name": "v"})},
+        coords={"time": ("time", np.arange(2, dtype=np.float64), time_attrs)},
+        attrs={"Conventions": "CF-1.8"},
+    )
 
 
-def test_cf003_missing_recommended_attrs_warning() -> None:
-    ds = make_cf_compliant_dataset()
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF003")
-    assert len(findings) == 1
-    assert "institution" in findings[0].message
-    assert "source" in findings[0].message
-    assert "history" in findings[0].message
-
-
-def test_cf004_no_time_coord_error() -> None:
-    ds = xr.Dataset(
+def _no_time_dataset() -> xr.Dataset:
+    return xr.Dataset(
         {"x_var": (("x",), np.zeros(3), {"units": "K", "long_name": "x"})},
         coords={"x": ("x", np.arange(3), {"units": "m"})},
         attrs={"Conventions": "CF-1.8"},
     )
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF004")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
 
 
-def test_cf004_legacy_timestamp_with_standard_name_passes() -> None:
-    ds = make_legacy_timestamp_dataset()
-    report = validate_cf18(ds, "p", "g")
-
-    assert _ids(report, "CF004") == []
-    assert _ids(report, "CF005") == []
-
-
-def test_cf005_bad_time_units_error() -> None:
+def _without_global_attr(key: str) -> xr.Dataset:
     ds = make_cf_compliant_dataset()
-    ds["time"].attrs = dict(ds["time"].attrs)
-    ds["time"].attrs["units"] = "foo bar baz"
-    report = validate_cf18(ds, "p", "g")
+    ds.attrs = {k: v for k, v in ds.attrs.items() if k != key}
+    return ds
 
-    findings = _by_id(report, "CF005")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
+
+def _with_time_attr(key: str, value: str | None) -> xr.Dataset:
+    """Compliant dataset with one time attr replaced (``None`` removes it)."""
+    ds = make_cf_compliant_dataset()
+    attrs = {k: v for k, v in ds["time"].attrs.items() if k != key}
+    if value is not None:
+        attrs[key] = value
+    ds["time"].attrs = attrs
+    return ds
+
+
+def _unnamed_temperature() -> xr.Dataset:
+    ds = make_cf_compliant_dataset()
+    ds["temperature"].attrs = {"units": "K"}
+    return ds
+
+
+def _bad_time_bounds() -> xr.Dataset:
+    ds = make_cf_compliant_dataset()
+    ds = ds.assign(time_bnds=xr.DataArray(np.zeros((3, 5)), dims=("time", "extra")))
+    ds["time"].attrs = dict(ds["time"].attrs)
+    ds["time"].attrs["bounds"] = "time_bnds"
+    return ds
+
+
+# (row id, dataset, check id, severity, substrings of the finding message)
+_ONE_FINDING: tuple[tuple[str, Callable[[], xr.Dataset], str, CFSeverity, tuple[str, ...]], ...] = (
+    (
+        "test_cf001_missing_conventions_error",
+        lambda: make_broken_dataset("conventions"),
+        "CF001",
+        CFSeverity.error,
+        (),
+    ),
+    (
+        "test_cf002_missing_title_warning",
+        lambda: _without_global_attr("title"),
+        "CF002",
+        CFSeverity.warning,
+        (),
+    ),
+    (
+        "test_cf003_missing_recommended_attrs_warning",
+        make_cf_compliant_dataset,
+        "CF003",
+        CFSeverity.warning,
+        ("institution", "source", "history"),
+    ),
+    ("test_cf004_no_time_coord_error", _no_time_dataset, "CF004", CFSeverity.error, ()),
+    (
+        "test_cf005_bad_time_units_error",
+        lambda: _with_time_attr("units", "foo bar baz"),
+        "CF005",
+        CFSeverity.error,
+        (),
+    ),
+    (
+        "test_cf006_missing_calendar_warning",
+        lambda: _with_time_attr("calendar", None),
+        "CF006",
+        CFSeverity.warning,
+        (),
+    ),
+    (
+        "test_cf007_missing_axis_T_info",
+        lambda: _with_time_attr("axis", None),
+        "CF007",
+        CFSeverity.info,
+        (),
+    ),
+    ("test_cf008_no_latitude_warning", _time_only_dataset, "CF008", CFSeverity.warning, ()),
+    ("test_cf009_no_longitude_warning", _time_only_dataset, "CF009", CFSeverity.warning, ()),
+    (
+        "test_cf010_missing_var_units_error",
+        lambda: make_broken_dataset("var_units"),
+        "CF010",
+        CFSeverity.error,
+        ("temperature",),
+    ),
+    (
+        "test_cf011_missing_long_or_standard_name_warning",
+        _unnamed_temperature,
+        "CF011",
+        CFSeverity.warning,
+        (),
+    ),
+    (
+        "test_cf012_broken_reference_error",
+        lambda: make_broken_dataset("broken_reference"),
+        "CF012",
+        CFSeverity.error,
+        ("nonexistent_var",),
+    ),
+    ("test_cf013_bad_bounds_shape_error", _bad_time_bounds, "CF013", CFSeverity.error, ()),
+    (
+        "test_cf014_bad_variable_name_warning",
+        lambda: make_cf_compliant_dataset().rename({"temperature": "1bad-name"}),
+        "CF014",
+        CFSeverity.warning,
+        (),
+    ),
+)
+
+
+def test_cf_check_reports_one_finding(subtests: Any, tmp_path: Path) -> None:
+    for row_id, build, check_id, severity, message_parts in _ONE_FINDING:
+        with table_row(subtests, row_id, tmp_path):
+            report = validate_cf18(build(), "p", "g")
+
+            findings = _by_id(report, check_id)
+            assert len(findings) == 1
+            assert findings[0].severity is severity
+            for part in message_parts:
+                assert part in findings[0].message
+
+
+# (row id, dataset, check ids that must not report)
+_NO_FINDING: tuple[tuple[str, Callable[[], xr.Dataset], tuple[str, ...]], ...] = (
+    ("test_cf001_compliant_no_finding", make_cf_compliant_dataset, ("CF001",)),
+    (
+        "test_cf004_legacy_timestamp_with_standard_name_passes",
+        make_legacy_timestamp_dataset,
+        ("CF004", "CF005"),
+    ),
+    ("test_cf008_2d_aux_lat_passes", _make_2d_lat_lon_dataset, ("CF008", "CF009")),
+    ("test_cf015_monotonic_coord_no_finding", make_cf_compliant_dataset, ("CF015",)),
+)
+
+
+def test_cf_check_reports_nothing(subtests: Any, tmp_path: Path) -> None:
+    for row_id, build, check_ids in _NO_FINDING:
+        with table_row(subtests, row_id, tmp_path):
+            report = validate_cf18(build(), "p", "g")
+
+            for check_id in check_ids:
+                assert _ids(report, check_id) == []
 
 
 def test_cf005_missing_time_units_error_via_fixture() -> None:
@@ -165,93 +267,6 @@ def test_cf005_missing_time_units_error_via_fixture() -> None:
 
     findings = _by_id(report, "CF005")
     assert len(findings) >= 1
-
-
-def test_cf006_missing_calendar_warning() -> None:
-    ds = make_cf_compliant_dataset()
-    ds["time"].attrs = {k: v for k, v in ds["time"].attrs.items() if k != "calendar"}
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF006")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.warning
-
-
-def test_cf007_missing_axis_T_info() -> None:
-    ds = make_cf_compliant_dataset()
-    ds["time"].attrs = {k: v for k, v in ds["time"].attrs.items() if k != "axis"}
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF007")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.info
-
-
-def test_cf008_no_latitude_warning() -> None:
-    times = np.arange(2, dtype=np.float64)
-    ds = xr.Dataset(
-        {"v": (("time",), np.zeros(2), {"units": "K", "long_name": "v"})},
-        coords={
-            "time": (
-                "time",
-                times,
-                {
-                    "units": "days since 2000-01-01",
-                    "standard_name": "time",
-                    "axis": "T",
-                    "calendar": "standard",
-                },
-            )
-        },
-        attrs={"Conventions": "CF-1.8"},
-    )
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF008")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.warning
-
-
-def test_cf008_2d_aux_lat_passes() -> None:
-    ds = _make_2d_lat_lon_dataset()
-    report = validate_cf18(ds, "p", "g")
-
-    assert _ids(report, "CF008") == []
-    assert _ids(report, "CF009") == []
-
-
-def test_cf009_no_longitude_warning() -> None:
-    times = np.arange(2, dtype=np.float64)
-    ds = xr.Dataset(
-        {"v": (("time",), np.zeros(2), {"units": "K", "long_name": "v"})},
-        coords={
-            "time": (
-                "time",
-                times,
-                {
-                    "units": "days since 2000-01-01",
-                    "standard_name": "time",
-                    "axis": "T",
-                    "calendar": "standard",
-                },
-            )
-        },
-        attrs={"Conventions": "CF-1.8"},
-    )
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF009")
-    assert len(findings) == 1
-
-
-def test_cf010_missing_var_units_error() -> None:
-    ds = make_broken_dataset("var_units")
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF010")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
-    assert "temperature" in findings[0].message
 
 
 def test_cf010_exempts_grid_mapping_container() -> None:
@@ -286,49 +301,6 @@ def test_cf010_exempts_grid_mapping_container() -> None:
     assert "no_units_var" in flagged, "non-referenced unitless var must still error"
 
 
-def test_cf011_missing_long_or_standard_name_warning() -> None:
-    ds = make_cf_compliant_dataset()
-    ds["temperature"].attrs = {"units": "K"}
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF011")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.warning
-
-
-def test_cf012_broken_reference_error() -> None:
-    ds = make_broken_dataset("broken_reference")
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF012")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
-    assert "nonexistent_var" in findings[0].message
-
-
-def test_cf013_bad_bounds_shape_error() -> None:
-    ds = make_cf_compliant_dataset()
-    bad_bounds = xr.DataArray(np.zeros((3, 5)), dims=("time", "extra"))
-    ds = ds.assign(time_bnds=bad_bounds)
-    ds["time"].attrs = dict(ds["time"].attrs)
-    ds["time"].attrs["bounds"] = "time_bnds"
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF013")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.error
-
-
-def test_cf014_bad_variable_name_warning() -> None:
-    ds = make_cf_compliant_dataset()
-    ds = ds.rename({"temperature": "1bad-name"})
-    report = validate_cf18(ds, "p", "g")
-
-    findings = _by_id(report, "CF014")
-    assert len(findings) == 1
-    assert findings[0].severity is CFSeverity.warning
-
-
 def test_cf015_non_monotonic_coord_warning() -> None:
     ds = xr.Dataset(
         {"v": (("y",), np.zeros(4), {"units": "K", "long_name": "v"})},
@@ -346,13 +318,6 @@ def test_cf015_non_monotonic_coord_warning() -> None:
     findings = _by_id(report, "CF015")
     assert any(f.target == "y" for f in findings)
     assert all(f.severity is CFSeverity.warning for f in findings)
-
-
-def test_cf015_monotonic_coord_no_finding() -> None:
-    ds = make_cf_compliant_dataset()
-    report = validate_cf18(ds, "p", "g")
-
-    assert _ids(report, "CF015") == []
 
 
 def test_aggregation_multiple_findings() -> None:

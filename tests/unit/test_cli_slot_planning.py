@@ -18,6 +18,9 @@ Mirrors the existing test_plan_*.py tests but imports from the new
 _slot_planning module directly (not through plan.py re-exports).
 """
 
+from pathlib import Path
+from typing import Any
+
 import click
 import numpy as np
 import pytest
@@ -27,6 +30,7 @@ from firecube.cli._slot_planning import (
     _chunk_aligned_remaining,
     _resolve_per_group_slot_sizes,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -35,34 +39,29 @@ def test_plan_schema_version() -> None:
     assert PLAN_SCHEMA_VERSION == "v1"
 
 
-def test_chunk_aligned_remaining_basic() -> None:
-    """Test chunk-aligned remaining computation."""
-    # interval already aligned: start=0, slot=100, total=500
-    aligned, blocked = _chunk_aligned_remaining([(0, 500)], slot_size=100, total=500)
-    assert aligned == [(0, 500)]
-    assert blocked == []
-
-
-def test_chunk_aligned_remaining_misaligned_start() -> None:
-    """Misaligned start should be blocked."""
-    # start=73, slot=100, total=1000
-    aligned, blocked = _chunk_aligned_remaining([(73, 1000)], slot_size=100, total=1000)
-    assert aligned == [(100, 1000)]
-    assert blocked == [(73, 100)]
-
-
-def test_chunk_aligned_remaining_fully_blocked() -> None:
-    """Interval that produces no aligned range is fully blocked."""
-    # (950, 1000) with slot=100, total=1000: aligned_start=1000 >= end=1000
-    aligned, blocked = _chunk_aligned_remaining([(950, 1000)], slot_size=100, total=1000)
-    assert aligned == []
-    assert blocked == [(950, 1000)]
-
-
-def test_chunk_aligned_remaining_empty() -> None:
-    aligned, blocked = _chunk_aligned_remaining([], slot_size=100, total=1000)
-    assert aligned == []
-    assert blocked == []
+def test_chunk_aligned_remaining(subtests: Any, tmp_path: Path) -> None:
+    # (row id, remaining intervals, slot size, total, expected aligned, expected blocked)
+    rows = (
+        # interval already aligned
+        ("test_chunk_aligned_remaining_basic", [(0, 500)], 100, 500, [(0, 500)], []),
+        # misaligned start is blocked up to the next slot boundary
+        (
+            "test_chunk_aligned_remaining_misaligned_start",
+            [(73, 1000)],
+            100,
+            1000,
+            [(100, 1000)],
+            [(73, 100)],
+        ),
+        # aligned_start=1000 >= end=1000: no aligned range, fully blocked
+        ("test_chunk_aligned_remaining_fully_blocked", [(950, 1000)], 100, 1000, [], [(950, 1000)]),
+        ("test_chunk_aligned_remaining_empty", [], 100, 1000, [], []),
+    )
+    for row_id, intervals, slot_size, total, expected_aligned, expected_blocked in rows:
+        with table_row(subtests, row_id, tmp_path):
+            aligned, blocked = _chunk_aligned_remaining(intervals, slot_size=slot_size, total=total)
+            assert aligned == expected_aligned
+            assert blocked == expected_blocked
 
 
 def test_resolve_per_group_slot_sizes_explicit() -> None:

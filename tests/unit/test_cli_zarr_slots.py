@@ -38,6 +38,7 @@ from firecube.ingestor.api import (
     register_ingestor,
 )
 from firecube.ingestor.registry import loader
+from tests.helpers.rows import table_row
 
 
 def _cli_index_spec(size: int) -> IndexSpec:
@@ -175,195 +176,223 @@ def _required_args_without_storage_driver(
     ]
 
 
-def test_zarr_slots_help() -> None:
-    result = CliRunner().invoke(cli, ["zarr", "slots", "--help"])
+def test_zarr_slots_json_and_ranges(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "zarr_slots_emits_valid_json_schema", tmp_path) as (workdir, _):
+        result = CliRunner().invoke(cli, _required_args(workdir, "slots_test_capable"))
 
-    assert result.exit_code == 0
-    assert "Examples:" in result.output
-    assert "--slot-size" in result.output
-
-
-def test_zarr_slots_missing_write_mode() -> None:
-    result = CliRunner().invoke(
-        cli,
-        [
-            "zarr",
-            "slots",
-            "test_product",
-            "--product-name",
-            "test",
-            "--target",
-            "file:///tmp/x.zarr",
-            "--storage-type",
-            "local",
-            "--storage-driver",
-            "fsspec",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "write-mode" in result.output.lower() or "write_mode" in result.output.lower()
-
-
-def test_zarr_slots_missing_target() -> None:
-    result = CliRunner().invoke(
-        cli,
-        [
-            "zarr",
-            "slots",
-            "test_product",
-            "--product-name",
-            "test",
-            "--storage-type",
-            "local",
-            "--storage-driver",
-            "fsspec",
-            "--write-mode",
-            "direct",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "target" in result.output.lower()
-
-
-def test_slots_rejects_file_uri_with_s3_storage_type() -> None:
-    result = CliRunner().invoke(
-        cli,
-        [
-            "zarr",
-            "slots",
-            "slots_test_capable",
-            "--product-name",
-            "x",
-            "--target",
-            "file:///tmp/x.zarr",
-            "--storage-type",
-            "s3",
-            "--storage-driver",
-            "fsspec",
-            "--write-mode",
-            "staged",
-            "--no-resume",
-        ],
-        prog_name="firecube",
-    )
-
-    assert result.exit_code != 0, result.output
-    assert "incompatible" in result.output
-
-
-def test_slots_rejects_s3_uri_with_local_storage_type() -> None:
-    result = CliRunner().invoke(
-        cli,
-        [
-            "zarr",
-            "slots",
-            "slots_test_capable",
-            "--product-name",
-            "x",
-            "--target",
-            "s3://bucket/x.zarr",
-            "--storage-type",
-            "local",
-            "--storage-driver",
-            "fsspec",
-            "--write-mode",
-            "staged",
-            "--no-resume",
-        ],
-        prog_name="firecube",
-    )
-
-    assert result.exit_code != 0, result.output
-    assert "incompatible" in result.output
-
-
-def test_zarr_slots_emits_valid_json_schema(tmp_path: Path) -> None:
-    result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_capable"))
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert list(payload) == [
-        "schema_version",
-        "product_name",
-        "target",
-        "storage_type",
-        "storage_driver",
-        "write_mode",
-        "strategy",
-        "groups",
-        "ranges",
-    ]
-    assert payload["schema_version"] == "v1"
-    assert payload["strategy"] == "indexed-region"
-    assert payload["product_name"] == "slots_test_capable"
-
-
-def test_zarr_slots_emits_resolved_storage_driver_when_flag_omitted(tmp_path: Path) -> None:
-    # Keep this focused on the omitted-flag path; env override coverage would
-    # depend on fixture ordering and is intentionally left out here.
-    result = CliRunner().invoke(
-        cli, _required_args_without_storage_driver(tmp_path, "slots_test_capable")
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["storage_driver"] == "fsspec"
-
-
-def test_zarr_slots_ranges_have_env_and_cli_args(tmp_path: Path) -> None:
-    result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_capable"))
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    ranges = payload["ranges"]
-    assert len(ranges) > 0
-    for entry in ranges:
-        assert entry["env"]["FIRECUBE_SLOT_START"] == str(entry["slot_start"])
-        assert entry["env"]["FIRECUBE_SLOT_END"] == str(entry["slot_end"])
-        assert entry["env"]["FIRECUBE_SLOT_GROUP"] == entry["group"]
-        assert entry["cli_args"] == [
-            "--slot-start",
-            str(entry["slot_start"]),
-            "--slot-end",
-            str(entry["slot_end"]),
-            "--slot-group",
-            entry["group"],
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert list(payload) == [
+            "schema_version",
+            "product_name",
+            "target",
+            "storage_type",
+            "storage_driver",
+            "write_mode",
+            "strategy",
+            "groups",
+            "ranges",
         ]
+        assert payload["schema_version"] == "v1"
+        assert payload["strategy"] == "indexed-region"
+        assert payload["product_name"] == "slots_test_capable"
+
+    with table_row(
+        subtests, "zarr_slots_emits_resolved_storage_driver_when_flag_omitted", tmp_path
+    ) as (workdir, _):
+        # Keep this focused on the omitted-flag path; env override coverage would
+        # depend on fixture ordering and is intentionally left out here.
+        result = CliRunner().invoke(
+            cli, _required_args_without_storage_driver(workdir, "slots_test_capable")
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["storage_driver"] == "fsspec"
+
+    with table_row(subtests, "zarr_slots_ranges_have_env_and_cli_args", tmp_path) as (workdir, _):
+        result = CliRunner().invoke(cli, _required_args(workdir, "slots_test_capable"))
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        ranges = payload["ranges"]
+        assert len(ranges) > 0
+        for entry in ranges:
+            assert entry["env"]["FIRECUBE_SLOT_START"] == str(entry["slot_start"])
+            assert entry["env"]["FIRECUBE_SLOT_END"] == str(entry["slot_end"])
+            assert entry["env"]["FIRECUBE_SLOT_GROUP"] == entry["group"]
+            assert entry["cli_args"] == [
+                "--slot-start",
+                str(entry["slot_start"]),
+                "--slot-end",
+                str(entry["slot_end"]),
+                "--slot-group",
+                entry["group"],
+            ]
+
+    with table_row(subtests, "zarr_slots_last_range_handles_remainder", tmp_path) as (workdir, _):
+        result = CliRunner().invoke(cli, _required_args(workdir, "slots_test_capable_remainder"))
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        ranges = [r for r in payload["ranges"] if r["group"] == "data"]
+        assert ranges[-1]["slot_start"] == 900
+        assert ranges[-1]["slot_end"] == 950
+        assert ranges[-1]["slot_end"] - ranges[-1]["slot_start"] == 50
+
+    with table_row(subtests, "zarr_slots_no_resume_emits_full_ranges", tmp_path) as (workdir, _):
+        args = [*_required_args(workdir, "slots_test_capable"), "--no-resume"]
+        result = CliRunner().invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        group = next(g for g in payload["groups"] if g["name"] == "data")
+        assert group["covered_ranges"] == []
+        assert group["remaining_ranges"] == [[0, 1000]]
+        data_ranges = [r for r in payload["ranges"] if r["group"] == "data"]
+        assert data_ranges[0]["slot_start"] == 0
+        assert data_ranges[-1]["slot_end"] == 1000
+        assert sum(r["slot_end"] - r["slot_start"] for r in data_ranges) == 1000
 
 
-def test_zarr_slots_last_range_handles_remainder(tmp_path: Path) -> None:
-    result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_capable_remainder"))
+def test_zarr_slots_help_and_refusals(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "zarr_slots_help", tmp_path):
+        result = CliRunner().invoke(cli, ["zarr", "slots", "--help"])
 
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    ranges = [r for r in payload["ranges"] if r["group"] == "data"]
-    assert ranges[-1]["slot_start"] == 900
-    assert ranges[-1]["slot_end"] == 950
-    assert ranges[-1]["slot_end"] - ranges[-1]["slot_start"] == 50
+        assert result.exit_code == 0
+        assert "Examples:" in result.output
+        assert "--slot-size" in result.output
 
+    with table_row(subtests, "zarr_slots_missing_write_mode", tmp_path):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "zarr",
+                "slots",
+                "test_product",
+                "--product-name",
+                "test",
+                "--target",
+                "file:///tmp/x.zarr",
+                "--storage-type",
+                "local",
+                "--storage-driver",
+                "fsspec",
+            ],
+        )
 
-def test_zarr_slots_no_resume_emits_full_ranges(tmp_path: Path) -> None:
-    args = [*_required_args(tmp_path, "slots_test_capable"), "--no-resume"]
-    result = CliRunner().invoke(cli, args)
+        assert result.exit_code != 0
+        assert "write-mode" in result.output.lower() or "write_mode" in result.output.lower()
 
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    group = next(g for g in payload["groups"] if g["name"] == "data")
-    assert group["covered_ranges"] == []
-    assert group["remaining_ranges"] == [[0, 1000]]
-    data_ranges = [r for r in payload["ranges"] if r["group"] == "data"]
-    assert data_ranges[0]["slot_start"] == 0
-    assert data_ranges[-1]["slot_end"] == 1000
-    assert sum(r["slot_end"] - r["slot_start"] for r in data_ranges) == 1000
+    with table_row(subtests, "zarr_slots_missing_target", tmp_path):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "zarr",
+                "slots",
+                "test_product",
+                "--product-name",
+                "test",
+                "--storage-type",
+                "local",
+                "--storage-driver",
+                "fsspec",
+                "--write-mode",
+                "direct",
+            ],
+        )
 
+        assert result.exit_code != 0
+        assert "target" in result.output.lower()
 
-def test_zarr_slots_capability_check_fails_for_non_capable(tmp_path: Path) -> None:
-    result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_noncapable"))
+    with table_row(subtests, "slots_rejects_file_uri_with_s3_storage_type", tmp_path):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "zarr",
+                "slots",
+                "slots_test_capable",
+                "--product-name",
+                "x",
+                "--target",
+                "file:///tmp/x.zarr",
+                "--storage-type",
+                "s3",
+                "--storage-driver",
+                "fsspec",
+                "--write-mode",
+                "staged",
+                "--no-resume",
+            ],
+            prog_name="firecube",
+        )
 
-    assert result.exit_code != 0, result.output
-    assert "returned no index_spec" in result.output
+        assert result.exit_code != 0, result.output
+        assert "incompatible" in result.output
+
+    with table_row(subtests, "slots_rejects_s3_uri_with_local_storage_type", tmp_path):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "zarr",
+                "slots",
+                "slots_test_capable",
+                "--product-name",
+                "x",
+                "--target",
+                "s3://bucket/x.zarr",
+                "--storage-type",
+                "local",
+                "--storage-driver",
+                "fsspec",
+                "--write-mode",
+                "staged",
+                "--no-resume",
+            ],
+            prog_name="firecube",
+        )
+
+        assert result.exit_code != 0, result.output
+        assert "incompatible" in result.output
+
+    with table_row(subtests, "zarr_slots_capability_check_fails_for_non_capable", tmp_path) as (
+        workdir,
+        _,
+    ):
+        result = CliRunner().invoke(cli, _required_args(workdir, "slots_test_noncapable"))
+
+        assert result.exit_code != 0, result.output
+        assert "returned no index_spec" in result.output
+
+    with table_row(subtests, "slots_non_capable_plugin_is_rejected", tmp_path) as (workdir, _):
+        config = workdir / "config.toml"
+        config.write_text("", encoding="utf-8")
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "--config-file",
+                str(config),
+                "zarr",
+                "slots",
+                "direct_zarr_non_capable_test_plugin",
+                "--target",
+                (workdir / "slots.zarr").as_uri(),
+                "--product-name",
+                "direct_zarr_non_capable_test_plugin",
+                "--storage-type",
+                "local",
+                "--storage-driver",
+                "fsspec",
+                "--write-mode",
+                "direct",
+                "--no-resume",
+            ],
+            catch_exceptions=True,
+        )
+
+        assert result.exit_code != 0
+        assert "returned no index_spec" in result.output
 
 
 def test_zarr_slots_does_not_mutate_target(tmp_path: Path) -> None:
@@ -436,34 +465,3 @@ def test_slots_option_reaches_plugin_hook(tmp_path: Path) -> None:
     payload = json.loads(result.output)
     group = next(g for g in payload["groups"] if g["name"] == "data")
     assert group["total_slots"] == 24
-
-
-def test_slots_non_capable_plugin_is_rejected(tmp_path: Path) -> None:
-    config = tmp_path / "config.toml"
-    config.write_text("", encoding="utf-8")
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "--config-file",
-            str(config),
-            "zarr",
-            "slots",
-            "direct_zarr_non_capable_test_plugin",
-            "--target",
-            (tmp_path / "slots.zarr").as_uri(),
-            "--product-name",
-            "direct_zarr_non_capable_test_plugin",
-            "--storage-type",
-            "local",
-            "--storage-driver",
-            "fsspec",
-            "--write-mode",
-            "direct",
-            "--no-resume",
-        ],
-        catch_exceptions=True,
-    )
-
-    assert result.exit_code != 0
-    assert "returned no index_spec" in result.output

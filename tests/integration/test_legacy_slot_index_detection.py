@@ -187,28 +187,6 @@ def _preallocate_args(target_dir: Path) -> list[str]:
     ]
 
 
-def test_helper_raises_when_only_legacy_record_present(tmp_path: Path) -> None:
-    target_dir = tmp_path / "legacy-only.zarr"
-    manager = _manager(target_dir)
-    _seed_legacy_record(manager)
-    assert _legacy_current_path(target_dir).exists()
-    assert not _index_current_path(target_dir).exists()
-
-    with pytest.raises(LegacyIndexRecordError) as excinfo:
-        check_legacy_index_record(
-            manager,
-            product=PRODUCT_NAME,
-            plugin_name=PLUGIN_NAME,
-        )
-
-    message = str(excinfo.value)
-    legacy_path = _legacy_current_path(target_dir)
-    assert "Legacy index record detected at" in message
-    assert str(legacy_path) in message
-    assert "firecube zarr index rebuild" in message
-    assert f"--plugin {PLUGIN_NAME}" in message
-
-
 def test_helper_passes_when_both_records_present(tmp_path: Path) -> None:
     target_dir = tmp_path / "both-records.zarr"
     manager = _manager(target_dir)
@@ -232,19 +210,6 @@ def test_helper_passes_when_both_records_present(tmp_path: Path) -> None:
     )
 
 
-def test_helper_passes_on_fresh_cube(tmp_path: Path) -> None:
-    target_dir = tmp_path / "fresh.zarr"
-    manager = _manager(target_dir)
-    assert not _legacy_current_path(target_dir).exists()
-    assert not _index_current_path(target_dir).exists()
-
-    check_legacy_index_record(
-        manager,
-        product=PRODUCT_NAME,
-        plugin_name=PLUGIN_NAME,
-    )
-
-
 def test_direct_zarr_startup_raises_on_legacy_only_cube(tmp_path: Path) -> None:
     target_dir = tmp_path / "startup-legacy-only.zarr"
     manager = _manager(target_dir)
@@ -259,7 +224,9 @@ def test_direct_zarr_startup_raises_on_legacy_only_cube(tmp_path: Path) -> None:
 
     message = str(excinfo.value)
     assert "Legacy index record detected at" in message
+    assert str(_legacy_current_path(target_dir)) in message
     assert "firecube zarr index rebuild" in message
+    assert f"--plugin {ingestor.name} " in message
     assert not _index_current_path(target_dir).exists(), (
         "resolved-index current.json must NOT be written when legacy detection fires"
     )

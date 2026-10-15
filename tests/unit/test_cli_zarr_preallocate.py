@@ -27,6 +27,7 @@ from click.testing import CliRunner
 from firecube.cli.main import cli
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 from firecube.ingestor.registry import loader as _loader
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -95,26 +96,19 @@ def test_preallocate_missing_required_options() -> None:
     assert "target" in result.output.lower() or "missing" in result.output.lower()
 
 
-def test_preallocate_rejects_file_uri_with_s3_storage_type() -> None:
-    result = CliRunner().invoke(
-        cli,
-        _args("file:///tmp/x.zarr", storage_type="s3"),
-        prog_name="firecube",
+def test_preallocate_rejects_uri_storage_type_mismatch(subtests: Any, tmp_path: Path) -> None:
+    rows = (
+        ("test_preallocate_rejects_file_uri_with_s3_storage_type", "file:///tmp/x.zarr", "s3"),
+        ("test_preallocate_rejects_s3_uri_with_local_storage_type", "s3://bucket/x.zarr", "local"),
     )
+    for row_id, target, storage_type in rows:
+        with table_row(subtests, row_id, tmp_path):
+            result = CliRunner().invoke(
+                cli, _args(target, storage_type=storage_type), prog_name="firecube"
+            )
 
-    assert result.exit_code != 0, result.output
-    assert "incompatible" in result.output
-
-
-def test_preallocate_rejects_s3_uri_with_local_storage_type() -> None:
-    result = CliRunner().invoke(
-        cli,
-        _args("s3://bucket/x.zarr", storage_type="local"),
-        prog_name="firecube",
-    )
-
-    assert result.exit_code != 0, result.output
-    assert "incompatible" in result.output
+            assert result.exit_code != 0, result.output
+            assert "incompatible" in result.output
 
 
 def test_preallocate_not_top_level() -> None:
@@ -199,31 +193,26 @@ def test_preallocate_accepts_matching_existing_array(
     assert "no-op" in result.output
 
 
-def test_preallocate_mismatched_shape_errors(tmp_path: Path) -> None:
-    """Mismatched shape: exits non-zero with diff."""
-    target_path = tmp_path / "drift.zarr"
-    zarr.open_group(store=str(target_path), mode="w", zarr_format=3).require_group(
-        "data"
-    ).create_array("data", shape=(5, 10), dtype=np.float32, chunks=(100, 10), fill_value=0.0)
+def test_preallocate_mismatched_existing_array_errors(subtests: Any, tmp_path: Path) -> None:
+    """An existing array that differs from the plan: exits non-zero with the diff."""
+    rows = (
+        (
+            "test_preallocate_mismatched_shape_errors",
+            (5, 10),
+            (100, 10),
+            ("Existing arrays mismatch the plan", "shape:"),
+        ),
+        ("test_preallocate_mismatched_chunks_errors", (1000, 10), (10, 10), ("chunks:",)),
+    )
+    for row_id, shape, chunks, parts in rows:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            target_path = workdir / "drift.zarr"
+            zarr.open_group(store=str(target_path), mode="w", zarr_format=3).require_group(
+                "data"
+            ).create_array("data", shape=shape, dtype=np.float32, chunks=chunks, fill_value=0.0)
 
-    result = CliRunner().invoke(cli, _args(f"file://{target_path}"))
+            result = CliRunner().invoke(cli, _args(f"file://{target_path}"))
 
-    assert result.exit_code != 0, result.output
-    assert "Existing arrays mismatch the plan" in result.output
-    assert "shape:" in result.output
-    assert "expected" in result.output
-    assert "found" in result.output
-
-
-def test_preallocate_mismatched_chunks_errors(tmp_path: Path) -> None:
-    target_path = tmp_path / "chunk-drift.zarr"
-    zarr.open_group(store=str(target_path), mode="w", zarr_format=3).require_group(
-        "data"
-    ).create_array("data", shape=(1000, 10), dtype=np.float32, chunks=(10, 10), fill_value=0.0)
-
-    result = CliRunner().invoke(cli, _args(f"file://{target_path}"))
-
-    assert result.exit_code != 0, result.output
-    assert "chunks:" in result.output
-    assert "expected" in result.output
-    assert "found" in result.output
+            assert result.exit_code != 0, result.output
+            for part in (*parts, "expected", "found"):
+                assert part in result.output

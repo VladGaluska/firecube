@@ -272,12 +272,19 @@ def test_upload_tree_rejects_remote_source(tmp_path: Path) -> None:
         )
 
 
-def test_upload_tree_parallel_workers_one_uses_sequential_fallback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("n_files", "workers"),
+    [(4, 1), (2, 4)],
+    ids=[
+        "test_upload_tree_parallel_workers_one_uses_sequential_fallback",
+        "test_upload_tree_two_files_uses_sequential_fallback",
+    ],
+)
+def test_upload_tree_uses_sequential_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_files: int, workers: int
 ) -> None:
     source = tmp_path / "source.zarr"
-    for idx in range(4):
+    for idx in range(n_files):
         (source / f"{idx}.bin").parent.mkdir(parents=True, exist_ok=True)
         (source / f"{idx}.bin").write_bytes(str(idx).encode())
     target = tmp_path / "target.zarr"
@@ -292,38 +299,11 @@ def test_upload_tree_parallel_workers_one_uses_sequential_fallback(
     result = _session(str(target)).upload_tree(
         StorageUri.from_local_path(source),
         StorageUri.from_local_path(target),
-        parallel_workers=1,
+        parallel_workers=workers,
     )
 
-    assert result.files_written == 4
-    assert (target / "3.bin").read_bytes() == b"3"
-
-
-def test_upload_tree_two_files_uses_sequential_fallback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "source.zarr"
-    for idx in range(2):
-        (source / f"{idx}.bin").parent.mkdir(parents=True, exist_ok=True)
-        (source / f"{idx}.bin").write_bytes(str(idx).encode())
-    target = tmp_path / "target.zarr"
-
-    def _fail_executor(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("parallel executor should not be used")
-
-    monkeypatch.setattr(
-        "firecube.core.storage.session.concurrent.futures.ThreadPoolExecutor", _fail_executor
-    )
-
-    result = _session(str(target)).upload_tree(
-        StorageUri.from_local_path(source),
-        StorageUri.from_local_path(target),
-        parallel_workers=4,
-    )
-
-    assert result.files_written == 2
-    assert (target / "1.bin").read_bytes() == b"1"
+    assert result.files_written == n_files
+    assert (target / f"{n_files - 1}.bin").read_bytes() == str(n_files - 1).encode()
 
 
 def test_upload_tree_parallel_upload_uses_four_workers(

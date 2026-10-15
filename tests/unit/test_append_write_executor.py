@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -25,6 +27,7 @@ import xarray as xr
 from firecube.core.filesystem.store_factory import ZarrStoreHandle
 from firecube.ingestor.runtime.zarr.alignment import AlignmentMonitor
 from firecube.ingestor.runtime.zarr.append_services import AppendWriteExecutor
+from tests.helpers.rows import table_row
 from tests.helpers.storage import local_zarr_handle
 
 
@@ -56,9 +59,9 @@ def _executor(store, logger=None):
 
 
 @pytest.mark.unit
-class TestExecute:
-    def test_write_creates_zarr_group(self, tmp_path):
-        store = str(tmp_path / "exec.zarr")
+def test_append_write_executor_contract(subtests: Any, tmp_path: Path, mocker) -> None:
+    with table_row(subtests, "write_creates_zarr_group", tmp_path) as (workdir, _):
+        store = str(workdir / "exec.zarr")
         writer = _executor(store)
         ds = _make_ds(3)
 
@@ -67,8 +70,8 @@ class TestExecute:
         result = xr.open_zarr(store, group="G1", consolidated=False)
         assert result.sizes["timestamp"] == 3
 
-    def test_append_mode_extends_store(self, tmp_path):
-        store = str(tmp_path / "append.zarr")
+    with table_row(subtests, "append_mode_extends_store", tmp_path) as (workdir, _):
+        store = str(workdir / "append.zarr")
         writer = _executor(store)
         ds1 = _make_ds(2)
         ds2 = _make_ds(2)
@@ -80,15 +83,12 @@ class TestExecute:
         result = xr.open_zarr(store, group="G1", consolidated=False)
         assert result.sizes["timestamp"] == 4
 
-
-@pytest.mark.unit
-class TestCheckAlignment:
-    def test_aligned_returns_true(self):
+    with table_row(subtests, "aligned_returns_true", tmp_path):
         writer = _executor("dummy")
         assert writer.check_alignment(start_i=0, count=2, chunk_len=2, group="G1") is True
         assert writer.check_alignment(start_i=4, count=2, chunk_len=2, group="G1") is True
 
-    def test_unaligned_returns_false_and_warns(self):
+    with table_row(subtests, "unaligned_returns_false_and_warns", tmp_path):
         logger = logging.getLogger("test.alignment")
         writer = _executor("dummy", logger=logger)
 
@@ -99,34 +99,35 @@ class TestCheckAlignment:
         assert mock_warn.call_count == 1
         assert "unaligned" in mock_warn.call_args[0][0].lower()
 
-    def test_no_chunk_len_returns_true(self):
+    with table_row(subtests, "no_chunk_len_returns_true", tmp_path):
         writer = _executor("dummy")
         assert writer.check_alignment(start_i=1, count=3, chunk_len=None, group="G1") is True
         assert writer.check_alignment(start_i=1, count=3, chunk_len=0, group="G1") is True
 
+    with table_row(subtests, "write_dataset_to_zarr_does_not_call_schema_validator", tmp_path) as (
+        workdir,
+        _,
+    ):
+        # write_dataset_to_zarr no longer runs schema validation; the caller owns it.
+        from firecube.ingestor.runtime.zarr import schema as schema_module
+        from firecube.ingestor.runtime.zarr.write import write_dataset_to_zarr
 
-@pytest.mark.unit
-def test_write_dataset_to_zarr_does_not_call_schema_validator(tmp_path, mocker):
-    """write_dataset_to_zarr no longer runs schema validation; the caller owns it."""
-    from firecube.ingestor.runtime.zarr import schema as schema_module
-    from firecube.ingestor.runtime.zarr.write import write_dataset_to_zarr
+        spy = mocker.spy(schema_module, "validate_existing_time_array_schema")
+        store = str(workdir / "no_validate.zarr")
+        ds1 = _make_ds(2)
+        ds2 = _make_ds(2).assign_coords(
+            timestamp=pd.date_range("2024-01-01T02:00", periods=2, freq="h")
+        )
 
-    spy = mocker.spy(schema_module, "validate_existing_time_array_schema")
-    store = str(tmp_path / "no_validate.zarr")
-    ds1 = _make_ds(2)
-    ds2 = _make_ds(2).assign_coords(
-        timestamp=pd.date_range("2024-01-01T02:00", periods=2, freq="h")
-    )
+        write_dataset_to_zarr(
+            ds1, zarr_store=local_zarr_handle(store), group="G1", mode="w", time_dim="timestamp"
+        )
+        write_dataset_to_zarr(
+            ds2,
+            zarr_store=local_zarr_handle(store, mode="a"),
+            group="G1",
+            mode="a",
+            time_dim="timestamp",
+        )
 
-    write_dataset_to_zarr(
-        ds1, zarr_store=local_zarr_handle(store), group="G1", mode="w", time_dim="timestamp"
-    )
-    write_dataset_to_zarr(
-        ds2,
-        zarr_store=local_zarr_handle(store, mode="a"),
-        group="G1",
-        mode="a",
-        time_dim="timestamp",
-    )
-
-    assert spy.call_count == 0
+        assert spy.call_count == 0

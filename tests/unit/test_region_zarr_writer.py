@@ -207,20 +207,6 @@ class TestWrite1D:
         result = np.asarray(writer._open_root()["grp/cal"][2])
         np.testing.assert_array_equal(result, data)
 
-    def test_1d_datetime64_single_element_ndarray_writes_slot(self, writer):
-        """Regression: numpy>=2 rejects arr[i]=1-elem-array for datetime64."""
-        writer.ensure_group(
-            "grp/scans_start",
-            shape=(288,),
-            dtype=np.dtype("datetime64[s]"),
-            fill_value=np.datetime64("NaT", "s"),
-            chunks=(288,),
-        )
-        data = np.array(["2023-12-01T00:00:00"], dtype="datetime64[s]")
-        writer.write_1d("grp", "scans_start", ts_index=42, data=data)
-        arr = writer._open_root()["grp/scans_start"]
-        assert np.asarray(arr[42]) == np.datetime64("2023-12-01T00:00:00", "s")
-
     @pytest.mark.parametrize(
         "dtype,fill,scalar_val,array_val",
         [

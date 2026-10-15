@@ -19,6 +19,7 @@ from __future__ import annotations
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
+from tests.helpers.rows import table_row
 
 _LOCAL_STORAGE_FLAGS = ["--storage-type", "local", "--storage-driver", "fsspec"]
 
@@ -70,53 +71,33 @@ class TestArchiveListCommand:
         assert "No such command" in result.output
 
 
-class TestLocalArchiveWithoutStorageConfig:
-    """archive create works without FIRECUBE_STORAGE_TYPE for local paths."""
-
-    def test_local_create_no_storage_env(self, tmp_path, monkeypatch):
-        import numpy as np
-        import xarray as xr
-
-        monkeypatch.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
-        monkeypatch.delenv("FIRECUBE_TARGET_PATH", raising=False)
-        runner = CliRunner()
-        src = str(tmp_path / "test.zarr")
-        src_uri = f"file://{src}"
-        tgt_uri = f"file://{tmp_path / 'test.tgm'}"
-        ds = xr.Dataset(
-            {"FWI": (["t", "y"], np.ones((3, 4), dtype="float32"))},
-            coords={"t": [0, 1, 2], "y": [1, 2, 3, 4]},
-        )
-        ds.to_zarr(src)
-        result = runner.invoke(
-            cli,
-            ["archive", "create", "--source", src_uri, "--archive", tgt_uri, *_LOCAL_STORAGE_FLAGS],
-        )
-        assert result.exit_code == 0, result.output
-        assert (tmp_path / "test.tgm").exists()
-
-
-class TestArchiveCreateIntegration:
+class TestArchiveCreateLocal:
     """archive create with a real Zarr source produces a .tgm file."""
 
-    def test_produces_tgm_file(self, tmp_path, monkeypatch):
+    def test_produces_tgm_file(self, tmp_path, monkeypatch, subtests):
         import numpy as np
         import xarray as xr
 
-        monkeypatch.setenv("FIRECUBE_STORAGE_TYPE", "local")
-        monkeypatch.setenv("FIRECUBE_TARGET_PATH", str(tmp_path))
-        runner = CliRunner()
-        src = str(tmp_path / "test.zarr")
-        src_uri = f"file://{src}"
-        tgt_uri = f"file://{tmp_path / 'test.tgm'}"
-        ds = xr.Dataset(
-            {"FWI": (["t", "y"], np.ones((3, 4), dtype="float32"))},
-            coords={"t": [0, 1, 2], "y": [1, 2, 3, 4]},
-        )
-        ds.to_zarr(src)
-        result = runner.invoke(
-            cli,
-            ["archive", "create", "--source", src_uri, "--archive", tgt_uri, *_LOCAL_STORAGE_FLAGS],
-        )
-        assert result.exit_code == 0, result.output
-        assert (tmp_path / "test.tgm").exists()
+        for row_id, storage_env in (
+            ("test_local_create_no_storage_env", False),
+            ("test_produces_tgm_file", True),
+        ):
+            with table_row(subtests, row_id, tmp_path, monkeypatch) as (workdir, mp):
+                assert mp is not None
+                if storage_env:
+                    mp.setenv("FIRECUBE_STORAGE_TYPE", "local")
+                    mp.setenv("FIRECUBE_TARGET_PATH", str(workdir))
+                else:
+                    mp.delenv("FIRECUBE_STORAGE_TYPE", raising=False)
+                    mp.delenv("FIRECUBE_TARGET_PATH", raising=False)
+                src = str(workdir / "test.zarr")
+                ds = xr.Dataset(
+                    {"FWI": (["t", "y"], np.ones((3, 4), dtype="float32"))},
+                    coords={"t": [0, 1, 2], "y": [1, 2, 3, 4]},
+                )
+                ds.to_zarr(src)
+                args = ["archive", "create", "--source", f"file://{src}"]
+                args += ["--archive", f"file://{workdir / 'test.tgm'}", *_LOCAL_STORAGE_FLAGS]
+                result = CliRunner().invoke(cli, args)
+                assert result.exit_code == 0, result.output
+                assert (workdir / "test.tgm").exists()

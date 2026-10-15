@@ -164,138 +164,112 @@ def test_rebuild_help_lists_required_flags() -> None:
     assert "--product-name" in result.output
 
 
-def test_rebuild_fresh_cube_writes_new_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_rebuild_fresh_cube_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subtests: pytest.Subtests
 ) -> None:
+    """One cube through fresh rebuild, replay, divergent refusal and the next ingest.
+
+    Each step is a former test of this module (step id = old test name). The
+    steps are sequential on purpose: each one starts from the state the
+    previous step left behind.
+    """
     _register_plugins(monkeypatch)
     cube = tmp_path / "fresh_cube"
     cube.mkdir()
-
-    result = CliRunner().invoke(cli, _args(cube))
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "Rebuilt index record" in result.stdout
-    record = _current_record(cube)
-    assert record.recorded_by_run_id.startswith("rebuild-"), record.recorded_by_run_id
-    assert record.identity_hash == _expected_record().identity_hash
-    assert record.identity_hash[:16] in result.stdout
-
-
-def test_rebuild_success_does_not_strand_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _register_plugins(monkeypatch)
-    cube = tmp_path / "success_no_strand_cube"
-    cube.mkdir()
-
-    result = CliRunner().invoke(cli, _args(cube))
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert _non_terminal_runs(cube) == []
-
-
-def test_rebuild_matching_record_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _register_plugins(monkeypatch)
-    cube = tmp_path / "matching_cube"
-    cube.mkdir()
-    first = CliRunner().invoke(cli, _args(cube))
-    assert first.exit_code == 0, first.output
     current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
-    original_bytes = current_json.read_bytes()
 
-    result = CliRunner().invoke(cli, _args(cube))
+    with subtests.test(msg="test_rebuild_fresh_cube_writes_new_record"):
+        result = CliRunner().invoke(cli, _args(cube))
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "Index record unchanged" in result.stdout
-    assert current_json.read_bytes() == original_bytes
-    assert _current_record(cube).identity_hash[:16] in result.stdout
+        assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "Rebuilt index record" in result.stdout
+        record = _current_record(cube)
+        assert record.recorded_by_run_id.startswith("rebuild-"), record.recorded_by_run_id
+        assert record.identity_hash == _expected_record().identity_hash
+        assert record.identity_hash[:16] in result.stdout
 
+    with subtests.test(msg="test_rebuild_success_does_not_strand_run"):
+        assert _non_terminal_runs(cube) == []
 
-def test_rebuild_divergent_record_exits_one_without_overwrite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _register_plugins(monkeypatch)
-    cube = tmp_path / "conflict_cube"
-    cube.mkdir()
-    created = CliRunner().invoke(cli, _args(cube))
-    assert created.exit_code == 0, created.output
-    current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
-    original_bytes = current_json.read_bytes()
-    stored_hash = _current_record(cube).identity_hash
-    incoming_hash = _expected_record(size=5).identity_hash
+    with subtests.test(msg="test_rebuild_matching_record_is_noop"):
+        original_bytes = current_json.read_bytes()
 
-    result = CliRunner().invoke(cli, _args(cube, plugin="index-rebuild-divergent"))
+        result = CliRunner().invoke(cli, _args(cube))
 
-    assert result.exit_code == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "plugin declares incompatible resolved index" in result.stderr
-    assert stored_hash[:16] in result.stderr
-    assert incoming_hash[:16] in result.stderr
-    assert current_json.read_bytes() == original_bytes
+        assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "Index record unchanged" in result.stdout
+        assert current_json.read_bytes() == original_bytes
+        assert _current_record(cube).identity_hash[:16] in result.stdout
 
+    with subtests.test(msg="test_rebuild_divergent_record_exits_one_without_overwrite"):
+        original_bytes = current_json.read_bytes()
+        stored_hash = _current_record(cube).identity_hash
+        incoming_hash = _expected_record(size=5).identity_hash
 
-def test_rebuild_conflict_does_not_strand_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _register_plugins(monkeypatch)
-    cube = tmp_path / "conflict_no_strand_cube"
-    cube.mkdir()
-    created = CliRunner().invoke(cli, _args(cube))
-    assert created.exit_code == 0, created.output
+        result = CliRunner().invoke(cli, _args(cube, plugin="index-rebuild-divergent"))
 
-    result = CliRunner().invoke(cli, _args(cube, plugin="index-rebuild-divergent"))
+        assert result.exit_code == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "plugin declares incompatible resolved index" in result.stderr
+        assert stored_hash[:16] in result.stderr
+        assert incoming_hash[:16] in result.stderr
+        assert current_json.read_bytes() == original_bytes
 
-    assert result.exit_code == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "plugin declares incompatible resolved index" in result.stderr
-    assert _non_terminal_runs(cube) == []
+    with subtests.test(msg="test_rebuild_conflict_does_not_strand_run"):
+        assert _non_terminal_runs(cube) == []
 
+    with subtests.test(msg="test_rebuild_run_id_is_uuid_per_invocation"):
+        cube_b = tmp_path / "cube_b"
+        cube_b.mkdir()
 
-def test_rebuild_success_allows_next_ingest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _register_plugins(monkeypatch)
-    cube = tmp_path / "success_then_ingest_cube"
-    cube.mkdir()
-    rebuilt = CliRunner().invoke(cli, _args(cube))
-    assert rebuilt.exit_code == 0, rebuilt.output
-    assert _non_terminal_runs(cube) == []
+        second = CliRunner().invoke(cli, _args(cube_b))
 
-    from cli_test_plugin import CliTestIngestor
+        assert second.exit_code == 0, second.output
+        first_id = _current_record(cube).recorded_by_run_id
+        second_id = _current_record(cube_b).recorded_by_run_id
+        assert first_id.startswith("rebuild-"), first_id
+        assert second_id.startswith("rebuild-"), second_id
+        assert first_id != second_id, (
+            f"Each rebuild invocation must produce a distinct run_id; both were {first_id!r}"
+        )
 
-    config = tmp_path / "config.toml"
-    config.write_text("", encoding="utf-8")
-    input_dir = tmp_path / "input"
-    input_dir.mkdir()
-    monkeypatch.setattr(
-        ingestor_loader,
-        "AVAILABLE_INGESTORS",
-        {"cli_test_plugin": CliTestIngestor},
-    )
-    ingested = CliRunner().invoke(
-        cli,
-        [
-            "--config-file",
-            str(config),
-            "ingest",
-            "cli_test_plugin",
-            "--target",
-            f"file://{cube}",
-            "--product-name",
-            "index_rebuild_product",
-            "--input-data",
-            str(input_dir),
-            "--storage-type",
-            "local",
-            "--storage-driver",
-            "fsspec",
-            "--write-mode",
-            "direct",
-            "--option",
-            "allow_empty_source=true",
-        ],
-    )
+    with subtests.test(msg="test_rebuild_success_allows_next_ingest"):
+        from cli_test_plugin import CliTestIngestor
 
-    assert ingested.exit_code == 0, ingested.output
-    assert "ResumeConflictError" not in ingested.output
+        config = tmp_path / "config.toml"
+        config.write_text("", encoding="utf-8")
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        monkeypatch.setattr(
+            ingestor_loader,
+            "AVAILABLE_INGESTORS",
+            {"cli_test_plugin": CliTestIngestor},
+        )
+        ingested = CliRunner().invoke(
+            cli,
+            [
+                "--config-file",
+                str(config),
+                "ingest",
+                "cli_test_plugin",
+                "--target",
+                f"file://{cube}",
+                "--product-name",
+                "index_rebuild_product",
+                "--input-data",
+                str(input_dir),
+                "--storage-type",
+                "local",
+                "--storage-driver",
+                "fsspec",
+                "--write-mode",
+                "direct",
+                "--option",
+                "allow_empty_source=true",
+            ],
+        )
+
+        assert ingested.exit_code == 0, ingested.output
+        assert "ResumeConflictError" not in ingested.output
 
 
 def test_rebuild_pre_ensure_failure_does_not_create_or_strand_run(
@@ -471,29 +445,6 @@ def test_rebuild_emits_rebuilt_outcome(tmp_path: Path, monkeypatch: pytest.Monke
     assert event.product == "index_rebuild_product"
     assert event.run_id.startswith("rebuild-"), event.run_id
     assert event.identity_hash == _expected_record().identity_hash
-
-
-def test_rebuild_run_id_is_uuid_per_invocation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _register_plugins(monkeypatch)
-    cube_a = tmp_path / "cube_a"
-    cube_a.mkdir()
-    cube_b = tmp_path / "cube_b"
-    cube_b.mkdir()
-
-    first = CliRunner().invoke(cli, _args(cube_a))
-    second = CliRunner().invoke(cli, _args(cube_b))
-
-    assert first.exit_code == 0, first.output
-    assert second.exit_code == 0, second.output
-    first_id = _current_record(cube_a).recorded_by_run_id
-    second_id = _current_record(cube_b).recorded_by_run_id
-    assert first_id.startswith("rebuild-"), first_id
-    assert second_id.startswith("rebuild-"), second_id
-    assert first_id != second_id, (
-        f"Each rebuild invocation must produce a distinct run_id; both were {first_id!r}"
-    )
 
 
 def test_rebuild_none_spec_clear_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -41,6 +41,7 @@ from firecube.core.filesystem.fsspec_backend import (
     _is_precondition_failed,
 )
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.rows import table_row
 
 _URI = StorageUri.parse("s3://bucket/.firecube/claims/slot_index_model__current.json")
 
@@ -99,35 +100,26 @@ class _CapturingFs:
 
 
 @pytest.mark.unit
-def test_s3fs_precondition_failed_maps_to_file_exists() -> None:
-    """The wrapped s3fs 412 (OSError EINVAL + ClientError cause) -> FileExistsError."""
-    writer = FsspecAtomicWriter(_RaisingFs(_s3fs_precondition_oserror()))
-    with pytest.raises(FileExistsError):
-        writer.write_atomic(_URI, b"{}")
-
-
-@pytest.mark.unit
-def test_direct_client_error_precondition_maps_to_file_exists() -> None:
-    """A bare botocore-style ClientError(412) with no OSError wrapper still maps."""
-    writer = FsspecAtomicWriter(_RaisingFs(_FakeClientError("PreconditionFailed", 412)))
-    with pytest.raises(FileExistsError):
-        writer.write_atomic(_URI, b"{}")
-
-
-@pytest.mark.unit
-def test_local_eexist_maps_to_file_exists() -> None:
-    """Regression: local-fs errno EEXIST still normalizes to FileExistsError."""
-    writer = FsspecAtomicWriter(_RaisingFs(OSError(errno.EEXIST, "File exists")))
-    with pytest.raises(FileExistsError):
-        writer.write_atomic(_URI, b"{}")
-
-
-@pytest.mark.unit
-def test_native_file_exists_error_propagates() -> None:
-    """A backend that already raises FileExistsError passes through unchanged."""
-    writer = FsspecAtomicWriter(_RaisingFs(FileExistsError("exists")))
-    with pytest.raises(FileExistsError):
-        writer.write_atomic(_URI, b"{}")
+def test_exclusive_create_conflict_maps_to_file_exists(subtests: Any, tmp_path: Path) -> None:
+    """Every backend's exclusive-create conflict surfaces as FileExistsError."""
+    rows: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+        # the wrapped s3fs 412 (OSError EINVAL + ClientError cause)
+        ("test_s3fs_precondition_failed_maps_to_file_exists", _s3fs_precondition_oserror),
+        # a bare botocore-style ClientError(412) with no OSError wrapper
+        (
+            "test_direct_client_error_precondition_maps_to_file_exists",
+            lambda: _FakeClientError("PreconditionFailed", 412),
+        ),
+        # regression: local-fs errno EEXIST
+        ("test_local_eexist_maps_to_file_exists", lambda: OSError(errno.EEXIST, "File exists")),
+        # a backend that already raises FileExistsError passes through unchanged
+        ("test_native_file_exists_error_propagates", lambda: FileExistsError("exists")),
+    )
+    for row_id, conflict in rows:
+        with table_row(subtests, row_id, tmp_path):
+            writer = FsspecAtomicWriter(_RaisingFs(conflict()))
+            with pytest.raises(FileExistsError):
+                writer.write_atomic(_URI, b"{}")
 
 
 @pytest.mark.unit

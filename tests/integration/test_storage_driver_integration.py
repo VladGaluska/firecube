@@ -23,6 +23,7 @@ import xarray as xr
 from firecube.core.config import StorageConfig
 from firecube.core.filesystem.store_factory import ZarrStoreHandle, create_zarr_store
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_session
 
 
@@ -61,63 +62,49 @@ def _open_zarr_with_driver(store_path: str, driver: str, group: str | None = Non
     return xr.open_zarr(**handle.zarr_kwargs(), group=group, zarr_format=3)
 
 
-@pytest.mark.integration
-class TestFsspecDriver:
-    def test_write_and_read_back(self, tmp_path: Path) -> None:
-        store_path = str(tmp_path / "fsspec_output.zarr")
-        ds = _make_sample_dataset()
-
-        _write_zarr_with_driver(ds, store_path, "fsspec")
-
-        assert Path(store_path).exists()
-        assert (Path(store_path) / "zarr.json").exists()
-
-        ds_read = _open_zarr_with_driver(store_path, "fsspec")
-
-        assert set(ds_read.dims) == {"timestamp", "lat", "lon"}
-        assert set(ds_read.data_vars) == {"temperature", "humidity"}
-        assert ds_read.sizes["timestamp"] == 5
-        assert ds_read.sizes["lat"] == 8
-        assert ds_read.sizes["lon"] == 8
-        xr.testing.assert_equal(ds, ds_read)
-
-    def test_write_with_group(self, tmp_path: Path) -> None:
-        store_path = str(tmp_path / "fsspec_grouped.zarr")
-        ds = _make_sample_dataset()
-
-        _write_zarr_with_driver(ds, store_path, "fsspec", group="Euro")
-
-        ds_read = _open_zarr_with_driver(store_path, "fsspec", group="Euro")
-        xr.testing.assert_equal(ds, ds_read)
+# Row id = former ``Class::test`` name; every row runs the same body with its driver.
+_ROUND_TRIP_ROWS = (
+    ("TestFsspecDriver::test_write_and_read_back", "fsspec"),
+    ("TestObstoreDriver::test_write_and_read_back", "obstore"),
+)
+_GROUPED_ROWS = (
+    ("TestFsspecDriver::test_write_with_group", "fsspec"),
+    ("TestObstoreDriver::test_write_with_group", "obstore"),
+)
 
 
 @pytest.mark.integration
-class TestObstoreDriver:
-    def test_write_and_read_back(self, tmp_path: Path) -> None:
-        store_path = str(tmp_path / "obstore_output.zarr")
-        ds = _make_sample_dataset()
+class TestDriverRoundTrip:
+    def test_write_and_read_back(self, tmp_path: Path, subtests: pytest.Subtests) -> None:
+        for row_id, driver in _ROUND_TRIP_ROWS:
+            with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+                store_path = str(workdir / f"{driver}_output.zarr")
+                ds = _make_sample_dataset()
 
-        _write_zarr_with_driver(ds, store_path, "obstore")
+                _write_zarr_with_driver(ds, store_path, driver)
 
-        assert Path(store_path).exists()
+                assert Path(store_path).exists()
+                assert (Path(store_path) / "zarr.json").exists()
 
-        ds_read = _open_zarr_with_driver(store_path, "obstore")
+                ds_read = _open_zarr_with_driver(store_path, driver)
 
-        assert set(ds_read.dims) == {"timestamp", "lat", "lon"}
-        assert set(ds_read.data_vars) == {"temperature", "humidity"}
-        assert ds_read.sizes["timestamp"] == 5
-        assert ds_read.sizes["lat"] == 8
-        assert ds_read.sizes["lon"] == 8
-        xr.testing.assert_equal(ds, ds_read)
+                assert set(ds_read.dims) == {"timestamp", "lat", "lon"}
+                assert set(ds_read.data_vars) == {"temperature", "humidity"}
+                assert ds_read.sizes["timestamp"] == 5
+                assert ds_read.sizes["lat"] == 8
+                assert ds_read.sizes["lon"] == 8
+                xr.testing.assert_equal(ds, ds_read)
 
-    def test_write_with_group(self, tmp_path: Path) -> None:
-        store_path = str(tmp_path / "obstore_grouped.zarr")
-        ds = _make_sample_dataset()
+    def test_write_with_group(self, tmp_path: Path, subtests: pytest.Subtests) -> None:
+        for row_id, driver in _GROUPED_ROWS:
+            with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+                store_path = str(workdir / f"{driver}_grouped.zarr")
+                ds = _make_sample_dataset()
 
-        _write_zarr_with_driver(ds, store_path, "obstore", group="Euro")
+                _write_zarr_with_driver(ds, store_path, driver, group="Euro")
 
-        ds_read = _open_zarr_with_driver(store_path, "obstore", group="Euro")
-        xr.testing.assert_equal(ds, ds_read)
+                ds_read = _open_zarr_with_driver(store_path, driver, group="Euro")
+                xr.testing.assert_equal(ds, ds_read)
 
 
 @pytest.mark.integration

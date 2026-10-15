@@ -313,7 +313,31 @@ def test_upload_workers_propagates_through_engine_to_upload_tree(
     assert captured.get("parallel_workers") == 8, f"Expected 8, got {captured}"
 
 
-def test_bt2_poison_ingest_write_flow(tmp_path: Path) -> None:
+# Each BT2 poison flow runs once per driver: the obstore path must be as free of
+# disallowed ``fsspec.*`` calls as the fsspec one.
+_DRIVERS = ["fsspec", "obstore"]
+
+
+def _write_counts_zarr(path: Path) -> None:
+    ds = xr.Dataset(
+        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
+        coords={"t": np.array([0, 1, 2], dtype="int64")},
+    )
+    ds.to_zarr(str(path), mode="w")
+
+
+def _build_local_archive_session(
+    product_uri: str,
+    target_root: Path,
+    driver: Literal["fsspec", "obstore"],
+) -> tuple[StorageConfig, StorageSession]:
+    """Build a local-storage StorageSession for archive create/restore tests."""
+    session = make_test_session(target_root, product=Path(product_uri).name, driver=driver)
+    return StorageConfig(storage_type="local", storage_driver=driver), session
+
+
+@pytest.mark.parametrize("driver", _DRIVERS)
+def test_bt2_poison_ingest_write_flow(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     from tests.integration._bt_helpers import bt2_poison
 
     staged_source = tmp_path / "staged" / "product.zarr"
@@ -330,15 +354,15 @@ def test_bt2_poison_ingest_write_flow(tmp_path: Path) -> None:
     target_root = tmp_path / "out"
     target = target_root / "product.zarr"
 
-    session = make_test_session(target_root, product=target.name)
+    session = make_test_session(target_root, product=target.name, driver=driver)
     ctx = RuntimeIngestContext(
         source="source",
         target=str(target),
         output_format="zarr",
         storage=StorageContext(output=session),
         options={"write_mode": "staged", "no_progress": True},
-        run_id="poison-ingest-run",
-        identity=RuntimeIdentity(run_id="poison-ingest-run"),
+        run_id=f"poison-ingest-run-{driver}",
+        identity=RuntimeIdentity(run_id=f"poison-ingest-run-{driver}"),
     )
     result = IngestResult(
         outputs=OutputPaths(primary=str(staged_source)),
@@ -363,34 +387,21 @@ def test_bt2_poison_ingest_write_flow(tmp_path: Path) -> None:
     assert updated.manifest["stored_at"] == StorageUri.from_local_path(target).to_str()
 
 
-def _build_local_archive_session(
-    product_uri: str,
-    target_root: Path,
-) -> tuple[StorageConfig, StorageSession]:
-    """Build a local-storage StorageSession for archive create/restore tests."""
-    session = make_test_session(target_root, product=Path(product_uri).name)
-    storage_config = StorageConfig(storage_type="local")
-    return storage_config, session
-
-
-def test_bt2_poison_archive_create(tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", _DRIVERS)
+def test_bt2_poison_archive_create(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     from tests.integration._bt_helpers import bt2_poison
 
     from firecube.core.tensogram.converter import zarr_to_tgm
 
-    # Build a real (small) zarr source product OUTSIDE the poison context so
-    # the archive create flow has a genuine store to read from.
+    # Build a real (small) zarr source product OUTSIDE the poison context with
+    # the default fsspec writer, so the archive create flow has a genuine store.
     source_root = tmp_path / "products"
     source_root.mkdir()
     source = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(source), mode="w")
+    _write_counts_zarr(source)
 
     archive_path = tmp_path / "archive.tgm"
-    storage_config, session = _build_local_archive_session(str(source), source_root)
+    storage_config, session = _build_local_archive_session(str(source), source_root, driver)
 
     with bt2_poison():
         result = zarr_to_tgm(
@@ -400,13 +411,14 @@ def test_bt2_poison_archive_create(tmp_path: Path) -> None:
             session=session,
         )
 
-    assert archive_path.exists(), "archive .tgm not produced under bt2_poison"
+    assert archive_path.exists(), f"archive .tgm not produced under bt2_poison ({driver})"
     assert archive_path.stat().st_size > 0
     assert result["target"] == str(archive_path)
     assert "counts" in result["variables"]
 
 
-def test_bt2_poison_archive_restore(tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", _DRIVERS)
+def test_bt2_poison_archive_restore(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     from tests.integration._bt_helpers import bt2_poison
 
     from firecube.core.tensogram.converter import zarr_to_tgm
@@ -417,14 +429,12 @@ def test_bt2_poison_archive_restore(tmp_path: Path) -> None:
     source_root = tmp_path / "products"
     source_root.mkdir()
     source = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(source), mode="w")
+    _write_counts_zarr(source)
 
     archive_path = tmp_path / "archive.tgm"
-    create_storage_config, create_session = _build_local_archive_session(str(source), source_root)
+    create_storage_config, create_session = _build_local_archive_session(
+        str(source), source_root, driver
+    )
     zarr_to_tgm(
         str(source),
         str(archive_path),
@@ -437,7 +447,9 @@ def test_bt2_poison_archive_restore(tmp_path: Path) -> None:
     target_root = tmp_path / "restored"
     target_root.mkdir()
     target = target_root / "restored.zarr"
-    restore_storage_config, restore_session = _build_local_archive_session(str(target), target_root)
+    restore_storage_config, restore_session = _build_local_archive_session(
+        str(target), target_root, driver
+    )
 
     with bt2_poison():
         restore_result = tgm_to_zarr(
@@ -447,11 +459,14 @@ def test_bt2_poison_archive_restore(tmp_path: Path) -> None:
             session=restore_session,
         )
 
-    assert (target / "zarr.json").exists(), "restored zarr.json missing under bt2_poison"
+    assert (target / "zarr.json").exists(), (
+        f"restored zarr.json missing under bt2_poison ({driver})"
+    )
     assert restore_result["target"] == str(target)
 
 
-def test_bt2_poison_delete_flow(tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", _DRIVERS)
+def test_bt2_poison_delete_flow(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     """Abandoning a non-terminal run via the ChunkManager facade must not
     trip BT2 poison: control-plane I/O routes through the approved
     ``firecube.core.filesystem.ops`` module (and downstream control-plane
@@ -459,13 +474,12 @@ def test_bt2_poison_delete_flow(tmp_path: Path) -> None:
     """
     from tests.integration._bt_helpers import bt2_poison
 
-    product = "bt2_delete_product"
-    run_id = "run-to-abandon"
-    base_uri = str(tmp_path)
+    product = f"bt2_delete_product_{driver}"
+    run_id = f"run-to-abandon-{driver}"
 
     # Set up a non-terminal run under .firecube/ OUTSIDE the poison context
     # so the poisoning only covers the abandon/cleanup flow under test.
-    manager = ChunkManager(binding=make_test_binding(Path(base_uri)), workspace=tmp_path)
+    manager = ChunkManager(binding=make_test_binding(tmp_path, driver=driver), workspace=tmp_path)
     try:
         manager.record_run_started(
             product=product,
@@ -484,7 +498,7 @@ def test_bt2_poison_delete_flow(tmp_path: Path) -> None:
             result = manager.abandon_run(
                 product=product,
                 run_id=run_id,
-                reason="bt2-poison-test",
+                reason=f"bt2-poison-test-{driver}",
             )
 
         assert result == {
@@ -503,7 +517,8 @@ def test_bt2_poison_delete_flow(tmp_path: Path) -> None:
         manager.close()
 
 
-def test_bt2_poison_read_flow(tmp_path: Path) -> None:
+@pytest.mark.parametrize("driver", _DRIVERS)
+def test_bt2_poison_read_flow(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     """Reading zarr metadata via ``validate_group_with_fs`` must not trip BT2
     poison: ``firecube.core.zarr.validation`` routes filesystem access through
     the typed ``StorageFilesystem`` adapter rather than calling ``fsspec.*``
@@ -516,262 +531,9 @@ def test_bt2_poison_read_flow(tmp_path: Path) -> None:
     source_root = tmp_path / "products"
     source_root.mkdir()
     product = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(product), mode="w")
+    _write_counts_zarr(product)
 
-    session = make_test_session(source_root, product=product.name, driver="fsspec")
-
-    with bt2_poison():
-        report = validate_group_with_fs(
-            session.fs(),
-            session.product.product_uri,
-            "counts",
-        )
-
-    assert report.product == "product.zarr"
-    assert report.group == "counts"
-    assert report.shape == [3]
-    assert report.extra_chunks == []
-
-
-# ---------------------------------------------------------------------------
-# Obstore-driver variants of the BT2 poison flows above. These ensure the
-# obstore I/O path is also free of disallowed ``fsspec.*`` calls when the
-# canonical control-plane / read / write seams are exercised. Each variant
-# is gated on ``obstore`` being importable so environments without the
-# optional dependency simply skip it.
-# ---------------------------------------------------------------------------
-
-
-def test_bt2_poison_ingest_write_flow_obstore(tmp_path: Path) -> None:
-    """Obstore variant of :func:`test_bt2_poison_ingest_write_flow`.
-
-    With ``storage_driver="obstore"`` the staged-write seam routes through
-    ``ObstoreFilesystem`` (no ``fsspec.*`` calls), so the BT2 poison must
-    not fire even though no fsspec call would be allowed from a runtime
-    caller.
-    """
-    from tests.integration._bt_helpers import bt2_poison
-
-    staged_source = tmp_path / "staged" / "product.zarr"
-    staged_source.mkdir(parents=True)
-    (staged_source / "zarr.json").write_text("{}", encoding="utf-8")
-    (staged_source / "data.bin").write_bytes(b"poison-payload")
-    nested = staged_source / "subgroup"
-    nested.mkdir()
-    (nested / "chunk.bin").write_bytes(b"nested-poison")
-
-    target_root = tmp_path / "out"
-    target = target_root / "product.zarr"
-
-    session = make_test_session(target_root, product=target.name, driver="obstore")
-    ctx = RuntimeIngestContext(
-        source="source",
-        target=str(target),
-        output_format="zarr",
-        storage=StorageContext(output=session),
-        options={"write_mode": "staged", "no_progress": True},
-        run_id="poison-ingest-run-obstore",
-        identity=RuntimeIdentity(run_id="poison-ingest-run-obstore"),
-    )
-    result = IngestResult(
-        outputs=OutputPaths(primary=str(staged_source)),
-        output_format="zarr",
-        metrics=ResultMetrics(pipeline=PipelineMetrics(duration_pipeline_s=0.1)),
-    )
-
-    with bt2_poison():
-        updated = PipelineExecutor().complete_output(result, ctx, host=cast(Any, _FakeHost()))
-
-    assert (target / "zarr.json").read_text(encoding="utf-8") == "{}"
-    assert (target / "data.bin").read_bytes() == b"poison-payload"
-    assert (target / "subgroup" / "chunk.bin").read_bytes() == b"nested-poison"
-
-    expected_bytes = len(b"{}") + len(b"poison-payload") + len(b"nested-poison")
-    assert updated.storage_result is not None
-    assert updated.storage_result.path == StorageUri.from_local_path(target).to_str()
-    assert updated.storage_result.files_written == 3
-    assert updated.storage_result.bytes_written == expected_bytes
-    assert updated.storage_result.storage_type == "local"
-    assert updated.manifest is not None
-    assert updated.manifest["stored_at"] == StorageUri.from_local_path(target).to_str()
-
-
-def _build_local_archive_session_obstore(
-    product_uri: str,
-    target_root: Path,
-) -> tuple[StorageConfig, StorageSession]:
-    """Same as :func:`_build_local_archive_session` but with the obstore driver."""
-    storage_config = StorageConfig(storage_type="local", storage_driver="obstore")
-    session = make_test_session(target_root, product=Path(product_uri).name, driver="obstore")
-    return storage_config, session
-
-
-def test_bt2_poison_archive_create_obstore(tmp_path: Path) -> None:
-    """Obstore variant of :func:`test_bt2_poison_archive_create`."""
-    from tests.integration._bt_helpers import bt2_poison
-
-    from firecube.core.tensogram.converter import zarr_to_tgm
-
-    # Build a real (small) zarr source product OUTSIDE the poison context.
-    # Use the default fsspec driver for the source build so we don't depend
-    # on the obstore zarr write path here — the test exercises archive
-    # creation under poison, which reads the existing store via obstore.
-    source_root = tmp_path / "products"
-    source_root.mkdir()
-    source = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(source), mode="w")
-
-    archive_path = tmp_path / "archive.tgm"
-    storage_config, session = _build_local_archive_session_obstore(str(source), source_root)
-
-    with bt2_poison():
-        result = zarr_to_tgm(
-            str(source),
-            str(archive_path),
-            storage_config=storage_config,
-            session=session,
-        )
-
-    assert archive_path.exists(), "archive .tgm not produced under bt2_poison (obstore)"
-    assert archive_path.stat().st_size > 0
-    assert result["target"] == str(archive_path)
-    assert "counts" in result["variables"]
-
-
-def test_bt2_poison_archive_restore_obstore(tmp_path: Path) -> None:
-    """Obstore variant of :func:`test_bt2_poison_archive_restore`."""
-    from tests.integration._bt_helpers import bt2_poison
-
-    from firecube.core.tensogram.converter import zarr_to_tgm
-    from firecube.core.tensogram.restore import tgm_to_zarr
-
-    # Stage 1: build source zarr and create archive WITHOUT poison so the
-    # restore-only behavior is exercised inside bt2_poison.
-    source_root = tmp_path / "products"
-    source_root.mkdir()
-    source = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(source), mode="w")
-
-    archive_path = tmp_path / "archive.tgm"
-    create_storage_config, create_session = _build_local_archive_session_obstore(
-        str(source), source_root
-    )
-    zarr_to_tgm(
-        str(source),
-        str(archive_path),
-        storage_config=create_storage_config,
-        session=create_session,
-    )
-    assert archive_path.exists()
-
-    # Stage 2: restore under poison into a fresh target root using obstore.
-    target_root = tmp_path / "restored"
-    target_root.mkdir()
-    target = target_root / "restored.zarr"
-    restore_storage_config, restore_session = _build_local_archive_session_obstore(
-        str(target), target_root
-    )
-
-    with bt2_poison():
-        restore_result = tgm_to_zarr(
-            str(archive_path),
-            str(target),
-            storage_config=restore_storage_config,
-            session=restore_session,
-        )
-
-    assert (target / "zarr.json").exists(), "restored zarr.json missing under bt2_poison (obstore)"
-    assert restore_result["target"] == str(target)
-
-
-def test_bt2_poison_delete_flow_obstore(tmp_path: Path) -> None:
-    """Obstore variant of :func:`test_bt2_poison_delete_flow`.
-
-    Even with ``storage_driver="obstore"`` configured on the
-    ``ChunkManager``, abandoning a non-terminal run must route through the
-    approved control-plane modules and not call ``fsspec.*`` from any
-    runtime caller — the obstore path is fully fsspec-free.
-    """
-    from tests.integration._bt_helpers import bt2_poison
-
-    product = "bt2_delete_product_obstore"
-    run_id = "run-to-abandon-obstore"
-    base_uri = str(tmp_path)
-
-    manager = ChunkManager(
-        binding=make_test_binding(Path(base_uri), driver="obstore"),
-        workspace=tmp_path,
-    )
-    try:
-        manager.record_run_started(
-            product=product,
-            run_id=run_id,
-            output_path=str(tmp_path / product),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-        )
-
-        non_terminal_before = manager.list_runs(product=product, non_terminal=True)
-        assert [run.run_id for run in non_terminal_before] == [run_id]
-        assert non_terminal_before[0].status == "started"
-
-        with bt2_poison():
-            result = manager.abandon_run(
-                product=product,
-                run_id=run_id,
-                reason="bt2-poison-test-obstore",
-            )
-
-        assert result == {
-            "product": product,
-            "run_id": run_id,
-            "status": "abandoned",
-            "abandoned": True,
-        }
-
-        runs_after = manager.list_runs(product=product)
-        statuses = {run.run_id: run.status for run in runs_after}
-        assert statuses == {run_id: "abandoned"}
-
-        assert manager.list_runs(product=product, non_terminal=True) == []
-    finally:
-        manager.close()
-
-
-def test_bt2_poison_read_flow_obstore(tmp_path: Path) -> None:
-    """Obstore variant of :func:`test_bt2_poison_read_flow`.
-
-    With ``storage_driver="obstore"`` the validation read path uses
-    ``ObstoreFilesystem`` — which never calls ``fsspec.*`` — so BT2 poison
-    must not fire.
-    """
-    from tests.integration._bt_helpers import bt2_poison
-
-    from firecube.core.zarr.validation import validate_group_with_fs
-
-    source_root = tmp_path / "products"
-    source_root.mkdir()
-    product = source_root / "product.zarr"
-    ds = xr.Dataset(
-        {"counts": (("t",), np.array([1.0, 2.0, 3.0], dtype="float32"))},
-        coords={"t": np.array([0, 1, 2], dtype="int64")},
-    )
-    ds.to_zarr(str(product), mode="w")
-
-    session = make_test_session(source_root, product=product.name, driver="obstore")
+    session = make_test_session(source_root, product=product.name, driver=driver)
 
     with bt2_poison():
         report = validate_group_with_fs(

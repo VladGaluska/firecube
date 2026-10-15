@@ -33,6 +33,7 @@ from firecube.ingestor.types.context import (
     RuntimeIngestContext,
 )
 from firecube.ingestor.types.result_metrics import PipelineMetrics, StorageMetrics
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.integration
@@ -195,36 +196,50 @@ def _replacement_events(temp_workspace: Path, *, product: str, run_id: str) -> l
     ]
 
 
-def test_force_reingest_with_empty_coverage_raises_and_does_not_commit_replacement(
-    temp_workspace,
-):
+# Rows: (old test name, record_spans). The guard must refuse empty coverage
+# whether spans are recorded at the run level or were recorded per batch;
+# loosening it to ``not coverage`` must not drop the ``record_spans=False`` row.
+_EMPTY_COVERAGE_ROWS = (
+    ("test_force_reingest_with_empty_coverage_raises_and_does_not_commit_replacement", True),
+    ("test_force_reingest_empty_coverage_still_raises_when_spans_not_recorded", False),
+)
+
+
+def test_force_reingest_with_empty_coverage_refuses_and_keeps_prior_span(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    """Empty new coverage refuses force_reingest and keeps the prior span active."""
     product = "test_product"
-    output_path = str(temp_workspace / product)
-    manager = ChunkManager(binding=make_test_binding(temp_workspace), workspace=temp_workspace)
-    recorder = SpanRecorder(manager)
+    for row_id, record_spans in _EMPTY_COVERAGE_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workspace, _mp):
+            output_path = str(workspace / product)
+            manager = ChunkManager(binding=make_test_binding(workspace), workspace=workspace)
+            recorder = SpanRecorder(manager)
+            prior_key = _record_completed_span_run(
+                manager,
+                product=product,
+                run_id="run-old",
+                group="F024",
+                time_min="2024-01-01T00:00:00Z",
+                time_max="2024-01-02T00:00:00Z",
+            )
+            _start_run(manager, product=product, run_id="run-new", output_path=output_path)
 
-    prior_key = _record_completed_span_run(
-        manager,
-        product=product,
-        run_id="run-old",
-        group="F024",
-        time_min="2024-01-01T00:00:00Z",
-        time_max="2024-01-02T00:00:00Z",
-    )
-    _start_run(manager, product=product, run_id="run-new", output_path=output_path)
+            with pytest.raises(ManifestError, match="new coverage is empty"):
+                recorder.register_run(
+                    ctx=_make_runtime_ctx(
+                        run_id="run-new", target=output_path, force_reingest=True
+                    ),
+                    result=_make_empty_coverage_result(output_path=output_path),
+                    run_id="run-new",
+                    product=product,
+                    slice_meta={"plugin": "test_product", "group": "F024"},
+                    record_spans=record_spans,
+                )
 
-    with pytest.raises(ManifestError, match="new coverage is empty"):
-        recorder.register_run(
-            ctx=_make_runtime_ctx(run_id="run-new", target=output_path, force_reingest=True),
-            result=_make_empty_coverage_result(output_path=output_path),
-            run_id="run-new",
-            product=product,
-            slice_meta={"plugin": "test_product", "group": "F024"},
-        )
-
-    current = _current_state(manager, product=product)
-    assert current[prior_key]["status"] == "active"
-    assert _replacement_events(temp_workspace, product=product, run_id="run-new") == []
+            current = _current_state(manager, product=product)
+            assert current[prior_key]["status"] == "active"
+            assert _replacement_events(workspace, product=product, run_id="run-new") == []
 
 
 def test_force_reingest_with_run_level_zarr_coverage_commits_replacement(temp_workspace):
@@ -272,42 +287,6 @@ def test_force_reingest_with_run_level_zarr_coverage_commits_replacement(temp_wo
     assert _replacement_events(temp_workspace, product=product, run_id="run-new") != []
     current = _current_state(manager, product=product)
     assert current[prior_key]["status"] != "active"
-
-
-def test_force_reingest_empty_coverage_still_raises_when_spans_not_recorded(temp_workspace):
-    """Guard preservation: with no new coverage at all, force_reingest must still
-    refuse to erase prior active coverage — even when ``record_spans=False``.
-
-    Loosening the guard to ``not coverage`` must not drop this protection.
-    """
-    product = "test_product"
-    output_path = str(temp_workspace / product)
-    manager = ChunkManager(binding=make_test_binding(temp_workspace), workspace=temp_workspace)
-    recorder = SpanRecorder(manager)
-
-    prior_key = _record_completed_span_run(
-        manager,
-        product=product,
-        run_id="run-old",
-        group="F024",
-        time_min="2024-01-01T00:00:00Z",
-        time_max="2024-01-02T00:00:00Z",
-    )
-    _start_run(manager, product=product, run_id="run-new", output_path=output_path)
-
-    with pytest.raises(ManifestError, match="new coverage is empty"):
-        recorder.register_run(
-            ctx=_make_runtime_ctx(run_id="run-new", target=output_path, force_reingest=True),
-            result=_make_empty_coverage_result(output_path=output_path),
-            run_id="run-new",
-            product=product,
-            slice_meta={"plugin": "test_product", "group": "F024"},
-            record_spans=False,
-        )
-
-    current = _current_state(manager, product=product)
-    assert current[prior_key]["status"] == "active"
-    assert _replacement_events(temp_workspace, product=product, run_id="run-new") == []
 
 
 def test_force_reingest_first_time_no_prior_spans_does_not_raise(temp_workspace):

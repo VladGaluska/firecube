@@ -45,6 +45,7 @@ in one session.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -201,19 +202,24 @@ def _install_error_logger_capture() -> tuple[
     return firecube_cli_logger, log_records, memory_handler
 
 
-def _coord_materialization_claims_on_disk(target: Path, product: str) -> list[Path]:
-    """Return the raw claim file paths for the coord_materialization domain.
+def _coord_materialization_claims_on_disk(target: Path) -> list[str]:
+    """Return the domains of claim files left under ``<target>/.firecube/claims``.
 
-    Uses direct disk inspection (not ``ChunkManager.list_claims``) so the
-    claim-file assertion is orthogonal to the control-plane API surface. The
-    preallocate command writes claims under
-    ``<target-parent>/<product>/.firecube/claims/`` — a stale file there is
-    exactly what a leaked claim leaves behind.
+    Reads the claim JSON payloads directly (not ``ChunkManager.list_claims``)
+    and keeps those whose ``domain`` field names the ``coord_materialization``
+    category (``<product>:coord_materialization:<name>``). Filenames are
+    hashed, so the payload is the only reliable identifier. The directory must
+    exist: preallocate creates it when it acquires its claims, so a missing
+    directory means this helper is looking in the wrong place.
     """
-    claims_dir = target.parent / product / ".firecube" / "claims"
-    if not claims_dir.exists():
-        return []
-    return [p for p in claims_dir.iterdir() if "coord_materialization" in p.name]
+    claims_dir = target / ".firecube" / "claims"
+    assert claims_dir.is_dir(), f"claims directory not found at {claims_dir}"
+    domains: list[str] = []
+    for claim_file in claims_dir.iterdir():
+        domain = json.loads(claim_file.read_text(encoding="utf-8")).get("domain", "")
+        if ":coord_materialization:" in domain:
+            domains.append(domain)
+    return domains
 
 
 def test_preallocate_terminal_failure_releases_claim(
@@ -278,11 +284,11 @@ def test_preallocate_terminal_failure_releases_claim(
         "existing logger.error line for terminal-record failure must fire; "
         f"captured error messages: {error_messages!r}"
     )
-    leaked_claims = _coord_materialization_claims_on_disk(target, _STUB_PLUGIN_NAME)
+    leaked_claims = _coord_materialization_claims_on_disk(target)
     assert leaked_claims == [], (
         "Claim-leak regression: coord_materialization claim file must be released "
         "before the terminal-record exception propagates; found stale "
-        f"claim file(s): {[str(p) for p in leaked_claims]!r}\n"
+        f"claim domain(s): {leaked_claims!r}\n"
         f"output={result.output!r}"
     )
 

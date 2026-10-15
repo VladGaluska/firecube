@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.rows import table_row
+
 pytestmark = pytest.mark.integration
 
 
@@ -82,16 +84,6 @@ def _assert_no_firecube(target: Path) -> None:
     )
 
 
-def test_zero_input_no_explicit_patterns_raises(tmp_path: Path) -> None:
-    source = _junk_source(tmp_path / "input")
-    target = tmp_path / "target.zarr"
-
-    result = _run(_precip_cmd(source, target))
-
-    assert result.returncode != 0, result.stdout + result.stderr
-    _assert_no_firecube(target)
-
-
 def test_zero_input_with_explicit_patterns_raises_before_firecube(tmp_path: Path) -> None:
     source = _junk_source(tmp_path / "input")
     target = tmp_path / "target.zarr"
@@ -110,6 +102,7 @@ def test_zero_input_message_names_input_filters_and_suffixes(tmp_path: Path) -> 
     combined = result.stdout + result.stderr
 
     assert result.returncode != 0, combined
+    _assert_no_firecube(target)
     assert "--input-filters" in combined
     for suffix in (".zip", ".h5", ".nc", ".nc4", ".hdf", ".he5"):
         assert suffix in combined
@@ -153,37 +146,24 @@ def _dynamic_cmd(plugin: str, source: Path, target: Path) -> list[str]:
     ]
 
 
-def test_plugin_override_exempted(tmp_path: Path) -> None:
-    source = _junk_source(tmp_path / "input")
-    target = tmp_path / "target.zarr"
-    counter = tmp_path / "counter.txt"
-    env = _base_env() | {"W14_DISCOVERY_COUNTER": str(counter)}
-
-    result = _run(_dynamic_cmd("w14_override_empty", source, target), env=env)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert counter.read_text(encoding="utf-8") == "1"
+# Plugins that override discovery (rows: old test name, plugin): each run must
+# succeed and call discover_source_files exactly once.
+_DISCOVERY_ROWS = [
+    ("test_plugin_override_exempted", "w14_override_empty"),
+    ("test_discover_source_files_called_exactly_once_per_ingest", "w14_counter_success"),
+    ("test_lazy_discovery_iterator_not_re_listed", "w14_lazy_success"),
+]
 
 
-def test_discover_source_files_called_exactly_once_per_ingest(tmp_path: Path) -> None:
-    source = _junk_source(tmp_path / "input")
-    target = tmp_path / "target.zarr"
-    counter = tmp_path / "counter.txt"
-    env = _base_env() | {"W14_DISCOVERY_COUNTER": str(counter)}
+def test_plugin_discovery_runs_once(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    for row_id, plugin in _DISCOVERY_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            source = _junk_source(workdir / "input")
+            target = workdir / "target.zarr"
+            counter = workdir / "counter.txt"
+            env = _base_env() | {"W14_DISCOVERY_COUNTER": str(counter)}
 
-    result = _run(_dynamic_cmd("w14_counter_success", source, target), env=env)
+            result = _run(_dynamic_cmd(plugin, source, target), env=env)
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert counter.read_text(encoding="utf-8") == "1"
-
-
-def test_lazy_discovery_iterator_not_re_listed(tmp_path: Path) -> None:
-    source = _junk_source(tmp_path / "input")
-    target = tmp_path / "target.zarr"
-    counter = tmp_path / "counter.txt"
-    env = _base_env() | {"W14_DISCOVERY_COUNTER": str(counter)}
-
-    result = _run(_dynamic_cmd("w14_lazy_success", source, target), env=env)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert counter.read_text(encoding="utf-8") == "1"
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert counter.read_text(encoding="utf-8") == "1"

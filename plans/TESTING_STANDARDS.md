@@ -60,6 +60,9 @@ Reject these patterns in review:
   private paths unless the test protects an active architecture invariant.
 - **Dead fixture tests**: tests tied to removed plugins, product names, or sample
   paths that no longer represent a current contract.
+- **Bare assertion loops**: a `for` loop of asserts inside one test without
+  `subtests` (or equivalent per-row reporting) stops at the first failure and
+  hides which row failed.
 - **Permanent xfail drift**: adding `xfail` for a known bug without an accepted
   TODO item, owner, and removal condition.
 
@@ -154,17 +157,7 @@ Implemented target lanes for the testing overhaul:
 | Extended storage | Storage-driver and S3 parity | s3, obstore/fsspec remote integration, larger upload paths |
 | Release | Full pre-tag evidence | strict deps, warnings as errors, coverage, docs build, package checks |
 
-Primary agentic workload command:
-
-```bash
-uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot" -q --tb=short
-```
-
-Docs/static drift command:
-
-```bash
-uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short
-```
+The command for each lane lives in `plans/TEST.md` ("Lanes") and nowhere else.
 
 Do not add a new lane marker unless the marker is registered, documented, and
 assigned a clear command in `plans/TEST.md`.
@@ -193,8 +186,8 @@ Definition of done: every high-volume test file has an owner category and a lane
 
 ### Phase 2 - Fix Policy Drift
 
-- Add every test-extra Python package to the strict dependency guard. Current
-  strict guard includes `tensogram`, `obstore`, `moto`, and `healpix-geo`.
+- Add every test-extra Python package to the strict dependency guard. The
+  canonical strict-guard list is in `plans/TEST.md` ("Lanes").
 - Replace `pytest.importorskip` for test-extra packages with normal imports or a
   strict-deps failure.
 - Remove or convert skips that only prune poor parametrization.
@@ -251,6 +244,18 @@ Before an agent adds or edits tests, it must:
 
 Agents must not add broad snapshot, static grep, or xfail tests to make progress
 look measurable. Test count is not a quality metric.
+
+### Table-driven merges (added 2026-10-14, test diet)
+
+Fold tests into one `subtests` table only when they share one body and differ
+only in data, and only when the table plus body is smaller than the tests it
+replaces. Row id is the exact old test function name, and each row builds fresh
+state (no fixture, tmp path, or mutable object shared between rows). Delete a
+mirror or duplicate only when a surviving test guards the same failure mode,
+proved with a mutant. Tests with distinct bodies stay separate tests, and
+parametrizations that are already compact stay as they are. Case count is an
+outcome, not a target. Record each merge in the node's survivor mapping (old
+name to row id).
 
 ## Review Checklist
 

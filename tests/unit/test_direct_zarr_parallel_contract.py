@@ -14,12 +14,14 @@
 
 from __future__ import annotations
 
-from typing import cast
+from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from firecube.ingestor.api import DirectZarrIngestor, IngestResult, PipelineBatch, PluginContext
+from tests.helpers.rows import table_row
 
 
 class _DirectZarrStub(DirectZarrIngestor):
@@ -36,21 +38,22 @@ class _DirectZarrStub(DirectZarrIngestor):
         return cast(IngestResult, MagicMock())
 
 
-def test_default_supports_flag_is_false() -> None:
-    assert _DirectZarrStub().index_spec(cast(PluginContext, MagicMock(spec=PluginContext))) is None
+def test_direct_zarr_parallel_contract(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "default_supports_flag_is_false", tmp_path):
+        assert (
+            _DirectZarrStub().index_spec(cast(PluginContext, MagicMock(spec=PluginContext))) is None
+        )
 
+    with table_row(subtests, "default_inspect_item_raises_not_implemented", tmp_path):
+        ingestor = _DirectZarrStub()
+        ctx = cast(PluginContext, MagicMock(spec=PluginContext))
+        with pytest.raises(NotImplementedError, match=r"inspect_item"):
+            ingestor.inspect_item(object(), ctx)
 
-def test_default_inspect_item_raises_not_implemented() -> None:
-    ingestor = _DirectZarrStub()
-    ctx = cast(PluginContext, MagicMock(spec=PluginContext))
-    with pytest.raises(NotImplementedError, match=r"inspect_item"):
-        ingestor.inspect_item(object(), ctx)
-
-
-def test_simple_subclass_works_without_implementing_new_methods() -> None:
-    ingestor = _DirectZarrStub()
-    ctx = cast(PluginContext, MagicMock(spec=PluginContext))
-    batch = cast(PipelineBatch, MagicMock(spec=PipelineBatch))
-    assert ingestor.name == "direct_stub"
-    assert ingestor.zarr_schema(ctx) == []
-    assert ingestor.build_write_intents(batch, ctx) == []
+    with table_row(subtests, "simple_subclass_works_without_implementing_new_methods", tmp_path):
+        ingestor = _DirectZarrStub()
+        ctx = cast(PluginContext, MagicMock(spec=PluginContext))
+        batch = cast(PipelineBatch, MagicMock(spec=PipelineBatch))
+        assert ingestor.name == "direct_stub"
+        assert ingestor.zarr_schema(ctx) == []
+        assert ingestor.build_write_intents(batch, ctx) == []

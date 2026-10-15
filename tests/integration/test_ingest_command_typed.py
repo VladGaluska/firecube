@@ -71,14 +71,19 @@ def test_all_required_ingest_flags_reach_ingestor(tmp_path: Path) -> None:
             output_format=str(ctx.output_format),
         )
 
+    args = _required_args(tmp_path)
+    # --output-format is omitted: the typed config default ('zarr') must still
+    # reach the context (the CLI must not drop it by reading the raw Click param).
+    assert "--output-format" not in args
     with patch("cli_test_plugin.CliTestIngestor.run", autospec=True, side_effect=fake_run):
-        result = CliRunner().invoke(cli, _required_args(tmp_path))
+        result = CliRunner().invoke(cli, [*args, "--option", "test_int=42"])
 
     assert result.exit_code == 0, result.output
     assert "ctx" in captured
     ctx = captured["ctx"]
     assert ctx.target == (tmp_path / "qa.zarr").as_uri()
     assert ctx.output_format == "zarr"
+    assert ctx.options["test_int"] == 42
     assert ctx.options["write_mode"] == "direct"
     assert ctx.storage is not None
     assert ctx.storage.output is not None
@@ -120,53 +125,6 @@ def test_unknown_option_key_reports_plugin_and_valid_keys(tmp_path: Path) -> Non
     assert "test_int" in result.output
     assert "test_str" in result.output
     assert "test_bool" in result.output
-
-
-def test_valid_option_value_is_coerced_before_ingest(tmp_path: Path) -> None:
-    captured: dict[str, IngestContext] = {}
-
-    def fake_run(self: Any, ctx: IngestContext) -> IngestResult:
-        captured["ctx"] = ctx
-        return IngestResult(
-            outputs=OutputPaths(primary=str(ctx.target)),
-            output_format=str(ctx.output_format),
-        )
-
-    with patch("cli_test_plugin.CliTestIngestor.run", autospec=True, side_effect=fake_run):
-        result = CliRunner().invoke(
-            cli,
-            [*_required_args(tmp_path), "--option", "test_int=42"],
-        )
-
-    assert result.exit_code == 0, result.output
-    assert captured["ctx"].options["test_int"] == 42
-
-
-def test_output_format_defaults_to_zarr_when_flag_omitted(tmp_path: Path) -> None:
-    """IngestCommandConfig.output_format default ('zarr') must flow into IngestContext when --output-format is omitted (regression guard: the CLI must not drop the typed default by using the raw Click param)."""
-    captured: dict[str, IngestContext] = {}
-
-    def fake_run(self: Any, ctx: IngestContext) -> IngestResult:
-        captured["ctx"] = ctx
-        return IngestResult(
-            outputs=OutputPaths(primary=str(ctx.target)),
-            output_format=str(ctx.output_format),
-        )
-
-    args = _required_args(tmp_path)
-    assert "--output-format" not in args, (
-        "test precondition: --output-format must be omitted to exercise the default"
-    )
-
-    with patch("cli_test_plugin.CliTestIngestor.run", autospec=True, side_effect=fake_run):
-        result = CliRunner().invoke(cli, args)
-
-    assert result.exit_code == 0, result.output
-    assert "ctx" in captured
-    assert captured["ctx"].output_format == "zarr", (
-        f"expected typed-config default 'zarr' to flow into IngestContext, "
-        f"got {captured['ctx'].output_format!r}"
-    )
 
 
 @pytest.mark.parametrize(

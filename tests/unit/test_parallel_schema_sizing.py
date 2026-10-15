@@ -163,24 +163,21 @@ def test_parallel_schema_uses_global_expected_not_batch_local(
     assert captured["slot_range"] == (0, 10)
 
 
-def test_empty_global_dict_fails(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="empty"):
+@pytest.mark.parametrize(
+    ("global_expected", "match"),
+    [
+        pytest.param({}, "empty", id="empty_global_dict_fails"),
+        pytest.param({"data": 0}, "non-positive", id="non_positive_global_count_fails"),
+    ],
+)
+def test_invalid_global_expected_fails(
+    tmp_path: Path, global_expected: dict[str, int], match: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=match):
         _setup_global_zarr_schema(
             strategy=SimpleNamespace(_store_uri=str(tmp_path / "out.zarr"), _storage_config=None),
             schema=_schema(),
-            global_expected={},
-            product="product",
-            run_id="run-1",
-            chunk_manager=_ChunkManager(),
-        )
-
-
-def test_non_positive_global_count_fails(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="non-positive"):
-        _setup_global_zarr_schema(
-            strategy=SimpleNamespace(_store_uri=str(tmp_path / "out.zarr"), _storage_config=None),
-            schema=_schema(),
-            global_expected={"data": 0},
+            global_expected=global_expected,
             product="product",
             run_id="run-1",
             chunk_manager=_ChunkManager(),

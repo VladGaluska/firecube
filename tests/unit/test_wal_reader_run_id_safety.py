@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from firecube.core.controlplane import ChunkManager
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.unit
@@ -60,18 +61,23 @@ def _write_orphan_segment(tmp_path: Path, *, product: str, run_id: str) -> None:
     (run_dir / "events-000.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
 
 
-def test_read_run_with_simple_id(tmp_path: Path) -> None:
+_GROUPLESS_ROWS = (
+    ("test_read_run_with_simple_id", "abc__slot=0-100"),
+    ("test_legacy_phase3_run_id_still_reads", "base__slot=0-100"),
+)
+
+
+def test_read_run_without_group_segment(tmp_path: Path, subtests: pytest.Subtests) -> None:
     product = "product.zarr"
-    run_id = "abc__slot=0-100"
-    manager = _make_manager(tmp_path, product=product)
-    try:
-        _write_run_meta(tmp_path, product=product, run_id=run_id)
-
-        runs = manager.list_runs(product=product)
-
-        assert [run.run_id for run in runs] == [run_id]
-    finally:
-        manager.close()
+    for row_id, run_id in _GROUPLESS_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            manager = _make_manager(workdir, product=product)
+            try:
+                _write_run_meta(workdir, product=product, run_id=run_id)
+                runs = manager.list_runs(product=product)
+                assert [run.run_id for run in runs] == [run_id]
+            finally:
+                manager.close()
 
 
 def test_read_run_with_encoded_group_id(tmp_path: Path) -> None:
@@ -85,20 +91,6 @@ def test_read_run_with_encoded_group_id(tmp_path: Path) -> None:
 
         assert [run.run_id for run in runs] == [run_id]
         assert runs[0].status == "orphaned"
-    finally:
-        manager.close()
-
-
-def test_legacy_phase3_run_id_still_reads(tmp_path: Path) -> None:
-    product = "product.zarr"
-    run_id = "base__slot=0-100"
-    manager = _make_manager(tmp_path, product=product)
-    try:
-        _write_run_meta(tmp_path, product=product, run_id=run_id)
-
-        runs = manager.list_runs(product=product)
-
-        assert [run.run_id for run in runs] == [run_id]
     finally:
         manager.close()
 

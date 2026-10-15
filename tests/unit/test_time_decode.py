@@ -51,32 +51,34 @@ def test_datetime64_subsecond_not_truncated() -> None:
     assert out[0] == np.datetime64("2023-12-01T00:00:00.100", "ns")
 
 
-def test_float64_seconds_since_epoch() -> None:
-    values = np.array([1701388800.0])
-
-    out = decode_time_array(values, {"units": "seconds since 1970-01-01"})
-
-    assert str(out[0])[:10] == "2023-12-01"
-
-
-def test_float64_days_since_2000() -> None:
-    values = np.array([0.0, 1.0, 9.0])
-
-    out = decode_time_array(
-        values,
+_DECODE_DATE_ROWS = (
+    # (row id, values, attrs, expected ISO dates of the decoded elements)
+    (
+        "float64_seconds_since_epoch",
+        np.array([1701388800.0]),
+        {"units": "seconds since 1970-01-01"},
+        ["2023-12-01"],
+    ),
+    (
+        "float64_days_since_2000",
+        np.array([0.0, 1.0, 9.0]),
         {"units": "days since 2000-01-01", "calendar": "standard"},
-    )
+        ["2000-01-01", "2000-01-02", "2000-01-10"],
+    ),
+    (
+        "int64_seconds_since_epoch",
+        np.array([1701388800], dtype="int64"),
+        {"units": "seconds since 1970-01-01"},
+        ["2023-12-01"],
+    ),
+)
 
-    assert str(out[0])[:10] == "2000-01-01"
-    assert str(out[2])[:10] == "2000-01-10"
 
-
-def test_int64_seconds_since_epoch() -> None:
-    values = np.array([1701388800], dtype="int64")
-
-    out = decode_time_array(values, {"units": "seconds since 1970-01-01"})
-
-    assert str(out[0])[:10] == "2023-12-01"
+def test_decode_time_array_dates(subtests) -> None:
+    for row_id, values, attrs, expected in _DECODE_DATE_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            out = decode_time_array(values, attrs)
+            assert [str(x)[:10] for x in out] == expected
 
 
 def test_calendar_proleptic_gregorian() -> None:
@@ -93,25 +95,17 @@ def test_calendar_proleptic_gregorian() -> None:
     assert out[0] == np.datetime64("2000-01-01")
 
 
-def test_no_units_raises_valueerror() -> None:
-    values = np.array([1.0, 2.0])
-
-    with pytest.raises(ValueError, match="units"):
-        decode_time_array(values, {})
-
-
-def test_units_without_since_raises() -> None:
-    values = np.array([1.0, 2.0])
-
-    with pytest.raises(ValueError, match="since"):
-        decode_time_array(values, {"units": "kelvin"})
+_DECODE_ERROR_ROWS = (
+    ("no_units_raises_valueerror", np.array([1.0, 2.0]), {}, "units"),
+    ("units_without_since_raises", np.array([1.0, 2.0]), {"units": "kelvin"}, "since"),
+    ("unsupported_dtype_raises", np.array([1.0 + 2.0j], dtype=np.complex64), {}, r"complex64"),
+)
 
 
-def test_unsupported_dtype_raises() -> None:
-    values = np.array([1.0 + 2.0j], dtype=np.complex64)
-
-    with pytest.raises(ValueError, match=r"complex64"):
-        decode_time_array(values, {})
+def test_decode_time_array_errors(subtests) -> None:
+    for row_id, values, attrs, match in _DECODE_ERROR_ROWS:
+        with subtests.test(msg=f"test_{row_id}"), pytest.raises(ValueError, match=match):
+            decode_time_array(values, attrs)
 
 
 class TestDecodeOrPassthrough:

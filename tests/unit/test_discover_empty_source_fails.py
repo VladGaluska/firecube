@@ -30,6 +30,7 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -52,95 +53,6 @@ def _make_plugin_ctx(source: str) -> PluginContext:
     return PluginContext(runtime_ctx)
 
 
-@pytest.mark.unit
-def test_empty_discovery_with_explicit_pattern_raises(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ingestor.engine_config = EngineConfig(allow_empty_source=False, input_filters=["*.nc"])
-    ctx = _make_plugin_ctx(str(source))
-
-    with (
-        patch(_DISCOVERY_TARGET, return_value=[]),
-        pytest.raises(ConfigurationError, match="input-filters"),
-    ):
-        list(ingestor.discover_source_files(ctx))
-
-
-@pytest.mark.unit
-def test_empty_discovery_without_explicit_pattern_raises(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ingestor.engine_config = EngineConfig(allow_empty_source=False)
-    ctx = _make_plugin_ctx(str(source))
-
-    with (
-        patch(_DISCOVERY_TARGET, return_value=[]),
-        pytest.raises(ConfigurationError, match=r"\.zip, \.h5, \.nc, \.nc4, \.hdf, \.he5"),
-    ):
-        list(ingestor.discover_source_files(ctx))
-
-
-@pytest.mark.unit
-def test_allow_empty_source_bypasses_check_even_with_pattern(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ingestor.engine_config = EngineConfig(allow_empty_source=True, input_filters=["*.nc"])
-    ctx = _make_plugin_ctx(str(source))
-
-    with patch(_DISCOVERY_TARGET, return_value=[]):
-        result = list(ingestor.discover_source_files(ctx))
-
-    assert result == []
-
-
-@pytest.mark.unit
-def test_slot_range_context_bypasses_empty_source_check(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ingestor.engine_config = EngineConfig(
-        allow_empty_source=False, slot_start=0, slot_end=10, input_filters=["*.nc"]
-    )
-    ctx = _make_plugin_ctx(str(source))
-
-    with patch(_DISCOVERY_TARGET, return_value=[]):
-        result = list(ingestor.discover_source_files(ctx))
-
-    assert result == []
-
-
-@pytest.mark.unit
-def test_non_empty_discovery_does_not_raise(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ingestor.engine_config = EngineConfig(allow_empty_source=False, input_filters=["*.nc"])
-    ctx = _make_plugin_ctx(str(source))
-
-    files = [str(source / "a.nc"), str(source / "b.nc")]
-    with patch(_DISCOVERY_TARGET, return_value=files):
-        result = list(ingestor.discover_source_files(ctx))
-
-    assert result == files
-
-
-@pytest.mark.unit
-def test_no_engine_config_raises_on_empty(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _MinimalIngestor()
-    ctx = _make_plugin_ctx(str(source))
-
-    with (
-        patch(_DISCOVERY_TARGET, return_value=[]),
-        pytest.raises(ConfigurationError, match="allow_empty_source=true"),
-    ):
-        list(ingestor.discover_source_files(ctx))
-
-
 class _OverridesAndCallsSuper(BaseIngestor):
     PRODUCT_NAME = "test_override_calls_super"
     name = "test_override_calls_super"
@@ -155,30 +67,85 @@ class _OverridesAndCallsSuper(BaseIngestor):
         return {}
 
 
-@pytest.mark.unit
-def test_override_without_opt_in_still_raises(tmp_path: Path) -> None:
-    source = tmp_path / "source"
+def _discover(
+    ingestor_cls: type[BaseIngestor], config: EngineConfig | None, source: Path, found: list[str]
+) -> list[Any]:
+    """Discover from an existing *source* while the filesystem walk returns *found*."""
     source.mkdir()
-    ingestor = _OverridesAndCallsSuper()
-    ingestor.engine_config = EngineConfig(allow_empty_source=False)
-    ctx = _make_plugin_ctx(str(source))
+    ingestor = ingestor_cls()
+    if config is not None:  # None: the attribute stays unset, as on a bare ingestor
+        ingestor.engine_config = config
+    with patch(_DISCOVERY_TARGET, return_value=found):
+        return list(ingestor.discover_source_files(_make_plugin_ctx(str(source))))
 
-    with (
-        patch(_DISCOVERY_TARGET, return_value=[]),
-        pytest.raises(ConfigurationError, match="allow_empty_source=true"),
-    ):
-        ingestor.discover_source_files(ctx)
+
+# (row id, ingestor class, engine config, ConfigurationError message pattern)
+_EMPTY_REFUSED: tuple[tuple[str, type[BaseIngestor], EngineConfig | None, str], ...] = (
+    (
+        "test_empty_discovery_with_explicit_pattern_raises",
+        _MinimalIngestor,
+        EngineConfig(allow_empty_source=False, input_filters=["*.nc"]),
+        "input-filters",
+    ),
+    (
+        "test_empty_discovery_without_explicit_pattern_raises",
+        _MinimalIngestor,
+        EngineConfig(allow_empty_source=False),
+        r"\.zip, \.h5, \.nc, \.nc4, \.hdf, \.he5",
+    ),
+    ("test_no_engine_config_raises_on_empty", _MinimalIngestor, None, "allow_empty_source=true"),
+    (
+        "test_override_without_opt_in_still_raises",
+        _OverridesAndCallsSuper,
+        EngineConfig(allow_empty_source=False),
+        "allow_empty_source=true",
+    ),
+)
 
 
 @pytest.mark.unit
-def test_override_with_opt_in_downgrades_to_warning(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    ingestor = _OverridesAndCallsSuper()
-    ingestor.engine_config = EngineConfig(allow_empty_source=True)
-    ctx = _make_plugin_ctx(str(source))
+def test_empty_discovery_is_refused(subtests: Any, tmp_path: Path) -> None:
+    for row_id, ingestor_cls, config, message in _EMPTY_REFUSED:
+        with (
+            table_row(subtests, row_id, tmp_path) as (workdir, _),
+            pytest.raises(ConfigurationError, match=message),
+        ):
+            _discover(ingestor_cls, config, workdir / "source", [])
 
-    with patch(_DISCOVERY_TARGET, return_value=[]):
-        result = ingestor.discover_source_files(ctx)
 
-    assert result == []
+# (row id, ingestor class, engine config, files the walk finds)
+_DISCOVERY_PASSES: tuple[tuple[str, type[BaseIngestor], EngineConfig, list[str]], ...] = (
+    (
+        "test_allow_empty_source_bypasses_check_even_with_pattern",
+        _MinimalIngestor,
+        EngineConfig(allow_empty_source=True, input_filters=["*.nc"]),
+        [],
+    ),
+    (
+        "test_slot_range_context_bypasses_empty_source_check",
+        _MinimalIngestor,
+        EngineConfig(allow_empty_source=False, slot_start=0, slot_end=10, input_filters=["*.nc"]),
+        [],
+    ),
+    (
+        "test_non_empty_discovery_does_not_raise",
+        _MinimalIngestor,
+        EngineConfig(allow_empty_source=False, input_filters=["*.nc"]),
+        ["a.nc", "b.nc"],
+    ),
+    (
+        "test_override_with_opt_in_downgrades_to_warning",
+        _OverridesAndCallsSuper,
+        EngineConfig(allow_empty_source=True),
+        [],
+    ),
+)
+
+
+@pytest.mark.unit
+def test_discovery_returns_what_was_found(subtests: Any, tmp_path: Path) -> None:
+    for row_id, ingestor_cls, config, names in _DISCOVERY_PASSES:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            files = [str(workdir / "source" / name) for name in names]
+
+            assert _discover(ingestor_cls, config, workdir / "source", files) == files

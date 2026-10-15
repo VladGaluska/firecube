@@ -168,31 +168,6 @@ def test_eager_ndarray_dispatched_byte_identical() -> None:
     np.testing.assert_array_equal(captured["data"], payload)
 
 
-def test_callable_resolved_exactly_once_per_dispatch() -> None:
-    """A callable payload is invoked once, and only once, per dispatch call.
-
-    Two calls would double-resolve every plugin's lazy payload — a silent
-    correctness/cost regression the ``call_count`` counter exists to catch.
-    """
-
-    call_count = [0]
-
-    def payload() -> np.ndarray:
-        call_count[0] += 1
-        return np.ones((4, 4), dtype=np.float32)
-
-    intent = _region_intent(payload)
-    writer = _RecordingWriter()
-
-    _dispatch(writer, intent)
-
-    assert call_count[0] == 1, (
-        f"callable must fire exactly once at dispatch; observed {call_count[0]}"
-    )
-    assert len(writer.calls) == 1
-    np.testing.assert_array_equal(writer.calls[0][1]["data"], np.ones((4, 4), dtype=np.float32))
-
-
 def test_callable_not_invoked_at_construction_time() -> None:
     """WriteIntent construction must not invoke the callable.
 
@@ -214,6 +189,8 @@ def test_callable_not_invoked_at_construction_time() -> None:
     writer = _RecordingWriter()
     _dispatch(writer, intent)
     assert call_count[0] == 1, "callable must fire exactly once at dispatch"
+    assert len(writer.calls) == 1
+    np.testing.assert_array_equal(writer.calls[0][1]["data"], np.ones((4, 4), dtype=np.float32))
 
 
 def test_callables_are_resolved_in_dispatch_order() -> None:

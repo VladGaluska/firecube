@@ -52,42 +52,40 @@ def test_regular_axis_hash_is_deterministic() -> None:
     assert len(a) == 64
 
 
-def test_regular_axis_hash_differs_when_slot_count_differs() -> None:
-    axis = _make_regular()
-    assert _compute_group_identity_hash(axis, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(axis, 101, "datetime64[ns]")
-    )
+NS = "datetime64[ns]"
+HASH_DIFFERENCES = (
+    (
+        "test_regular_axis_hash_differs_when_slot_count_differs",
+        (_make_regular(), 100, NS),
+        (_make_regular(), 101, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_cadence_differs",
+        (_make_regular(cadence_s=600), 100, NS),
+        (_make_regular(cadence_s=900), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_epoch_differs",
+        (_make_regular(epoch="2024-01-01T00:00:00Z"), 100, NS),
+        (_make_regular(epoch="2025-01-01T00:00:00Z"), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_mode_differs",
+        (_make_regular(mode="exact"), 100, NS),
+        (_make_regular(mode="floor"), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_dtype_differs",
+        (_make_regular(), 100, NS),
+        (_make_regular(), 100, "datetime64[s]"),
+    ),
+)
 
 
-def test_regular_axis_hash_differs_when_cadence_differs() -> None:
-    small = _make_regular(cadence_s=600)
-    large = _make_regular(cadence_s=900)
-    assert _compute_group_identity_hash(small, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(large, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_epoch_differs() -> None:
-    a = _make_regular(epoch="2024-01-01T00:00:00Z")
-    b = _make_regular(epoch="2025-01-01T00:00:00Z")
-    assert _compute_group_identity_hash(a, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(b, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_mode_differs() -> None:
-    exact = _make_regular(mode="exact")
-    floor = _make_regular(mode="floor")
-    assert _compute_group_identity_hash(exact, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(floor, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_dtype_differs() -> None:
-    axis = _make_regular()
-    assert _compute_group_identity_hash(axis, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(axis, 100, "datetime64[s]")
-    )
+def test_regular_axis_hash_differs_per_identity_input(subtests) -> None:
+    for row_id, left, right in HASH_DIFFERENCES:
+        with subtests.test(msg=row_id):
+            assert _compute_group_identity_hash(*left) != _compute_group_identity_hash(*right)
 
 
 def test_regular_axis_hash_accepts_numpy_dtype_and_string_equivalently() -> None:

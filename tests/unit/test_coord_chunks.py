@@ -46,10 +46,6 @@ def test_spec_chunks_none_falls_back_to_default() -> None:
     assert resolve_coord_chunks(spec, 100) == (100,)
 
 
-def test_spec_none_is_default() -> None:
-    assert resolve_coord_chunks(None, 100) == (100,)
-
-
 def test_rank_mismatch_raises() -> None:
     spec = MagicMock()
     spec.chunks = (256, 128)

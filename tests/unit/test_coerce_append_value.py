@@ -16,39 +16,41 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from firecube.ingestor.runtime.zarr.append import _coerce_append_value
+from tests.helpers.rows import table_row
 
 
-def test_datetime64_passthrough() -> None:
-    """datetime64 value converts correctly without attrs."""
-    val = np.datetime64("2023-12-01", "s")
-    result = _coerce_append_value(val)
-    assert isinstance(result, pd.Timestamp)
-    assert str(result).startswith("2023-12-01")
+def test_coerce_append_value_rows(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "datetime64_passthrough", tmp_path):
+        # datetime64 value converts correctly without attrs.
+        val = np.datetime64("2023-12-01", "s")
+        result = _coerce_append_value(val)
+        assert isinstance(result, pd.Timestamp)
+        assert str(result).startswith("2023-12-01")
 
+    with table_row(subtests, "iso_string_passthrough", tmp_path):
+        # ISO string converts correctly without attrs.
+        result = _coerce_append_value("2023-12-01T00:00:00")
+        assert isinstance(result, pd.Timestamp)
+        assert str(result).startswith("2023-12-01")
 
-def test_iso_string_passthrough() -> None:
-    """ISO string converts correctly without attrs."""
-    result = _coerce_append_value("2023-12-01T00:00:00")
-    assert isinstance(result, pd.Timestamp)
-    assert str(result).startswith("2023-12-01")
+    with table_row(subtests, "numeric_without_cf_units_returns_raw", tmp_path):
+        result = _coerce_append_value(1.0)
+        assert result == 1.0
 
+        result_int = _coerce_append_value(42)
+        assert result_int == 42
 
-def test_numeric_without_cf_units_returns_raw() -> None:
-    result = _coerce_append_value(1.0)
-    assert result == 1.0
-
-    result_int = _coerce_append_value(42)
-    assert result_int == 42
-
-
-def test_numeric_with_cf_units_decodes_correctly() -> None:
-    """Numeric value WITH CF units decodes to correct timestamp."""
-    attrs = {"units": "days since 2000-01-01", "calendar": "standard"}
-    result = _coerce_append_value(0.0, attrs)
-    assert isinstance(result, pd.Timestamp)
-    assert str(result).startswith("2000-01-01")
-    assert "1970" not in str(result)
+    with table_row(subtests, "numeric_with_cf_units_decodes_correctly", tmp_path):
+        # Numeric value WITH CF units decodes to correct timestamp.
+        attrs = {"units": "days since 2000-01-01", "calendar": "standard"}
+        result = _coerce_append_value(0.0, attrs)
+        assert isinstance(result, pd.Timestamp)
+        assert str(result).startswith("2000-01-01")
+        assert "1970" not in str(result)

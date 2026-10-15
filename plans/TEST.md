@@ -31,25 +31,35 @@ Each mechanism has a specific purpose. Use the right one, and always supply a re
 
 **External binaries absent from PATH ARE a legitimate skip reason.** When a test requires an external CLI tool (not a Python package), guard it with `shutil.which` and skip with the reason string `"<binary> is not available on PATH"`. Example: `tests/unit/test_version_consistency.py` skips when `uv` is not on PATH. This is distinct from optional Python packages, which must be installed and never silently skipped.
 
-## CI Invocation (fail-fast)
+## Lanes
 
-```bash
-uv sync --extra test
-uv run pyright
-uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short
-uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short
-uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning
-```
+This is the only place that states the lane commands. `tests/README.md` and
+`plans/TESTING_STANDARDS.md` point here. Run from the repository root after
+`uv sync --extra test` and `uv pip install -e tests/fixtures/firecube_test_plugins`.
 
-The `--strict-deps` flag (registered in `tests/conftest.py`) causes pytest collection to **FAIL** with `pytest.UsageError` if any test-extra Python package is missing (`tensogram`, `obstore`, `moto`, `healpix-geo`, or `trollsift`). This catches dependency drift at collection time instead of producing silent skips.
+| Lane | Command | Collected |
+|---|---|---|
+| Fast behavior (primary gate; CI `test` job adds `-n auto` and coverage) | `uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short` | 4170 |
+| Docs/static drift (CI `docs` job also runs `uv run --group docs mkdocs build --strict`) | `uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short` | 48 |
+| Extended storage (S3) | `uv run pytest --strict-deps -m "s3 and not race" -q --tb=short` | 37 |
+| Slow | `uv run pytest --strict-deps -m "slow and not race" -q --tb=short` | 3 |
+| Full run before merge or release | `uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning` | 4257 |
+| Race (red by design, explicit only) | `uv run pytest -m race` | 30 |
 
-The first pytest command is the primary behavior gate for agentic workloads. The
-second command runs broad documentation/help/static drift checks separately so
-their failures are visible without drowning out behavioral regressions.
+Counts are `--collect-only` totals at the time of writing and move with the
+suite; the commands do not.
 
-A CLI `-m` expression REPLACES the `-m 'not race'` filter from `addopts`, so
-every explicit `-m` invocation must carry `and not race` itself; omitting it
-runs the red-by-design race characterization and fails the lane.
+The `--strict-deps` flag (registered in `tests/conftest.py`) causes pytest collection to **FAIL** with `pytest.UsageError` if a required test-extra package is missing. This catches dependency drift at collection time instead of producing silent skips. This is the canonical list; it mirrors the guard in `tests/conftest.py`: `trollsift`, `tensogram`, `obstore`, `moto`, `healpix-geo` and `griffe` (installed by the `griffelib` package), plus `moto.server` (the `moto[server]` extra, which provides `ThreadedMotoServer`).
+
+`pyproject.toml` sets `addopts = "-ra -q --strict-markers -m 'not race'"`. A CLI
+`-m` expression REPLACES that `-m 'not race'` filter, so every explicit `-m`
+invocation other than the race lane must carry `and not race` itself; omitting
+it runs the red-by-design race characterization and fails the lane. Invocations
+without `-m` (the full run, `uv run pytest -q`) keep the `addopts` filter.
+
+The fast lane is the primary behavior gate for agentic workloads. The docs/static
+lane runs separately so its failures do not drown out behavioral regressions.
+CI also runs `uv run pyright` before the tests.
 
 ## Local Dev Invocation
 
@@ -58,25 +68,10 @@ uv run pyright
 uv run pytest -q
 ```
 
-Without `--strict-deps`, legitimate platform skips remain visible, and any optional-dep imports that fail produce **loud ERRORs at runtime** rather than silent skips — making missing extras obvious.
-
-Run a focused subset during development:
+Without `--strict-deps`, legitimate platform skips remain visible, and any optional-dep imports that fail produce **loud ERRORs at runtime** rather than silent skips — making missing extras obvious. For one lane use its command from the table; for one file:
 
 ```bash
-# Fast behavior loop
-uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short
-
-# Docs/help/static lane
-uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short
-
-# Single file
 uv run pytest tests/unit/test_chunk_manager.py -q
-```
-
-Run the deprecation-warning gate before merge or release:
-
-```bash
-uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning
 ```
 
 ## Pytest Markers
@@ -100,7 +95,7 @@ Mark tests at definition time. Unmarked tests are still collected; markers exist
 
 ## Red-by-Design Tests
 
-Tests marked `race` are intentionally RED: they characterize the legacy per-slot write path losing updates in dense coordinate chunks, as an executable record of why the managed-coordinate path exists. They are excluded from the default lane via the `addopts` `-m 'not race'` filter in `pyproject.toml` and from the CI/publish `-m` filters; run them explicitly with `uv run pytest -m race`, and do not "fix" them to green. `gate` tests are the opposite: always green, run in the default lane, and assert the invariants the fix guarantees (e.g. no overlapping materialization-run intervals).
+Tests marked `race` are intentionally RED: they characterize the legacy per-slot write path losing updates in dense coordinate chunks, as an executable record of why the managed-coordinate path exists. They are excluded from the default lane via the `addopts` `-m 'not race'` filter in `pyproject.toml` and from the CI/publish `-m` filters (see [Lanes](#lanes)); run them explicitly with `uv run pytest -m race`, and do not "fix" them to green. `gate` tests are the opposite: always green, run in the default lane, and assert the invariants the fix guarantees (e.g. no overlapping materialization-run intervals).
 
 ## Integration Test Fixture Plugins
 
@@ -118,6 +113,8 @@ fixture modules keep their individual names (`cli_test_plugin`,
 
 Plugin-specific compatibility tests belong in each plugin's own repository,
 not here: core's test bench must not depend on sibling plugin checkouts.
+
+`tests/benchmarks/lazy_writeintent_harness/peak_retained_payload_campaign.py` is operator-run; its RSS and baseline checks are no longer CI gates.
 
 ## Test Suite Options
 
@@ -153,9 +150,9 @@ entries must remain historically accurate unless they are factually wrong.
 
 Before marking a change done:
 
-- [ ] `uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot" -q --tb=short` passes with no unexpected skips
-- [ ] `uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short` passes, or any docs/static drift is intentionally recorded
-- [ ] `uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning` passes
+- [ ] The fast behavior lane (see [Lanes](#lanes)) passes with no unexpected skips
+- [ ] The docs/static lane passes, or any docs/static drift is intentionally recorded
+- [ ] The full run (`-W error::DeprecationWarning`) passes
 - [ ] No new `pytest.skip(...)` calls without a legitimate reason (platform, hardware, or external service)
 - [ ] No new raw `fsspec.filesystem(...)` calls outside the allowlist in `tests/unit/test_no_raw_fsspec_usage.py`
 - [ ] `uv run ruff check .` clean

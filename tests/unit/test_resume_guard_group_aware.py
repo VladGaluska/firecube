@@ -20,6 +20,7 @@ import pytest
 from firecube.core.controlplane.types import RunInfo
 from firecube.ingestor.errors import RangeOverlapError, ResumeConflictError
 from firecube.ingestor.runtime.resume_guard import ResumeGuard
+from tests.helpers.rows import table_row
 
 
 def _make_ctx(*, force_reingest: bool = False, **options):
@@ -67,44 +68,40 @@ def _make_guard(runs: list[RunInfo]) -> ResumeGuard:
 
 
 @pytest.mark.unit
-def test_non_terminal_disjoint_groups_no_conflict():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group="A")])
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group="B")
+def test_non_terminal_allows(subtests, tmp_path):
+    for row_id, run_kwargs, slot_group, ctx_kwargs in [
+        ("test_non_terminal_disjoint_groups_no_conflict", {"slot_group": "A"}, "B", {}),
+        (
+            "test_non_terminal_stale_disjoint_group_allows",
+            {"slot_group": "A", "stale": True},
+            "B",
+            {},
+        ),
+        (
+            "test_non_terminal_same_group_same_range_resume_allows",
+            {"slot_group": "A"},
+            "A",
+            {"resume_existing": True},
+        ),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            guard = _make_guard([_make_run(slot_range=(0, 100), **run_kwargs)])
+            guard.enforce(
+                ctx=_make_ctx(**ctx_kwargs), product="P", slot_range=(0, 100), slot_group=slot_group
+            )
 
 
 @pytest.mark.unit
-def test_non_terminal_same_group_overlapping_range_blocks():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group="A")])
-    with pytest.raises(RangeOverlapError):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(50, 150), slot_group="A")
-
-
-@pytest.mark.unit
-def test_non_terminal_omitted_group_blocks_specific_group():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group=None)])
-    with pytest.raises(RangeOverlapError):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(50, 150), slot_group="A")
-
-
-@pytest.mark.unit
-def test_phase3_no_slot_group_preserves_behavior():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group=None)])
-    with pytest.raises(RangeOverlapError):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(50, 150), slot_group=None)
-
-
-@pytest.mark.unit
-def test_non_terminal_stale_disjoint_group_allows():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group="A", stale=True)])
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group="B")
-
-
-@pytest.mark.unit
-def test_non_terminal_same_group_same_range_resume_allows():
-    guard = _make_guard([_make_run(slot_range=(0, 100), slot_group="A")])
-    guard.enforce(
-        ctx=_make_ctx(resume_existing=True), product="P", slot_range=(0, 100), slot_group="A"
-    )
+def test_non_terminal_overlap_blocks(subtests, tmp_path):
+    for row_id, run_group, slot_group in [
+        ("test_non_terminal_same_group_overlapping_range_blocks", "A", "A"),
+        ("test_non_terminal_omitted_group_blocks_specific_group", None, "A"),
+        ("test_phase3_no_slot_group_preserves_behavior", None, None),
+    ]:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(RangeOverlapError):
+            _make_guard([_make_run(slot_range=(0, 100), slot_group=run_group)]).enforce(
+                ctx=_make_ctx(), product="P", slot_range=(50, 150), slot_group=slot_group
+            )
 
 
 @pytest.mark.unit

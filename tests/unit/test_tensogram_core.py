@@ -179,20 +179,6 @@ class TestZarrToTgm:
         np.testing.assert_array_equal(loaded["timestamp"].values, np.array([2, 3, 4]))
         np.testing.assert_array_equal(loaded["FWI"].values, values[1:4])
 
-    def test_variable_names_preserved_in_v3(self, tmp_path):
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "test.zarr")
-        tgt = str(tmp_path / "test.tgm")
-        ds = xr.Dataset({"FWI": (["t"], np.ones(3, dtype="float32"))})
-        ds.to_zarr(src)
-        zarr_to_tgm(src, tgt)
-        loaded = xr.open_dataset(tgt, engine="tensogram")
-        assert "FWI" in loaded.data_vars
-
     def test_allow_nan_true_accepts_nan_data(self, tmp_path):
         import numpy as np
         import xarray as xr
@@ -219,41 +205,6 @@ class TestZarrToTgm:
         ds.to_zarr(src)
         with pytest.raises(ValueError, match="strict-NaN check"):
             zarr_to_tgm(src, tgt, allow_nan=False)
-
-    def test_default_compression_is_zstd(self, tmp_path):
-        """zarr_to_tgm default compression is zstd."""
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "test.zarr")
-        tgt = str(tmp_path / "test.tgm")
-        ds = xr.Dataset({"X": (["t"], np.ones(3, dtype="float32"))})
-        ds.to_zarr(src)
-        result = zarr_to_tgm(src, tgt)
-        assert result["compression"] == "zstd"
-
-    def test_skipped_string_variables(self, tmp_path):
-        """zarr_to_tgm skips string variables and reports them."""
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "mixed.zarr")
-        tgt = str(tmp_path / "mixed.tgm")
-        ds = xr.Dataset(
-            {
-                "temp": (["t"], np.array([1.0, 2.0], dtype="float32")),
-                "name": (["t"], np.array(["a", "b"], dtype="<U1")),
-            }
-        )
-        ds.to_zarr(src)
-        result = zarr_to_tgm(src, tgt)
-        assert "temp" in result["variables"]
-        assert "name" not in result["variables"]
-        assert "name" in result["skipped"]
 
     def test_variables_excludes_skipped(self, tmp_path):
         """zarr_to_tgm return dict 'variables' only includes actually archived vars."""

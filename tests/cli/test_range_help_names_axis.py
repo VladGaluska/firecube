@@ -16,27 +16,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkManager, SpanCoverage
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 
-def test_delete_range_help_names_record_time_axis() -> None:
+@pytest.mark.docs_static
+def test_delete_help_names_axes_and_shows_time_range_example(subtests) -> None:
     result = CliRunner().invoke(cli, ["chunks", "delete", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert "delete chunks in a record-time range" in result.output
-    assert "YYYY-MM-DD,YYYY-MM-DD" in result.output
-    assert "use --time-range for data time" in result.output
-
-
-def test_delete_epilog_includes_time_range_example() -> None:
-    result = CliRunner().invoke(cli, ["chunks", "delete", "--help"])
-
-    assert result.exit_code == 0, result.output
-    assert "--time-range 2024-01-01:2024-03-31" in result.output
+    rows = {
+        "delete_range_help_names_record_time_axis": [
+            "delete chunks in a record-time range",
+            "YYYY-MM-DD,YYYY-MM-DD",
+            "use --time-range for data time",
+        ],
+        "delete_epilog_includes_time_range_example": ["--time-range 2024-01-01:2024-03-31"],
+    }
+    for row_id, expected in rows.items():
+        with subtests.test(msg=row_id):
+            for text in expected:
+                assert text in result.output
 
 
 def _seed_product_with_april_2024_span(tmp_path: Path) -> str:
@@ -108,42 +113,41 @@ def _invoke_no_match_delete(tmp_path: Path, product_uri: str, *time_filter: str)
     return result.output
 
 
-def test_delete_no_match_message_names_record_and_data_time_axes(tmp_path: Path) -> None:
-    product_uri = _seed_product_with_april_2024_span(tmp_path)
-
-    output = _invoke_no_match_delete(tmp_path, product_uri, "--range", "2000-01-01,2000-01-02")
-
-    assert (
-        "No chunks found matching the given criteria. Note: --range filters by "
-        "record time; use --time-range for data time."
-    ) in output
-
-
-def test_delete_no_match_with_time_range_names_data_time_axis(tmp_path: Path) -> None:
-    """A `--time-range` miss is explained in data-time terms, not by a `--range` note."""
-    product_uri = _seed_product_with_april_2024_span(tmp_path)
-
-    output = _invoke_no_match_delete(tmp_path, product_uri, "--time-range", "2000-01-01:2000-01-02")
-
-    assert "No chunks found matching the given criteria." in output
-    assert "--time-range filters by data time" in output
-    assert "for record time" in output
-    assert "--range filters by record time" not in output
-
-
-def test_delete_no_match_with_start_date_names_the_option_passed(tmp_path: Path) -> None:
-    product_uri = _seed_product_with_april_2024_span(tmp_path)
-
-    output = _invoke_no_match_delete(tmp_path, product_uri, "--start-date", "2030-01-01")
-
-    assert "--start-date filters by record time; use --time-range for data time" in output
-    assert "--range filters" not in output
-
-
-def test_delete_no_match_without_time_filter_has_no_axis_note(tmp_path: Path) -> None:
-    product_uri = _seed_product_with_april_2024_span(tmp_path)
-
-    output = _invoke_no_match_delete(tmp_path, product_uri, "--pattern", "no-such-key-*")
-
-    assert "No chunks found matching the given criteria." in output
-    assert "Note:" not in output
+def test_delete_no_match_note_names_the_axis_filtered(tmp_path: Path, subtests) -> None:
+    rows = {
+        "delete_no_match_message_names_record_and_data_time_axes": (
+            ("--range", "2000-01-01,2000-01-02"),
+            [
+                "No chunks found matching the given criteria. Note: --range filters by "
+                "record time; use --time-range for data time."
+            ],
+            [],
+        ),
+        "delete_no_match_with_time_range_names_data_time_axis": (
+            ("--time-range", "2000-01-01:2000-01-02"),
+            [
+                "No chunks found matching the given criteria.",
+                "--time-range filters by data time",
+                "for record time",
+            ],
+            ["--range filters by record time"],
+        ),
+        "delete_no_match_with_start_date_names_the_option_passed": (
+            ("--start-date", "2030-01-01"),
+            ["--start-date filters by record time; use --time-range for data time"],
+            ["--range filters"],
+        ),
+        "delete_no_match_without_time_filter_has_no_axis_note": (
+            ("--pattern", "no-such-key-*"),
+            ["No chunks found matching the given criteria."],
+            ["Note:"],
+        ),
+    }
+    for row_id, (time_filter, present, absent) in rows.items():
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            product_uri = _seed_product_with_april_2024_span(workdir)
+            output = _invoke_no_match_delete(workdir, product_uri, *time_filter)
+            for text in present:
+                assert text in output
+            for text in absent:
+                assert text not in output

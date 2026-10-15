@@ -54,25 +54,23 @@ def test_same_fields_produce_same_key() -> None:
     assert StorageCacheKey.from_binding(left) == StorageCacheKey.from_binding(right)
 
 
-def test_different_access_key_changes_key() -> None:
-    left = StorageCacheKey.from_binding(_binding(access_key="ak-1"))
-    right = StorageCacheKey.from_binding(_binding(access_key="ak-2"))
-
-    assert left != right
-
-
-def test_different_secret_key_changes_key() -> None:
-    left = StorageCacheKey.from_binding(_binding(secret_key="sk-1"))
-    right = StorageCacheKey.from_binding(_binding(secret_key="sk-2"))
-
-    assert left != right
+_DIFFERING_FIELD_ROWS = (
+    ("test_different_access_key_changes_key", {"access_key": "ak-1"}, {"access_key": "ak-2"}),
+    ("test_different_secret_key_changes_key", {"secret_key": "sk-1"}, {"secret_key": "sk-2"}),
+    (
+        "test_different_endpoint_changes_key",
+        {"endpoint_url": "https://one.example.com"},
+        {"endpoint_url": "https://two.example.com"},
+    ),
+)
 
 
-def test_different_endpoint_changes_key() -> None:
-    left = StorageCacheKey.from_binding(_binding(endpoint_url="https://one.example.com"))
-    right = StorageCacheKey.from_binding(_binding(endpoint_url="https://two.example.com"))
-
-    assert left != right
+def test_different_field_changes_key(subtests) -> None:
+    for row_id, left, right in _DIFFERING_FIELD_ROWS:
+        with subtests.test(msg=row_id):
+            assert StorageCacheKey.from_binding(_binding(**left)) != StorageCacheKey.from_binding(
+                _binding(**right)
+            )
 
 
 def test_anonymous_vs_explicit_credentials_change_key() -> None:

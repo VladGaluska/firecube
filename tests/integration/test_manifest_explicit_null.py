@@ -88,8 +88,11 @@ def _result(
     return result
 
 
-def test_direct_local_manifest_has_explicit_null(tmp_path: Path) -> None:
-    """direct+local run manifests keep upload-counter keys with null values."""
+def test_direct_local_manifest_has_explicit_null(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """direct+local completion: explicit null counters in manifest and metrics, schema v1.
+
+    One completion, read by one step per former test (step id = old test name).
+    """
     target = tmp_path / "product.zarr"
     target.mkdir()
 
@@ -98,32 +101,28 @@ def test_direct_local_manifest_has_explicit_null(tmp_path: Path) -> None:
         _ctx(tmp_path),
         _Host(),  # pyright: ignore[reportArgumentType]
     )
+    manifest = updated.manifest
+    assert manifest is not None
 
-    assert updated.manifest is not None
-    assert "files" in updated.manifest
-    assert "bytes" in updated.manifest
-    assert "duration_s" in updated.manifest
-    assert updated.manifest["files"] is None
-    assert updated.manifest["bytes"] is None
-    assert updated.manifest["duration_s"] is None
+    with subtests.test(msg="test_direct_local_manifest_has_explicit_null"):
+        # direct+local run manifests keep upload-counter keys with null values.
+        assert "files" in manifest
+        assert "bytes" in manifest
+        assert "duration_s" in manifest
+        assert manifest["files"] is None
+        assert manifest["bytes"] is None
+        assert manifest["duration_s"] is None
 
+    with subtests.test(msg="test_direct_local_metrics_storage_also_null"):
+        # metrics.storage counters also use null for direct+local runs.
+        storage = manifest["metrics"]["storage"]
+        assert storage["files"] is None
+        assert storage["bytes"] is None
+        assert storage["duration_s"] is None
 
-def test_direct_local_metrics_storage_also_null(tmp_path: Path) -> None:
-    """metrics.storage counters also use null for direct+local runs."""
-    target = tmp_path / "product.zarr"
-    target.mkdir()
-
-    updated = PipelineExecutor().complete_output(
-        _result(str(target)),
-        _ctx(tmp_path),
-        _Host(),  # pyright: ignore[reportArgumentType]
-    )
-
-    assert updated.manifest is not None
-    storage = updated.manifest["metrics"]["storage"]
-    assert storage["files"] is None
-    assert storage["bytes"] is None
-    assert storage["duration_s"] is None
+    with subtests.test(msg="test_schema_version_still_v1"):
+        # explicit-null counter encoding does not bump manifest schema.
+        assert manifest["schema_version"] == "v1"
 
 
 def test_staged_manifest_still_has_real_counters(
@@ -232,18 +231,3 @@ def test_direct_s3_completion_does_not_scan_store_or_use_path_stats(
     assert storage["latest_pointer"] == _CONTROL_PLANE["latest_pointer"]
     assert updated.metrics.storage is not None
     assert updated.metrics.storage.files is None
-
-
-def test_schema_version_still_v1(tmp_path: Path) -> None:
-    """explicit-null counter encoding does not bump manifest schema."""
-    target = tmp_path / "product.zarr"
-    target.mkdir()
-
-    updated = PipelineExecutor().complete_output(
-        _result(str(target)),
-        _ctx(tmp_path),
-        _Host(),  # pyright: ignore[reportArgumentType]
-    )
-
-    assert updated.manifest is not None
-    assert updated.manifest["schema_version"] == "v1"

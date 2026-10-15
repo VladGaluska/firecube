@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 from firecube.core.controlplane.types import canonical_index_bytes
 from firecube.core.index_resolve import resolve_index_spec
 from firecube.core.index_spec import IndexSpec, IntegerAxis, RegularTimeAxis
+from tests.helpers.rows import table_row
 
 
 def _integer_spec() -> IndexSpec:
@@ -59,21 +61,18 @@ def _regular_spec() -> IndexSpec:
 
 
 class TestResolvedIndexRecordByteParity:
-    def test_integer_only_hash_deterministic(self) -> None:
-        resolved = resolve_index_spec(_integer_spec(), time_dim_name="timestamp")
+    def test_hash_deterministic(self, subtests, tmp_path: Path) -> None:
+        for row_id, spec in [
+            ("integer_only_hash_deterministic", _integer_spec),
+            ("mixed_kind_hash_deterministic", _mixed_spec),
+        ]:
+            with table_row(subtests, row_id, tmp_path):
+                resolved = resolve_index_spec(spec(), time_dim_name="timestamp")
 
-        assert (
-            resolved.identity_hash
-            == resolve_index_spec(_integer_spec(), time_dim_name="timestamp").identity_hash
-        )
-
-    def test_mixed_kind_hash_deterministic(self) -> None:
-        resolved = resolve_index_spec(_mixed_spec(), time_dim_name="timestamp")
-
-        assert (
-            resolved.identity_hash
-            == resolve_index_spec(_mixed_spec(), time_dim_name="timestamp").identity_hash
-        )
+                assert (
+                    resolved.identity_hash
+                    == resolve_index_spec(spec(), time_dim_name="timestamp").identity_hash
+                )
 
     def test_regular_only_hash_diverges_from_legacy(self) -> None:
         resolved = resolve_index_spec(_regular_spec(), time_dim_name="timestamp")

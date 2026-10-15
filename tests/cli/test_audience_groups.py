@@ -33,11 +33,6 @@ _TOP_LEVEL_GROUPS = _top_level_groups()
 _TOP_LEVEL_GROUP_IDS = [name for name, _ in _TOP_LEVEL_GROUPS]
 
 
-def test_group_audience_mapping_exists() -> None:
-    assert isinstance(GROUP_AUDIENCE, dict)
-    assert GROUP_AUDIENCE, "GROUP_AUDIENCE must classify at least one group"
-
-
 def test_group_audience_values_are_valid() -> None:
     for name, audience in GROUP_AUDIENCE.items():
         assert audience in {"user", "operator"}, (

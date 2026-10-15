@@ -96,7 +96,7 @@ Install test extras and run the main local gate:
 
 ```bash
 uv sync --extra test
-uv run pytest --strict-deps -m "not slow and not s3"
+uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race"
 ```
 
 ## Software Bill Of Materials

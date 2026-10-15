@@ -22,6 +22,7 @@ from firecube.core.errors import ConfigurationError
 from firecube.ingestor.runtime.base import BaseIngestor
 from firecube.ingestor.templates.config import ZarrTemplateConfig
 from firecube.ingestor.types.context import OutputPaths, PipelineResult
+from tests.helpers.rows import table_row
 
 REMOVED_MESSAGE = (
     "zarr_multi_res during ingest has been removed; "
@@ -39,16 +40,16 @@ def test_zarr_multi_res_list_raises_config_error() -> None:
     assert str(exc_info.value) == REMOVED_MESSAGE
 
 
-def test_zarr_multi_res_empty_list_raises() -> None:
-    """Empty list also rejected — presence-based, not value-based."""
-    with pytest.raises(Exception, match="zarr_multi_res during ingest has been removed"):
-        ZarrTemplateConfig.from_options({"zarr_multi_res": []})
-
-
-def test_zarr_multi_res_bool_raises() -> None:
-    """Legacy bool form also rejected."""
-    with pytest.raises(Exception, match="zarr_multi_res during ingest has been removed"):
-        ZarrTemplateConfig.from_options({"zarr_multi_res": True})
+def test_zarr_multi_res_rejected_by_presence_not_value(subtests, tmp_path) -> None:
+    for row_id, value in [
+        ("test_zarr_multi_res_empty_list_raises", []),
+        ("test_zarr_multi_res_bool_raises", True),
+    ]:
+        with (
+            table_row(subtests, row_id, tmp_path),
+            pytest.raises(Exception, match="zarr_multi_res during ingest has been removed"),
+        ):
+            ZarrTemplateConfig.from_options({"zarr_multi_res": value})
 
 
 def test_zarr_multi_res_absent_is_fine() -> None:
@@ -70,14 +71,16 @@ def test_zarr_region_write_concurrency_default_is_one() -> None:
     assert cfg.zarr_region_write_concurrency == 1
 
 
-def test_zarr_region_write_concurrency_rejects_zero() -> None:
-    with pytest.raises(ConfigurationError, match="zarr_region_write_concurrency must be >= 1"):
-        ZarrTemplateConfig(zarr_region_write_concurrency=0)
-
-
-def test_zarr_region_write_concurrency_rejects_negative() -> None:
-    with pytest.raises(ConfigurationError, match="zarr_region_write_concurrency must be >= 1"):
-        ZarrTemplateConfig(zarr_region_write_concurrency=-1)
+def test_zarr_region_write_concurrency_rejects_below_one(subtests, tmp_path) -> None:
+    for row_id, value in [
+        ("test_zarr_region_write_concurrency_rejects_zero", 0),
+        ("test_zarr_region_write_concurrency_rejects_negative", -1),
+    ]:
+        with (
+            table_row(subtests, row_id, tmp_path),
+            pytest.raises(ConfigurationError, match="zarr_region_write_concurrency must be >= 1"),
+        ):
+            ZarrTemplateConfig(zarr_region_write_concurrency=value)
 
 
 def test_zarr_region_write_concurrency_accepts_positive() -> None:

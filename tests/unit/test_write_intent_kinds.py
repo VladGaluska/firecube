@@ -21,12 +21,6 @@ import numpy as np
 from firecube.ingestor.api import WriteIntent
 
 
-def test_static_kind_constructs() -> None:
-    """WriteIntent with kind='static' should construct without error."""
-    intent = WriteIntent(group="g", array="lat", ts_index=0, data=np.zeros((4, 5)), kind="static")
-    assert intent.kind == "static"
-
-
 def test_static_kind_ts_index_ignored_semantically() -> None:
     """For static intents, ts_index is meaningless but accepted without error."""
     intent = WriteIntent(group="g", array="lat", ts_index=999, data=np.zeros((4, 5)), kind="static")

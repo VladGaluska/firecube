@@ -29,6 +29,7 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 
 
 class _DuckAwareZarrIngestor(DuckDbMixin, GenericZarrIngestor):
@@ -118,33 +119,42 @@ def _state() -> PipelineRunState:
 
 
 @pytest.mark.unit
-def test_duckdb_persistence_initializes_for_mixin_host(tmp_path) -> None:
-    ingestor = _DuckAwareZarrIngestor()
-    ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
+def test_duckdb_persistence_capability_check(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "duckdb_persistence_initializes_for_mixin_host", tmp_path) as (
+        workdir,
+        _,
+    ):
+        ingestor = _DuckAwareZarrIngestor()
+        ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
 
-    ingestor.on_pipeline_start(_plugin_context(tmp_path, persist=True, in_memory=False), _state())
-
-    assert ingestor.calls == ["setup", "prepare", "teardown"]
-
-
-@pytest.mark.unit
-def test_duckdb_persistence_skips_for_non_mixin_host(tmp_path) -> None:
-    ingestor = _CoincidentalDuckHooksIngestor()
-    ingestor.engine_config = EngineConfig(duckdb_persist_batches=False)
-
-    ingestor.on_pipeline_start(_plugin_context(tmp_path, persist=False, in_memory=False), _state())
-
-    assert ingestor.calls == []
-
-
-@pytest.mark.unit
-def test_duckdb_persistence_rejects_coincidental_hooks_without_mixin(tmp_path) -> None:
-    ingestor = _CoincidentalDuckHooksIngestor()
-    ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
-
-    with pytest.raises(ConfigurationError, match="DuckDbMixin-compatible hooks"):
         ingestor.on_pipeline_start(
-            _plugin_context(tmp_path, persist=True, in_memory=False), _state()
+            _plugin_context(workdir, persist=True, in_memory=False), _state()
         )
 
-    assert ingestor.calls == []
+        assert ingestor.calls == ["setup", "prepare", "teardown"]
+
+    with table_row(subtests, "duckdb_persistence_skips_for_non_mixin_host", tmp_path) as (
+        workdir,
+        _,
+    ):
+        ingestor = _CoincidentalDuckHooksIngestor()
+        ingestor.engine_config = EngineConfig(duckdb_persist_batches=False)
+
+        ingestor.on_pipeline_start(
+            _plugin_context(workdir, persist=False, in_memory=False), _state()
+        )
+
+        assert ingestor.calls == []
+
+    with table_row(
+        subtests, "duckdb_persistence_rejects_coincidental_hooks_without_mixin", tmp_path
+    ) as (workdir, _):
+        ingestor = _CoincidentalDuckHooksIngestor()
+        ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
+
+        with pytest.raises(ConfigurationError, match="DuckDbMixin-compatible hooks"):
+            ingestor.on_pipeline_start(
+                _plugin_context(workdir, persist=True, in_memory=False), _state()
+            )
+
+        assert ingestor.calls == []

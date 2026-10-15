@@ -24,6 +24,7 @@ from unittest.mock import patch
 import pytest
 
 from firecube.core.controlplane import ChunkManager
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.unit
@@ -64,55 +65,58 @@ def _record_terminal_run(
     )
 
 
-def test_list_runs_reads_terminal_timestamps_skipped_without_wal_scan(
-    tmp_path: Path,
-) -> None:
-    product = "test_product"
-    run_id = "run-with-skips"
-    manager = _fresh_manager(tmp_path)
-    _record_terminal_run(
-        manager,
-        product=product,
-        run_id=run_id,
-        timestamps_skipped=5,
-    )
+def test_list_runs_terminal_timestamps_skipped(subtests: Any, tmp_path: Path) -> None:
+    with table_row(
+        subtests, "list_runs_reads_terminal_timestamps_skipped_without_wal_scan", tmp_path
+    ) as (workdir, _):
+        product = "test_product"
+        run_id = "run-with-skips"
+        manager = _fresh_manager(workdir)
+        _record_terminal_run(
+            manager,
+            product=product,
+            run_id=run_id,
+            timestamps_skipped=5,
+        )
 
-    manager.close()
-    manager = _fresh_manager(tmp_path)
+        manager.close()
+        manager = _fresh_manager(workdir)
 
-    with patch.object(
-        manager.repo,
-        "_read_run_events",
-        wraps=manager.repo._read_run_events,
-    ) as spy:
+        with patch.object(
+            manager.repo,
+            "_read_run_events",
+            wraps=manager.repo._read_run_events,
+        ) as spy:
+            runs = manager.list_runs(product=product)
+
+        assert spy.call_count == 0, "terminal list_runs must not scan run WAL events"
+        assert len(runs) == 1
+        assert runs[0].run_id == run_id
+        assert runs[0].timestamps_skipped == 5
+
+    with table_row(subtests, "list_runs_defaults_missing_timestamps_skipped_to_zero", tmp_path) as (
+        workdir,
+        _,
+    ):
+        product = "test_product"
+        run_id = "run-without-skips"
+        manager = _fresh_manager(workdir)
+        _record_terminal_run(
+            manager,
+            product=product,
+            run_id=run_id,
+            timestamps_skipped=0,
+        )
+
+        run_json = workdir / product / ".firecube" / "runs" / run_id / "run.json"
+        payload = json.loads(run_json.read_text(encoding="utf-8"))
+        payload.pop("timestamps_skipped", None)
+        run_json.write_text(json.dumps(payload), encoding="utf-8")
+
+        manager.close()
+        manager = _fresh_manager(workdir)
+
         runs = manager.list_runs(product=product)
 
-    assert spy.call_count == 0, "terminal list_runs must not scan run WAL events"
-    assert len(runs) == 1
-    assert runs[0].run_id == run_id
-    assert runs[0].timestamps_skipped == 5
-
-
-def test_list_runs_defaults_missing_timestamps_skipped_to_zero(tmp_path: Path) -> None:
-    product = "test_product"
-    run_id = "run-without-skips"
-    manager = _fresh_manager(tmp_path)
-    _record_terminal_run(
-        manager,
-        product=product,
-        run_id=run_id,
-        timestamps_skipped=0,
-    )
-
-    run_json = tmp_path / product / ".firecube" / "runs" / run_id / "run.json"
-    payload = json.loads(run_json.read_text(encoding="utf-8"))
-    payload.pop("timestamps_skipped", None)
-    run_json.write_text(json.dumps(payload), encoding="utf-8")
-
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-
-    runs = manager.list_runs(product=product)
-
-    assert len(runs) == 1
-    assert runs[0].timestamps_skipped == 0
+        assert len(runs) == 1
+        assert runs[0].timestamps_skipped == 0

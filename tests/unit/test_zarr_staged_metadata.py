@@ -271,40 +271,29 @@ def test_seed_partial_failure_raises_in_strict_mode(tmp_path, monkeypatch: pytes
         )
 
 
-def test_is_coordinate_chunk_matches_timestamp_chunk_v3():
-    assert _is_coordinate_chunk("data/timestamp/c/0", ["timestamp"]) is True
+_T = ["timestamp"]
+_COORDINATE_CHUNK_ROWS = (
+    ("test_is_coordinate_chunk_matches_timestamp_chunk_v3", "data/timestamp/c/0", _T, True),
+    ("test_is_coordinate_chunk_matches_nested_chunk_path", "data/timestamp/c/0/0", _T, True),
+    ("test_is_coordinate_chunk_rejects_zarr_json", "data/timestamp/zarr.json", _T, False),
+    (
+        "test_is_coordinate_chunk_rejects_substring_collision",
+        "data/timestamp_bounds/c/0",
+        _T,
+        False,
+    ),
+    ("test_is_coordinate_chunk_rejects_data_array_chunk", "data/val/c/0", _T, False),
+    ("test_is_coordinate_chunk_returns_false_for_empty_coords", "data/timestamp/c/0", [], False),
+    ("test_is_coordinate_chunk_returns_false_for_none_coords", "data/timestamp/c/0", None, False),
+    ("test_is_coordinate_chunk_handles_trailing_slash", "data/timestamp/c/0/", _T, True),
+    ("test_is_coordinate_chunk_matches_alternate_coord_name", "data/time/c/0", ["time"], True),
+)
 
 
-def test_is_coordinate_chunk_matches_nested_chunk_path():
-    assert _is_coordinate_chunk("data/timestamp/c/0/0", ["timestamp"]) is True
-
-
-def test_is_coordinate_chunk_rejects_zarr_json():
-    assert _is_coordinate_chunk("data/timestamp/zarr.json", ["timestamp"]) is False
-
-
-def test_is_coordinate_chunk_rejects_substring_collision():
-    assert _is_coordinate_chunk("data/timestamp_bounds/c/0", ["timestamp"]) is False
-
-
-def test_is_coordinate_chunk_rejects_data_array_chunk():
-    assert _is_coordinate_chunk("data/val/c/0", ["timestamp"]) is False
-
-
-def test_is_coordinate_chunk_returns_false_for_empty_coords():
-    assert _is_coordinate_chunk("data/timestamp/c/0", []) is False
-
-
-def test_is_coordinate_chunk_returns_false_for_none_coords():
-    assert _is_coordinate_chunk("data/timestamp/c/0", None) is False
-
-
-def test_is_coordinate_chunk_handles_trailing_slash():
-    assert _is_coordinate_chunk("data/timestamp/c/0/", ["timestamp"]) is True
-
-
-def test_is_coordinate_chunk_matches_alternate_coord_name():
-    assert _is_coordinate_chunk("data/time/c/0", ["time"]) is True
+def test_is_coordinate_chunk(subtests):
+    for row_id, path, coords, expected in _COORDINATE_CHUNK_ROWS:
+        with subtests.test(msg=row_id):
+            assert _is_coordinate_chunk(path, coords and list(coords)) is expected
 
 
 def test_seed_copies_coord_chunks_when_coordinate_arrays_provided(tmp_path):

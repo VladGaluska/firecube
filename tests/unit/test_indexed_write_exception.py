@@ -17,50 +17,61 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from firecube.core.errors import IndexedWriteCompilationError
 from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
+from tests.helpers.rows import table_row
 
 
-def test_compilation_error_fields() -> None:
-    coordinate = datetime(2026, 1, 1, tzinfo=UTC)
-    err = IndexedWriteCompilationError(coordinate, "bad shape", "IndexedWrite(...)")
+def test_indexed_write_compilation_error_contract(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "compilation_error_fields", tmp_path):
+        coordinate = datetime(2026, 1, 1, tzinfo=UTC)
+        err = IndexedWriteCompilationError(coordinate, "bad shape", "IndexedWrite(...)")
 
-    assert err.coordinate is coordinate
-    assert err.reason == "bad shape"
-    assert err.iw_repr == "IndexedWrite(...)"
-    assert isinstance(err, ValueError)
+        assert err.coordinate is coordinate
+        assert err.reason == "bad shape"
+        assert err.iw_repr == "IndexedWrite(...)"
+        assert isinstance(err, ValueError)
 
+    with table_row(subtests, "compilation_error_message_shape", tmp_path):
+        coordinate = datetime(2026, 1, 1, tzinfo=UTC)
+        err = IndexedWriteCompilationError(coordinate, "bad shape", "IndexedWrite(...)")
 
-def test_compilation_error_message_shape() -> None:
-    coordinate = datetime(2026, 1, 1, tzinfo=UTC)
-    err = IndexedWriteCompilationError(coordinate, "bad shape", "IndexedWrite(...)")
+        message = str(err)
+        assert "IndexedWrite compilation failed" in message
+        assert "bad shape" in message
+        assert repr(coordinate) in message
 
-    message = str(err)
-    assert "IndexedWrite compilation failed" in message
-    assert "bad shape" in message
-    assert repr(coordinate) in message
+    with table_row(subtests, "compilation_error_is_value_error", tmp_path):
+        assert issubclass(IndexedWriteCompilationError, ValueError)
 
+    with table_row(subtests, "reexport_from_core_api", tmp_path):
+        from firecube.core.api import (
+            IndexedWriteCompilationError as CoreIndexedWriteCompilationError,
+        )
 
-def test_compilation_error_is_value_error() -> None:
-    assert issubclass(IndexedWriteCompilationError, ValueError)
+        assert CoreIndexedWriteCompilationError is IndexedWriteCompilationError
 
+    with table_row(subtests, "reexport_from_ingestor_api", tmp_path):
+        from firecube.ingestor.api import (
+            IndexedWriteCompilationError as IngestorIndexedWriteCompilationError,
+        )
 
-def test_reexport_from_core_api() -> None:
-    from firecube.core.api import IndexedWriteCompilationError as CoreIndexedWriteCompilationError
+        assert IngestorIndexedWriteCompilationError is IndexedWriteCompilationError
 
-    assert CoreIndexedWriteCompilationError is IndexedWriteCompilationError
+    with table_row(subtests, "abstract_error_fires_when_neither_hook_overridden", tmp_path):
+        ingestor = _MinimalDirectZarrIngestor()
 
+        with pytest.raises(NotImplementedError) as excinfo:
+            ingestor.build_write_intents(cast(Any, []), cast(Any, None))
 
-def test_reexport_from_ingestor_api() -> None:
-    from firecube.ingestor.api import (
-        IndexedWriteCompilationError as IngestorIndexedWriteCompilationError,
-    )
-
-    assert IngestorIndexedWriteCompilationError is IndexedWriteCompilationError
+        message = str(excinfo.value)
+        assert "build_write_intents" in message
+        assert "WriteIntent and IndexedWrite" in message
 
 
 class _MinimalDirectZarrIngestor(DirectZarrIngestor):
@@ -69,14 +80,3 @@ class _MinimalDirectZarrIngestor(DirectZarrIngestor):
     def zarr_schema(self, ctx):
         _ = ctx
         return []
-
-
-def test_abstract_error_fires_when_neither_hook_overridden() -> None:
-    ingestor = _MinimalDirectZarrIngestor()
-
-    with pytest.raises(NotImplementedError) as excinfo:
-        ingestor.build_write_intents(cast(Any, []), cast(Any, None))
-
-    message = str(excinfo.value)
-    assert "build_write_intents" in message
-    assert "WriteIntent and IndexedWrite" in message

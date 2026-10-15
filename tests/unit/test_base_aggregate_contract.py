@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,6 +28,7 @@ from firecube.ingestor.types.context import (
     PipelineRunState,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 
 
 class _MissingAggregateIngestor(BaseIngestor):
@@ -51,78 +53,79 @@ class _HelperAggregateIngestor(BaseIngestor):
 
 
 @pytest.mark.unit
-def test_base_ingestor_provides_default_aggregate_metrics():
-    ingestor = _MissingAggregateIngestor(name="missing_aggregate")
-    ctx = RuntimeIngestContext.from_ingest_context(
-        IngestContext(source=str(Path(".")), target="out.zarr", output_format="zarr"),
-        run_id="test-run",
-        temp_root=Path("."),
-        materializer=lambda path: Path(path),
-    )
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=1,
-        batch_size=1,
-        batches=(),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-        results=(),
-    )
+def test_base_aggregate_contract(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "base_ingestor_provides_default_aggregate_metrics", tmp_path):
+        ingestor = _MissingAggregateIngestor(name="missing_aggregate")
+        ctx = RuntimeIngestContext.from_ingest_context(
+            IngestContext(source=str(Path(".")), target="out.zarr", output_format="zarr"),
+            run_id="test-run",
+            temp_root=Path("."),
+            materializer=lambda path: Path(path),
+        )
+        state = PipelineRunState(
+            product="dummy",
+            pipeline_workers=1,
+            batch_size=1,
+            batches=(),
+            ingestion_start_time=0.0,
+            batch_creation_duration=0.0,
+            processing_start_time=0.0,
+            results=(),
+        )
 
-    assert ingestor._aggregate_metrics(ctx, state) == {"zarr": {"coverage": []}}
+        assert ingestor._aggregate_metrics(ctx, state) == {"zarr": {"coverage": []}}
 
-
-@pytest.mark.unit
-def test_default_aggregate_metrics_helper_merges_successful_results():
-    ingestor = _HelperAggregateIngestor(name="helper_aggregate")  # pyright: ignore[reportAbstractUsage]
-    ctx = IngestContext(source=str(Path(".")), target="out.zarr", output_format="zarr")
-    batch = PipelineBatch(batch_id="b1", data_path=Path("."))
-    failed = PipelineResult(
-        batch=batch,
-        outputs=OutputPaths(primary=Path(".")),
-        success=False,
-        metrics={"rows": 99},
-        error="failed",
-    )
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=1,
-        batch_size=1,
-        batches=(batch,),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-        results=(
-            PipelineResult(
-                batch=batch,
-                outputs=OutputPaths(primary=Path(".")),
-                success=True,
-                metrics={
-                    "rows": 10,
-                    "tags": ["a"],
-                    "zarr": {"coverage": [{"group": "g1"}]},
-                    "meta": "first",
-                },
+    with table_row(
+        subtests, "default_aggregate_metrics_helper_merges_successful_results", tmp_path
+    ):
+        ingestor = _HelperAggregateIngestor(name="helper_aggregate")  # pyright: ignore[reportAbstractUsage]
+        ctx = IngestContext(source=str(Path(".")), target="out.zarr", output_format="zarr")
+        batch = PipelineBatch(batch_id="b1", data_path=Path("."))
+        failed = PipelineResult(
+            batch=batch,
+            outputs=OutputPaths(primary=Path(".")),
+            success=False,
+            metrics={"rows": 99},
+            error="failed",
+        )
+        state = PipelineRunState(
+            product="dummy",
+            pipeline_workers=1,
+            batch_size=1,
+            batches=(batch,),
+            ingestion_start_time=0.0,
+            batch_creation_duration=0.0,
+            processing_start_time=0.0,
+            results=(
+                PipelineResult(
+                    batch=batch,
+                    outputs=OutputPaths(primary=Path(".")),
+                    success=True,
+                    metrics={
+                        "rows": 10,
+                        "tags": ["a"],
+                        "zarr": {"coverage": [{"group": "g1"}]},
+                        "meta": "first",
+                    },
+                ),
+                PipelineResult(
+                    batch=batch,
+                    outputs=OutputPaths(primary=Path(".")),
+                    success=True,
+                    metrics={
+                        "rows": 5,
+                        "tags": ["b"],
+                        "zarr": {"coverage": [{"group": "g2"}]},
+                        "meta": "ignored_second",
+                    },
+                ),
+                failed,
             ),
-            PipelineResult(
-                batch=batch,
-                outputs=OutputPaths(primary=Path(".")),
-                success=True,
-                metrics={
-                    "rows": 5,
-                    "tags": ["b"],
-                    "zarr": {"coverage": [{"group": "g2"}]},
-                    "meta": "ignored_second",
-                },
-            ),
-            failed,
-        ),
-    )
+        )
 
-    merged = ingestor._aggregate_metrics(ctx, state)  # pyright: ignore[reportArgumentType]
+        merged = ingestor._aggregate_metrics(ctx, state)  # pyright: ignore[reportArgumentType]
 
-    assert merged["rows"] == 15
-    assert merged["tags"] == ["a", "b"]
-    assert merged["meta"] == "first"
-    assert merged["zarr"]["coverage"] == [{"group": "g1"}, {"group": "g2"}]
+        assert merged["rows"] == 15
+        assert merged["tags"] == ["a", "b"]
+        assert merged["meta"] == "first"
+        assert merged["zarr"]["coverage"] == [{"group": "g1"}, {"group": "g2"}]

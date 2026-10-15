@@ -181,6 +181,11 @@ def test_legacy_cube_consolidates_to_dense_layout(tmp_path: Path) -> None:
 
     expected = _EPOCH + np.arange(_LEGACY_SLOTS, dtype=np.int64) * _CADENCE_NS
     assert np.array_equal(np.asarray(arr[:]), expected)
+    # xarray still opens the consolidated cube (chunk files are its read cost).
+    with xr.open_zarr(str(cube / "data"), consolidated=False) as ds:
+        assert "time" in ds.coords
+        assert ds.sizes["time"] == _LEGACY_SLOTS
+        assert np.array_equal(ds["time"].values, expected)
 
     wal_root = cube / ".firecube"
     assert wal_root.exists(), (
@@ -305,33 +310,3 @@ def test_multi_group_cube_consolidates_every_group(tmp_path: Path) -> None:
         assert arr.attrs.get(ATTR_PREALLOCATED) is True
         assert arr.attrs.get(ATTR_CONSOLIDATED_AT) is not None
         assert _count_time_chunk_files(cube, group=group) == _EXPECTED_CHUNK_FILE_COUNT
-
-
-def test_xarray_opens_consolidated_cube_with_collapsed_chunk_files(tmp_path: Path) -> None:
-    """After consolidation the on-disk chunk-file count drops from T to ceil(T/256).
-
-    The number of chunk files is a direct proxy for xarray's read cost on
-    object stores: each chunk file is a separate object read. Confirming the
-    file-count regression AND that ``xarray.open_zarr`` still succeeds proves
-    the layout change did not sacrifice consumer compatibility.
-    """
-    cube = tmp_path / "cube.zarr"
-    _create_legacy_cube(cube)
-
-    files_before = _count_time_chunk_files(cube)
-    assert files_before == _LEGACY_SLOTS
-
-    result = CliRunner().invoke(cli, _consolidate_args(cube))
-    assert result.exit_code == 0, result.output
-
-    files_after = _count_time_chunk_files(cube)
-    assert files_after == _EXPECTED_CHUNK_FILE_COUNT
-    assert files_after < files_before, (
-        f"consolidation must reduce chunk-file count; before={files_before} after={files_after}"
-    )
-
-    with xr.open_zarr(str(cube / "data"), consolidated=False) as ds:
-        assert "time" in ds.coords
-        assert ds.sizes["time"] == _LEGACY_SLOTS
-        expected = _EPOCH + np.arange(_LEGACY_SLOTS, dtype=np.int64) * _CADENCE_NS
-        assert np.array_equal(ds["time"].values, expected)

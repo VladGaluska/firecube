@@ -25,6 +25,8 @@ runtime error rather than a clean fail-fast message.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -162,3 +164,43 @@ def test_agents_md_install_block_matches_actual_fixtures() -> None:
         f"{sorted(missing)}. Update the block to keep the AI-agent "
         f"install instructions in sync with tests/fixtures/."
     )
+
+
+def test_architecture_marker_is_limited_to_architecture_tests(
+    tmp_path: Path,
+) -> None:
+    """``-m architecture`` must not select tests outside tests/architecture.
+
+    A throwaway unmarked test is collected together with the architecture
+    directory, so the architecture conftest hook sees an item outside its
+    directory. The old hook marked every collected item and selected it.
+    """
+    unmarked = tmp_path / "test_unmarked.py"
+    unmarked.write_text("def test_unmarked():\n    pass\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-o",
+            "addopts=",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            str(REPO_ROOT),
+            "-m",
+            "architecture",
+            "tests/architecture",
+            str(unmarked),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.returncode == 0, output
+    assert "tests/architecture/" in result.stdout and "::" in result.stdout, output
+    assert "test_unmarked" not in result.stdout, output

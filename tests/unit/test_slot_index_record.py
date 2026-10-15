@@ -76,19 +76,6 @@ def test_round_trip_preserves_fields() -> None:
         assert recovered.model.groups[k].mode == axis.mode
 
 
-def test_round_trip_with_correct_identity_hash_succeeds() -> None:
-    m = _make_model()
-    rec = SlotIndexModelRecord(
-        model=m,
-        identity_hash=m.identity_hash,
-        schema_version="v1",
-        recorded_at="2026-01-01T00:00:00Z",
-        recorded_by_run_id="r1",
-    )
-    recovered = SlotIndexModelRecord.from_json_bytes(rec.to_json_bytes())
-    assert recovered.identity_hash == m.identity_hash
-
-
 @pytest.mark.parametrize(
     "identity_hash",
     [
@@ -126,14 +113,10 @@ def test_to_json_bytes_does_not_embed_canonical_hash_in_model() -> None:
     assert "identity_hash" not in payload["model"]
 
 
-def test_from_json_bytes_rejects_empty_bytes() -> None:
+@pytest.mark.parametrize("payload", [b"", b"corrupt"], ids=["empty_bytes", "corrupt_json"])
+def test_from_json_bytes_rejects_non_json(payload: bytes) -> None:
     with pytest.raises(ManifestError, match="not valid JSON"):
-        SlotIndexModelRecord.from_json_bytes(b"")
-
-
-def test_from_json_bytes_rejects_corrupt_json() -> None:
-    with pytest.raises(ManifestError, match="not valid JSON"):
-        SlotIndexModelRecord.from_json_bytes(b"corrupt")
+        SlotIndexModelRecord.from_json_bytes(payload)
 
 
 def test_from_json_bytes_rejects_missing_fields() -> None:

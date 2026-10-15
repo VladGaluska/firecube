@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import subprocess
 import sys
@@ -131,45 +130,49 @@ def _runs_list(target: Path) -> list[dict[str, Any]]:
     return payload
 
 
-def test_timestamps_skipped_in_runs_list(tmp_path: Path) -> None:
-    """resume_existing run logs skipped count in runs list."""
+def test_timestamps_skipped_in_runs_list(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """One store through a fresh ingest and a resume over the same 30 days.
+
+    Each step is a former test of this module (step id = old test name): the
+    fresh run reports 0 skipped in its manifest and in ``chunks runs list``;
+    the resume run skips all 30 days and reports it in both surfaces.
+    """
     source = tmp_path / "source"
     target = tmp_path / "store.zarr"
     _generate_days(source, 1, 30)
 
-    _ingest(source, target)
-    _ingest(source, target, resume_existing=True)
+    fresh_manifest = _ingest(source, target)
 
-    assert max(run.get("timestamps_skipped", 0) for run in _runs_list(target)) == 30
+    with subtests.test(msg="test_timestamps_skipped_zero_when_no_skips"):
+        # Verified-correct: default 0 when nothing skipped.
+        assert fresh_manifest["metrics"]["pipeline"]["timestamps_skipped"] == 0
+        assert [run.get("timestamps_skipped") for run in _runs_list(target)] == [0]
+
+    resume_manifest = _ingest(source, target, resume_existing=True)
+
+    with subtests.test(msg="test_timestamps_skipped_in_manifest"):
+        # manifest has non-zero timestamps_skipped after resume.
+        assert resume_manifest["metrics"]["pipeline"]["timestamps_skipped"] == 30
+
+    with subtests.test(msg="test_timestamps_skipped_in_runs_list"):
+        # resume_existing run logs skipped count in runs list.
+        assert max(run.get("timestamps_skipped", 0) for run in _runs_list(target)) == 30
 
 
-def test_timestamps_skipped_in_manifest(tmp_path: Path) -> None:
-    """manifest has non-zero timestamps_skipped after resume."""
-    source = tmp_path / "source"
-    target = tmp_path / "store.zarr"
-    _generate_days(source, 1, 30)
+class _ExplodingMetrics:
+    """Typed-metrics stand-in whose ``pipeline`` read fails."""
 
-    _ingest(source, target)
-    manifest = _ingest(source, target, resume_existing=True)
-
-    assert manifest["metrics"]["pipeline"]["timestamps_skipped"] == 30
-
-
-def test_timestamps_skipped_zero_when_no_skips(tmp_path: Path) -> None:
-    """Verified-correct: default 0 when nothing skipped."""
-    source = tmp_path / "source"
-    target = tmp_path / "store.zarr"
-    _generate_days(source, 1, 5)
-
-    manifest = _ingest(source, target)
-    runs = _runs_list(target)
-
-    assert manifest["metrics"]["pipeline"]["timestamps_skipped"] == 0
-    assert [run.get("timestamps_skipped") for run in runs] == [0]
+    @property
+    def pipeline(self) -> Any:
+        raise RuntimeError("pipeline metrics unreadable")
 
 
 def test_extract_no_bare_except() -> None:
-    """grep asserts `except Exception` removed from _extract_timestamps_skipped."""
-    source = inspect.getsource(recording._extract_timestamps_skipped)
+    """A failure reading the metrics propagates instead of reading as 0 skipped.
 
-    assert "except Exception" not in source
+    Behavioural form of the former source grep (no ``except Exception`` in
+    ``_extract_timestamps_skipped``): a swallowed error would report 0 and hide
+    a broken metrics object in the run record.
+    """
+    with pytest.raises(RuntimeError, match="pipeline metrics unreadable"):
+        recording._extract_timestamps_skipped(_ExplodingMetrics())  # pyright: ignore[reportArgumentType]

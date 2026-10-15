@@ -16,32 +16,20 @@ from typing import Any
 
 import pytest
 
-
-@pytest.mark.unit
-def test_compressors_entry_must_be_dict():
-    from firecube.ingestor.api import ZarrArraySpec
-
-    compressors: Any = ([1, 2, 3],)
-    with pytest.raises(ValueError, match=r"compressors\[0\].*dict"):
-        ZarrArraySpec(name="x", shape=(10,), dtype="f4", compressors=compressors)
+_INVALID_CODEC_FIELD_ROWS: tuple[tuple[str, dict[str, Any], str], ...] = (
+    ("compressors_entry_must_be_dict", {"compressors": ([1, 2, 3],)}, r"compressors\[0\].*dict"),
+    ("serializer_must_be_dict", {"serializer": "bytes"}, r"serializer.*dict"),
+    ("compressors_must_be_tuple", {"compressors": {"name": "blosc"}}, r"compressors.*tuple"),
+)
 
 
 @pytest.mark.unit
-def test_serializer_must_be_dict():
+def test_invalid_codec_fields_are_rejected(subtests):
     from firecube.ingestor.api import ZarrArraySpec
 
-    serializer: Any = "bytes"
-    with pytest.raises(ValueError, match=r"serializer.*dict"):
-        ZarrArraySpec(name="x", shape=(10,), dtype="f4", serializer=serializer)
-
-
-@pytest.mark.unit
-def test_compressors_must_be_tuple():
-    from firecube.ingestor.api import ZarrArraySpec
-
-    compressors: Any = {"name": "blosc"}
-    with pytest.raises(ValueError, match=r"compressors.*tuple"):
-        ZarrArraySpec(name="x", shape=(10,), dtype="f4", compressors=compressors)
+    for row_id, kwargs, match in _INVALID_CODEC_FIELD_ROWS:
+        with subtests.test(msg=f"test_{row_id}"), pytest.raises(ValueError, match=match):
+            ZarrArraySpec(name="x", shape=(10,), dtype="f4", **kwargs)
 
 
 @pytest.mark.unit

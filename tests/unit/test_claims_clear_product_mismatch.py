@@ -18,6 +18,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -26,6 +27,7 @@ from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.unit
@@ -104,75 +106,83 @@ def _cli_env() -> dict[str, str]:
     return env
 
 
-def test_clear_claim_accepts_uri_when_domain_uses_logical_name(tmp_path: Path) -> None:
-    claim_path = _stale_claim(tmp_path)
-    manager = _manager(tmp_path)
+def test_claim_clear_product_name_matching(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "clear_claim_accepts_uri_when_domain_uses_logical_name", tmp_path) as (
+        workdir,
+        _,
+    ):
+        claim_path = _stale_claim(workdir)
+        manager = _manager(workdir)
 
-    try:
-        cleared = manager.clear_claim(
-            product=STORE_PRODUCT,
-            domain_id=DOMAIN.identifier,
-            force=False,
+        try:
+            cleared = manager.clear_claim(
+                product=STORE_PRODUCT,
+                domain_id=DOMAIN.identifier,
+                force=False,
+            )
+        finally:
+            manager.close()
+
+        assert cleared is True
+        assert not claim_path.exists()
+
+    with table_row(
+        subtests, "read_claim_by_domain_accepts_uri_when_domain_uses_logical_name", tmp_path
+    ) as (workdir, _):
+        _stale_claim(workdir)
+        manager = _manager(workdir)
+
+        try:
+            manager.list_claims(product=STORE_PRODUCT)
+            assert manager.repo.claims is not None
+            claim = manager.repo.claims.read_claim_by_domain(
+                product=STORE_PRODUCT,
+                domain=DOMAIN.identifier,
+            )
+        finally:
+            manager.close()
+
+        assert claim is not None
+        assert claim.product == STORE_PRODUCT
+        assert claim.domain == DOMAIN.identifier
+
+    with table_row(subtests, "clear_claim_still_rejects_malformed_domain", tmp_path) as (
+        workdir,
+        _,
+    ):
+        manager = _manager(workdir)
+
+        try:
+            with pytest.raises(ValueError):
+                manager.clear_claim(
+                    product=STORE_PRODUCT, domain_id="malformed_no_colons", force=False
+                )
+        finally:
+            manager.close()
+
+    with table_row(
+        subtests, "cli_all_stale_clears_claim_when_store_name_differs_from_logical_name", tmp_path
+    ) as (workdir, _):
+        claim_path = _stale_claim(workdir)
+        store_uri = StorageUri.from_local_path(workdir / STORE_PRODUCT).to_str()
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "chunks",
+                "claims",
+                "clear",
+                "--product-name",
+                store_uri,
+                "--workspace",
+                str(workdir / "workspace"),
+                "--all-stale",
+                "--yes-i-really-mean-it",
+            ],
+            env=_cli_env(),
         )
-    finally:
-        manager.close()
 
-    assert cleared is True
-    assert not claim_path.exists()
-
-
-def test_read_claim_by_domain_accepts_uri_when_domain_uses_logical_name(tmp_path: Path) -> None:
-    _stale_claim(tmp_path)
-    manager = _manager(tmp_path)
-
-    try:
-        manager.list_claims(product=STORE_PRODUCT)
-        assert manager.repo.claims is not None
-        claim = manager.repo.claims.read_claim_by_domain(
-            product=STORE_PRODUCT,
-            domain=DOMAIN.identifier,
-        )
-    finally:
-        manager.close()
-
-    assert claim is not None
-    assert claim.product == STORE_PRODUCT
-    assert claim.domain == DOMAIN.identifier
-
-
-def test_clear_claim_still_rejects_malformed_domain(tmp_path: Path) -> None:
-    manager = _manager(tmp_path)
-
-    try:
-        with pytest.raises(ValueError):
-            manager.clear_claim(product=STORE_PRODUCT, domain_id="malformed_no_colons", force=False)
-    finally:
-        manager.close()
-
-
-def test_cli_all_stale_clears_claim_when_store_name_differs_from_logical_name(
-    tmp_path: Path,
-) -> None:
-    claim_path = _stale_claim(tmp_path)
-    store_uri = StorageUri.from_local_path(tmp_path / STORE_PRODUCT).to_str()
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "chunks",
-            "claims",
-            "clear",
-            "--product-name",
-            store_uri,
-            "--workspace",
-            str(tmp_path / "workspace"),
-            "--all-stale",
-            "--yes-i-really-mean-it",
-        ],
-        env=_cli_env(),
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Cleared stale claims:" in result.output
-    assert DOMAIN.identifier in result.output
-    assert not claim_path.exists()
+        assert result.exit_code == 0, result.output
+        assert "Cleared stale claims:" in result.output
+        assert DOMAIN.identifier in result.output
+        assert not claim_path.exists()

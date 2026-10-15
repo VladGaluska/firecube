@@ -61,26 +61,17 @@ def _stored_attrs(store: Path) -> dict[str, object]:
     return dict(root[_GROUP].attrs)
 
 
-def test_first_write_emits_no_attr_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    logger = logging.getLogger("test.attrs.first")
-    store = tmp_path / "attrs-first.zarr"
-
-    with caplog.at_level(logging.WARNING, logger=logger.name):
-        _write(store, _dataset("2024-01-01", title="first"), mode="w", logger=logger)
-
-    assert "Group attributes differ" not in caplog.text
-    assert _stored_attrs(store)["title"] == "first"
-
-
 def test_second_write_warns_once_and_preserves_first_attrs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     logger = logging.getLogger("test.attrs.second")
     store = tmp_path / "attrs-second.zarr"
-    _write(store, _dataset("2024-01-01", title="first"), mode="w", logger=logger)
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        _write(store, _dataset("2024-01-01", title="first"), mode="w", logger=logger)
+    assert "Group attributes differ" not in caplog.text, "first write must not warn"
+    assert _stored_attrs(store)["title"] == "first"
+    caplog.clear()
 
     with caplog.at_level(logging.WARNING, logger=logger.name):
         _write(store, _dataset("2024-01-01T02:00", title="second"), mode="a", logger=logger)

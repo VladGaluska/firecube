@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import click
 import pytest
@@ -22,6 +23,7 @@ import pytest
 from firecube.cli._command_schemas import (  # pyright: ignore[reportMissingImports]
     IngestCommandConfig,
 )
+from tests.helpers.rows import table_row
 
 
 def _config(**overrides: object) -> IngestCommandConfig:
@@ -37,119 +39,104 @@ def _config(**overrides: object) -> IngestCommandConfig:
     return IngestCommandConfig(**values)  # type: ignore[arg-type]
 
 
-def test_valid_config_constructs() -> None:
-    config = _config()
+_FILE_TARGET = "file:///tmp/out.zarr"
+_S3_TARGET = "s3://bucket/out.zarr"
+_GS_UNSUPPORTED = (
+    "Target URI scheme 'gs' is not supported. Use a file:// URI for "
+    "--storage-type local, or an s3:// URI for --storage-type s3."
+)
+_FILE_WITH_S3 = (
+    "Target URI scheme 'file' is incompatible with --storage-type 's3'. "
+    "Use --storage-type local for file:// targets, or change --target to an "
+    "s3://-compatible URI."
+)
 
-    assert config.plugin == "cli_test_plugin"
-    assert config.output_format == "zarr"
-    assert config.options == {}
-
-
-def test_missing_write_mode_raises() -> None:
-    with pytest.raises(click.UsageError, match="--write-mode"):
-        _config(write_mode=None)
-
-
-def test_missing_storage_type_is_valid() -> None:
-    config = _config(storage_type=None, storage_driver=None)
-
-    assert config.storage_type is None
-    assert config.storage_driver is None
-
-
-def test_missing_storage_driver_is_valid() -> None:
-    config = _config(storage_driver=None)
-
-    assert config.storage_type == "local"
-    assert config.storage_driver is None
-
-
-def test_explicit_empty_product_name_raises() -> None:
-    with pytest.raises(click.UsageError, match="--product-name"):
-        _config(product_name="")
-
-
-def test_none_product_name_accepted() -> None:
-    assert _config(product_name=None).product_name is None
-
-
-def test_invalid_write_mode_raises() -> None:
-    with pytest.raises(click.UsageError, match="--write-mode must be one of"):
-        _config(write_mode="invalid")
-
-
-def test_storage_type_local_with_file_target_constructs() -> None:
-    config = _config(target="file:///tmp/out.zarr", storage_type="local")
-
-    assert config.target == "file:///tmp/out.zarr"
-    assert config.storage_type == "local"
-
-
-def test_storage_type_s3_with_s3_target_constructs() -> None:
-    config = _config(target="s3://bucket/out.zarr", storage_type="s3")
-
-    assert config.target == "s3://bucket/out.zarr"
-    assert config.storage_type == "s3"
+# (row id, overrides of _config, expected attribute values)
+_ACCEPTED: tuple[tuple[str, dict[str, object], dict[str, object]], ...] = (
+    (
+        "test_valid_config_constructs",
+        {},
+        {"plugin": "cli_test_plugin", "output_format": "zarr", "options": {}},
+    ),
+    (
+        "test_missing_storage_type_is_valid",
+        {"storage_type": None, "storage_driver": None},
+        {"storage_type": None, "storage_driver": None},
+    ),
+    (
+        "test_missing_storage_driver_is_valid",
+        {"storage_driver": None},
+        {"storage_type": "local", "storage_driver": None},
+    ),
+    ("test_none_product_name_accepted", {"product_name": None}, {"product_name": None}),
+    (
+        "test_storage_type_local_with_file_target_constructs",
+        {"target": _FILE_TARGET, "storage_type": "local"},
+        {"target": _FILE_TARGET, "storage_type": "local"},
+    ),
+    (
+        "test_storage_type_s3_with_s3_target_constructs",
+        {"target": _S3_TARGET, "storage_type": "s3"},
+        {"target": _S3_TARGET, "storage_type": "s3"},
+    ),
+    (
+        "test_uppercase_s3_scheme_behavior",
+        {"target": "S3://bucket/out.zarr", "storage_type": "s3"},
+        {"target": "S3://bucket/out.zarr", "storage_type": "s3"},
+    ),
+)
 
 
-def test_storage_type_s3_with_file_target_raises() -> None:
-    with pytest.raises(click.UsageError) as exc_info:
-        _config(target="file:///tmp/out.zarr", storage_type="s3")
+def test_accepted_configs_construct(subtests: Any, tmp_path: Path) -> None:
+    for row_id, overrides, expected in _ACCEPTED:
+        with table_row(subtests, row_id, tmp_path):
+            config = _config(**overrides)
 
-    assert (
-        "Target URI scheme 'file' is incompatible with --storage-type 's3'. "
-        "Use --storage-type local for file:// targets, or change --target to an "
-        "s3://-compatible URI."
-    ) in str(exc_info.value)
+            for attr, value in expected.items():
+                assert getattr(config, attr) == value, attr
 
 
-def test_storage_type_local_with_s3_target_raises() -> None:
-    with pytest.raises(click.UsageError) as exc_info:
-        _config(target="s3://bucket/out.zarr", storage_type="local")
-
-    assert (
+# (row id, overrides of _config, substring of the UsageError message)
+_REJECTED: tuple[tuple[str, dict[str, object], str], ...] = (
+    ("test_missing_write_mode_raises", {"write_mode": None}, "--write-mode"),
+    ("test_explicit_empty_product_name_raises", {"product_name": ""}, "--product-name"),
+    ("test_invalid_write_mode_raises", {"write_mode": "invalid"}, "--write-mode must be one of"),
+    (
+        "test_storage_type_s3_with_file_target_raises",
+        {"target": _FILE_TARGET, "storage_type": "s3"},
+        _FILE_WITH_S3,
+    ),
+    (
+        "test_storage_type_local_with_s3_target_raises",
+        {"target": _S3_TARGET, "storage_type": "local"},
         "Target URI scheme 's3' is incompatible with --storage-type 'local'. "
-        "Use --storage-type s3 for s3:// targets, or change --target to a file:// URI."
-    ) in str(exc_info.value)
+        "Use --storage-type s3 for s3:// targets, or change --target to a file:// URI.",
+    ),
+    (
+        "test_unsupported_scheme_gs_with_local_storage_type_raises",
+        {"target": "gs://bucket/out.zarr", "storage_type": "local"},
+        _GS_UNSUPPORTED,
+    ),
+    (
+        "test_unsupported_scheme_gs_with_s3_storage_type_raises",
+        {"target": "gs://bucket/out.zarr", "storage_type": "s3"},
+        _GS_UNSUPPORTED,
+    ),
+    (
+        "test_aggregation_missing_driver_and_target_storage_type_mismatch",
+        {"target": _FILE_TARGET, "storage_type": "s3", "storage_driver": None},
+        _FILE_WITH_S3,
+    ),
+)
 
 
-def test_unsupported_scheme_gs_with_local_storage_type_raises() -> None:
-    with pytest.raises(click.UsageError) as exc_info:
-        _config(target="gs://bucket/out.zarr", storage_type="local")
+def test_rejected_configs_raise_usage_error(subtests: Any, tmp_path: Path) -> None:
+    for row_id, overrides, message in _REJECTED:
+        with table_row(subtests, row_id, tmp_path):
+            with pytest.raises(click.UsageError) as exc_info:
+                _config(**overrides)
 
-    assert (
-        "Target URI scheme 'gs' is not supported. Use a file:// URI for "
-        "--storage-type local, or an s3:// URI for --storage-type s3."
-    ) in str(exc_info.value)
-
-
-def test_unsupported_scheme_gs_with_s3_storage_type_raises() -> None:
-    with pytest.raises(click.UsageError) as exc_info:
-        _config(target="gs://bucket/out.zarr", storage_type="s3")
-
-    assert (
-        "Target URI scheme 'gs' is not supported. Use a file:// URI for "
-        "--storage-type local, or an s3:// URI for --storage-type s3."
-    ) in str(exc_info.value)
-
-
-def test_uppercase_s3_scheme_behavior() -> None:
-    config = _config(target="S3://bucket/out.zarr", storage_type="s3")
-
-    assert config.target == "S3://bucket/out.zarr"
-    assert config.storage_type == "s3"
-
-
-def test_aggregation_missing_driver_and_target_storage_type_mismatch() -> None:
-    with pytest.raises(click.UsageError) as exc_info:
-        _config(target="file:///tmp/out.zarr", storage_type="s3", storage_driver=None)
-
-    message = str(exc_info.value)
-    assert (
-        "Target URI scheme 'file' is incompatible with --storage-type 's3'. "
-        "Use --storage-type local for file:// targets, or change --target to an "
-        "s3://-compatible URI."
-    ) in message
+            assert message in str(exc_info.value)
 
 
 def test_storage_type_not_mutated_by_validation() -> None:

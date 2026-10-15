@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,6 +29,7 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 
 
 class _WrongPluginToRuntimeIngestor(BaseIngestor):
@@ -63,20 +65,19 @@ class _WrongRuntimeToPluginIngestor(BaseIngestor):
 
 
 @pytest.mark.unit
-def test_plugin_hook_annotated_runtime_context_is_rejected():
-    ingestor = _WrongPluginToRuntimeIngestor(name="boundary_plugin_to_runtime_test")  # pyright: ignore[reportAbstractUsage]
-    with pytest.raises(
-        ConfigurationError,
-        match=r"must use PluginContext, not RuntimeIngestContext",
-    ):
-        ingestor._validate_context_hook_signatures()
+def test_context_hook_annotation_validation(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "plugin_hook_annotated_runtime_context_is_rejected", tmp_path):
+        ingestor = _WrongPluginToRuntimeIngestor(name="boundary_plugin_to_runtime_test")  # pyright: ignore[reportAbstractUsage]
+        with pytest.raises(
+            ConfigurationError,
+            match=r"must use PluginContext, not RuntimeIngestContext",
+        ):
+            ingestor._validate_context_hook_signatures()
 
-
-@pytest.mark.unit
-def test_runtime_hook_annotated_plugin_context_is_rejected():
-    ingestor = _WrongRuntimeToPluginIngestor(name="boundary_runtime_to_plugin_test")  # pyright: ignore[reportAbstractUsage]
-    with pytest.raises(
-        ConfigurationError,
-        match=r"must use RuntimeIngestContext, not PluginContext",
-    ):
-        ingestor._validate_context_hook_signatures()
+    with table_row(subtests, "runtime_hook_annotated_plugin_context_is_rejected", tmp_path):
+        ingestor = _WrongRuntimeToPluginIngestor(name="boundary_runtime_to_plugin_test")  # pyright: ignore[reportAbstractUsage]
+        with pytest.raises(
+            ConfigurationError,
+            match=r"must use RuntimeIngestContext, not PluginContext",
+        ):
+            ingestor._validate_context_hook_signatures()

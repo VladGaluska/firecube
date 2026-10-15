@@ -54,14 +54,3 @@ def test_preallocate_preserves_static_array_shape(tmp_path: Path) -> None:
     root = zarr.open_group(str(tmp_path), mode="r", zarr_format=3)
     assert cast(Any, root["data/data"]).shape == (1000, 10)
     assert cast(Any, root["data/lat"]).shape == (10,)
-
-
-def test_preallocate_substitutes_time_indexed_shape(tmp_path: Path) -> None:
-    """Preallocate must substitute the time-axis extent into time-indexed array shapes."""
-    runner = CliRunner()
-    result = runner.invoke(cli, _args(f"file://{tmp_path}"))
-
-    assert result.exit_code == 0, f"CLI failed: {result.output}"
-
-    root = zarr.open_group(str(tmp_path), mode="r", zarr_format=3)
-    assert cast(Any, root["data/data"]).shape == (1000, 10)

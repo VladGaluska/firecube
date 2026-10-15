@@ -34,15 +34,6 @@ def test_run_entries_cache_scope_sets_cache(temp_workspace):
         assert cache.entries_by_product == {}
 
 
-def test_run_entries_cache_scope_restores_none(temp_workspace):
-    repo = _repo(temp_workspace)
-
-    with repo.run_entries_cache_scope():
-        assert repo._run_entries_cache is not None
-
-    assert repo._run_entries_cache is None
-
-
 def test_run_entries_cache_scope_restores_nested_scopes(temp_workspace):
     repo = _repo(temp_workspace)
 

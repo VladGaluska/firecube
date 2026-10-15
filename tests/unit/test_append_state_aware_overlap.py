@@ -32,6 +32,7 @@ from firecube.ingestor.errors import (
     InsertRefusedError,
 )
 from firecube.ingestor.runtime.zarr.append_services import AppendResumeService
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -106,47 +107,23 @@ def test_no_overlap_returns_append_only(tmp_path: Path) -> None:
     assert result.new_values == batch.tolist()
 
 
-def test_full_overlap_contiguous_state1_returns_region_overwrite(tmp_path: Path) -> None:
+def test_full_overlap_returns_region_overwrite(subtests, tmp_path: Path) -> None:
     times = _times("2024-01-01T00", "2024-01-01T01", "2024-01-01T02")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([1, 1, 1], dtype=np.uint8),
-    )
+    for row_id, state in [
+        ("full_overlap_contiguous_state1_returns_region_overwrite", [1, 1, 1]),
+        ("full_overlap_state2_refill_returns_region_overwrite", [2, 2, 2]),
+        ("full_overlap_state3_failed_returns_region_overwrite", [3, 3, 3]),
+    ]:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            group = _open_group_with_coord(
+                workdir, times=times, state=np.array(state, dtype=np.uint8)
+            )
 
-    result = _make_service().classify_incoming(times, group)
+            result = _make_service().classify_incoming(times, group)
 
-    assert result.mode == "region_overwrite"
-    _assert_slice(result.overwrite_slice, 0, 3)
-    assert result.new_values == []
-
-
-def test_full_overlap_state2_refill_returns_region_overwrite(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([2, 2], dtype=np.uint8),
-    )
-
-    result = _make_service().classify_incoming(times, group)
-
-    assert result.mode == "region_overwrite"
-    _assert_slice(result.overwrite_slice, 0, 2)
-
-
-def test_full_overlap_state3_failed_returns_region_overwrite(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([3, 3], dtype=np.uint8),
-    )
-
-    result = _make_service().classify_incoming(times, group)
-
-    assert result.mode == "region_overwrite"
-    _assert_slice(result.overwrite_slice, 0, 2)
+            assert result.mode == "region_overwrite"
+            _assert_slice(result.overwrite_slice, 0, 3)
+            assert result.new_values == []
 
 
 def test_split_prefix_overlap_plus_tail(tmp_path: Path) -> None:
@@ -169,100 +146,56 @@ def test_split_prefix_overlap_plus_tail(tmp_path: Path) -> None:
     assert result.new_values == batch[2:].tolist()
 
 
-def test_insert_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(tmp_path, times=_times("2024-01-01T00", "2024-01-01T02"))
-
-    with pytest.raises(InsertRefusedError) as exc_info:
-        _make_service().classify_incoming(_times("2024-01-01T01"), group)
-
-    assert exc_info.value.reason == "insert"
+def _hours(*hours: int | None) -> np.ndarray:
+    return _times(*("NaT" if h is None else f"2024-01-01T{h:02d}" for h in hours))
 
 
-def test_non_contiguous_overlap_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(
-        tmp_path,
-        times=_times(
-            "2024-01-01T00",
-            "2024-01-01T01",
-            "2024-01-01T02",
-            "2024-01-01T03",
-            "2024-01-01T04",
-            "2024-01-01T05",
+def test_classify_incoming_refusals(subtests, tmp_path: Path) -> None:
+    append_refused = AppendOverwriteRefused
+    rows = [
+        ("insert_refused", [0, 2], None, [1], InsertRefusedError, "insert"),
+        (
+            "non_contiguous_overlap_refused",
+            [0, 1, 2, 3, 4, 5],
+            None,
+            [0, 5],
+            append_refused,
+            "non_contiguous",
         ),
-    )
+        ("incoming_duplicates_refused", [0], None, [1, 1], append_refused, "duplicates_incoming"),
+        (
+            "existing_duplicates_refused",
+            [0, 0, 1],
+            None,
+            [2],
+            DuplicateExistingTimestampsError,
+            "duplicates_existing",
+        ),
+        ("incoming_nat_refused", [0], None, [None], append_refused, "nat_incoming"),
+        ("existing_nat_refused", [0, None], None, [1], append_refused, "nat_existing"),
+        # An unsorted axis makes ``coord.values[-1]`` an unreliable tail marker, so the
+        # classifier refuses before any state-aware overlap logic, whatever the state.
+        (
+            "unsorted_existing_refused_regardless_of_state",
+            [2, 0, 1],
+            [1, 2, 3],
+            [0, 1, 3],
+            append_refused,
+            "unsorted_existing_coord",
+        ),
+    ]
+    for row_id, existing, state, batch, exc, reason in rows:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            group = _open_group_with_coord(
+                workdir,
+                times=_hours(*existing),
+                state=None if state is None else np.array(state, dtype=np.uint8),
+            )
 
-    with pytest.raises(AppendOverwriteRefused) as exc_info:
-        _make_service().classify_incoming(
-            _times("2024-01-01T00", "2024-01-01T05"),
-            group,
-        )
+            with pytest.raises(exc) as exc_info:
+                _make_service().classify_incoming(_hours(*batch), group)
 
-    assert exc_info.value.reason == "non_contiguous"
-
-
-def test_incoming_duplicates_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(tmp_path, times=_times("2024-01-01T00"))
-
-    with pytest.raises(AppendOverwriteRefused) as exc_info:
-        _make_service().classify_incoming(
-            _times("2024-01-01T01", "2024-01-01T01"),
-            group,
-        )
-
-    assert exc_info.value.reason == "duplicates_incoming"
-
-
-def test_existing_duplicates_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(
-        tmp_path,
-        times=_times("2024-01-01T00", "2024-01-01T00", "2024-01-01T01"),
-    )
-
-    with pytest.raises(DuplicateExistingTimestampsError) as exc_info:
-        _make_service().classify_incoming(_times("2024-01-01T02"), group)
-
-    assert exc_info.value.reason == "duplicates_existing"
-
-
-def test_incoming_nat_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(tmp_path, times=_times("2024-01-01T00"))
-
-    with pytest.raises(AppendOverwriteRefused) as exc_info:
-        _make_service().classify_incoming(_times("NaT"), group)
-
-    assert exc_info.value.reason == "nat_incoming"
-
-
-def test_existing_nat_refused(tmp_path: Path) -> None:
-    group = _open_group_with_coord(
-        tmp_path,
-        times=_times("2024-01-01T00", "NaT"),
-    )
-
-    with pytest.raises(AppendOverwriteRefused) as exc_info:
-        _make_service().classify_incoming(_times("2024-01-01T01"), group)
-
-    assert exc_info.value.reason == "nat_existing"
-
-
-def test_unsorted_existing_refused_regardless_of_state(tmp_path: Path) -> None:
-    """unsorted existing coord refuses BEFORE any state-aware overlap logic.
-
-    Previously (Option A) unsorted stores still classified. supersedes that:
-    an unsorted axis makes `coord.values[-1]` an unreliable tail marker, so the
-    classifier refuses regardless of the state pattern on the existing slots.
-    """
-    group = _open_group_with_coord(
-        tmp_path,
-        times=_times("2024-01-01T02", "2024-01-01T00", "2024-01-01T01"),
-        state=np.array([1, 2, 3], dtype=np.uint8),
-    )
-    batch = _times("2024-01-01T00", "2024-01-01T01", "2024-01-01T03")
-
-    with pytest.raises(AppendOverwriteRefused) as exc_info:
-        _make_service().classify_incoming(batch, group)
-
-    assert exc_info.value.reason == "unsorted_existing_coord"
+            assert exc_info.value.reason == reason
 
 
 def test_classifier_uses_configured_append_dim(tmp_path: Path) -> None:
@@ -277,20 +210,6 @@ def test_classifier_uses_configured_append_dim(tmp_path: Path) -> None:
 
     assert result.mode == "append_only"
     assert result.new_values == batch.tolist()
-
-
-def test_state1_slot_skipped_on_resume(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01", "2024-01-01T02")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([1, 1, 1], dtype=np.uint8),
-    )
-    incoming = {pd.Timestamp("2024-01-01T01:00:00")}
-
-    result = _make_service().overlapping_values_state_aware(incoming, group)
-
-    assert result == {pd.Timestamp("2024-01-01T01:00:00")}
 
 
 def test_malformed_units_propagates_loudly(tmp_path: Path) -> None:
@@ -328,77 +247,25 @@ def test_malformed_units_propagates_loudly(tmp_path: Path) -> None:
     assert "totally not valid" in message
 
 
-def test_state2_slot_allowed_through_on_resume(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01", "2024-01-01T02")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([1, 2, 1], dtype=np.uint8),
-    )
-    incoming = {pd.Timestamp("2024-01-01T01:00:00")}
+def test_overlapping_values_state_aware(subtests, tmp_path: Path) -> None:
+    # state 1 counts as an overlap; states 2 (deleted) and 3 (failed) are refillable.
+    rows = [
+        ("state1_slot_skipped_on_resume", [0, 1, 2], [1, 1, 1], [1], [1]),
+        ("state2_slot_allowed_through_on_resume", [0, 1, 2], [1, 2, 1], [1], []),
+        ("state3_slot_allowed_through_on_resume", [0, 1], [3, 3], [0, 1], []),
+        ("partial_skip_mixed_states", [0, 1, 2], [1, 2, 3], [0, 1, 2, 3], [0]),
+        ("empty_incoming_returns_empty", [0], [1], [], []),
+        ("no_overlap_returns_empty", [0, 1], [1, 1], [5], []),
+    ]
+    stamp = "2024-01-01T{:02d}:00:00".format
+    for row_id, existing, state, incoming, expected in rows:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            group = _open_group_with_coord(
+                workdir, times=_hours(*existing), state=np.array(state, dtype=np.uint8)
+            )
 
-    result = _make_service().overlapping_values_state_aware(incoming, group)
+            result = _make_service().overlapping_values_state_aware(
+                {pd.Timestamp(stamp(h)) for h in incoming}, group
+            )
 
-    assert result == set(), "state=2 (deleted) slot must be refillable, not counted as overlap"
-
-
-def test_state3_slot_allowed_through_on_resume(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([3, 3], dtype=np.uint8),
-    )
-    incoming = {
-        pd.Timestamp("2024-01-01T00:00:00"),
-        pd.Timestamp("2024-01-01T01:00:00"),
-    }
-
-    result = _make_service().overlapping_values_state_aware(incoming, group)
-
-    assert result == set(), "state=3 (failed_batch) slots must be refillable"
-
-
-def test_partial_skip_mixed_states(tmp_path: Path) -> None:
-    times = _times(
-        "2024-01-01T00",
-        "2024-01-01T01",
-        "2024-01-01T02",
-    )
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([1, 2, 3], dtype=np.uint8),
-    )
-    incoming = {
-        pd.Timestamp("2024-01-01T00:00:00"),
-        pd.Timestamp("2024-01-01T01:00:00"),
-        pd.Timestamp("2024-01-01T02:00:00"),
-        pd.Timestamp("2024-01-01T03:00:00"),
-    }
-
-    result = _make_service().overlapping_values_state_aware(incoming, group)
-
-    assert result == {pd.Timestamp("2024-01-01T00:00:00")}
-
-
-def test_empty_incoming_returns_empty(tmp_path: Path) -> None:
-    group = _open_group_with_coord(tmp_path, times=_times("2024-01-01T00"))
-
-    result = _make_service().overlapping_values_state_aware(set(), group)
-
-    assert result == set()
-
-
-def test_no_overlap_returns_empty(tmp_path: Path) -> None:
-    times = _times("2024-01-01T00", "2024-01-01T01")
-    group = _open_group_with_coord(
-        tmp_path,
-        times=times,
-        state=np.array([1, 1], dtype=np.uint8),
-    )
-    incoming = {pd.Timestamp("2024-01-01T05:00:00")}
-
-    result = _make_service().overlapping_values_state_aware(incoming, group)
-
-    assert result == set()
+            assert result == {pd.Timestamp(stamp(h)) for h in expected}

@@ -16,9 +16,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from firecube.core.controlplane.types import IndexEnsuredEvent
+from tests.helpers.rows import table_row
 
 
 def test_index_ensured_event_constructs_and_serializes() -> None:
@@ -47,43 +51,27 @@ def test_index_ensured_event_constructs_and_serializes() -> None:
     }
 
 
-def test_index_ensured_event_rejects_unknown_outcome() -> None:
-    with pytest.raises(ValueError, match="outcome"):
-        IndexEnsuredEvent(
-            run_id="r1",
-            product="p1",
-            identity_hash="abc",
-            axis_kinds=("integer",),
-            groups=("data",),
-            outcome="badval",  # type: ignore[arg-type]
-            timestamp="2026-08-19T12:00:00Z",
-        )
+def test_index_ensured_event_rejects_invalid_field(subtests: Any, tmp_path: Path) -> None:
+    rows: tuple[tuple[str, str, object, type[Exception]], ...] = (
+        ("test_index_ensured_event_rejects_unknown_outcome", "outcome", "badval", ValueError),
+        ("test_index_ensured_event_rejects_axis_kinds_list", "axis_kinds", ["integer"], TypeError),
+        ("test_index_ensured_event_rejects_groups_list", "groups", ["data"], TypeError),
+    )
+    for row_id, field, value, error in rows:
+        with table_row(subtests, row_id, tmp_path):
+            fields: dict[str, Any] = {
+                "run_id": "r1",
+                "product": "p1",
+                "identity_hash": "abc",
+                "axis_kinds": ("integer",),
+                "groups": ("data",),
+                "outcome": "created",
+                "timestamp": "2026-08-19T12:00:00Z",
+            }
+            fields[field] = value
 
-
-def test_index_ensured_event_rejects_axis_kinds_list() -> None:
-    with pytest.raises(TypeError, match="axis_kinds"):
-        IndexEnsuredEvent(
-            run_id="r1",
-            product="p1",
-            identity_hash="abc",
-            axis_kinds=["integer"],  # type: ignore[arg-type]
-            groups=("data",),
-            outcome="created",
-            timestamp="2026-08-19T12:00:00Z",
-        )
-
-
-def test_index_ensured_event_rejects_groups_list() -> None:
-    with pytest.raises(TypeError, match="groups"):
-        IndexEnsuredEvent(
-            run_id="r1",
-            product="p1",
-            identity_hash="abc",
-            axis_kinds=("integer",),
-            groups=["data"],  # type: ignore[arg-type]
-            outcome="created",
-            timestamp="2026-08-19T12:00:00Z",
-        )
+            with pytest.raises(error, match=field):
+                IndexEnsuredEvent(**fields)
 
 
 def test_index_ensured_event_requires_all_fields() -> None:

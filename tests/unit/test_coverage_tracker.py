@@ -15,15 +15,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from firecube.core.controlplane.types import SpanCoverage
 from firecube.ingestor.runtime.coverage import CoverageTracker
+from tests.helpers.rows import table_row
 
 
-class TestSingleGroupAccumulation:
-    def test_single_write_produces_one_coverage(self):
+def test_coverage_tracker_contract(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "single_write_produces_one_coverage", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write(
             group="vis_06",
@@ -44,7 +47,7 @@ class TestSingleGroupAccumulation:
         assert cov.time_max == "2024-01-01T00:00:00Z"
         assert cov.state_array == "vis_06/firecube_timestamp_state"
 
-    def test_multiple_writes_same_group_accumulate(self):
+    with table_row(subtests, "multiple_writes_same_group_accumulate", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write(
             "g1", ["g1/a"], ts_index=0, time_val="2024-01-01T00:00:00Z", aligned=True
@@ -65,9 +68,7 @@ class TestSingleGroupAccumulation:
         assert cov.time_min == "2024-01-01T00:00:00Z"
         assert cov.time_max == "2024-01-01T02:00:00Z"
 
-
-class TestMultiGroup:
-    def test_separate_groups_produce_separate_coverage(self):
+    with table_row(subtests, "separate_groups_produce_separate_coverage", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write(
             "alpha", ["alpha/x"], ts_index=0, time_val="2024-01-01T00:00:00Z", aligned=True
@@ -83,9 +84,7 @@ class TestMultiGroup:
         assert result[0].time_index_ranges == [[0, 0]]
         assert result[1].time_index_ranges == [[5, 5]]
 
-
-class TestContiguousRangeMerging:
-    def test_contiguous_indices_merge_into_single_range(self):
+    with table_row(subtests, "contiguous_indices_merge_into_single_range", tmp_path):
         tracker = CoverageTracker()
         for i in [3, 4, 5, 6]:
             tracker.record_write(
@@ -95,7 +94,7 @@ class TestContiguousRangeMerging:
         cov = tracker.build_coverage()[0]
         assert cov.time_index_ranges == [[3, 6]]
 
-    def test_non_contiguous_indices_produce_multiple_ranges(self):
+    with table_row(subtests, "non_contiguous_indices_produce_multiple_ranges", tmp_path):
         tracker = CoverageTracker()
         for i in [0, 1, 5, 6, 10]:
             tracker.record_write("g", ["g/a"], ts_index=i, time_val=None, aligned=True)
@@ -103,13 +102,11 @@ class TestContiguousRangeMerging:
         cov = tracker.build_coverage()[0]
         assert cov.time_index_ranges == [[0, 1], [5, 6], [10, 10]]
 
-    def test_empty_tracker_produces_empty_list(self):
+    with table_row(subtests, "empty_tracker_produces_empty_list", tmp_path):
         tracker = CoverageTracker()
         assert tracker.build_coverage() == []
 
-
-class TestTimeBounds:
-    def test_datetime_objects_converted(self):
+    with table_row(subtests, "datetime_objects_converted", tmp_path):
         tracker = CoverageTracker()
         dt = datetime(2024, 3, 15, 12, 0, 0, tzinfo=UTC)
         tracker.record_write("g", ["g/a"], ts_index=0, time_val=dt, aligned=True)
@@ -118,7 +115,7 @@ class TestTimeBounds:
         assert cov.time_min == "2024-03-15T12:00:00+00:00"
         assert cov.time_max == "2024-03-15T12:00:00+00:00"
 
-    def test_np_datetime64_converted(self):
+    with table_row(subtests, "np_datetime64_converted", tmp_path):
         tracker = CoverageTracker()
         ts = np.datetime64("2024-07-20T10:30:00", "ns")
         tracker.record_write("g", ["g/a"], ts_index=0, time_val=ts, aligned=True)
@@ -127,7 +124,7 @@ class TestTimeBounds:
         assert cov.time_min == "2024-07-20T10:30:00.000000000Z"
         assert cov.time_max == "2024-07-20T10:30:00.000000000Z"
 
-    def test_none_time_val_skips_bounds(self):
+    with table_row(subtests, "none_time_val_skips_bounds", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write("g", ["g/a"], ts_index=0, time_val=None, aligned=True)
 
@@ -135,23 +132,21 @@ class TestTimeBounds:
         assert cov.time_min is None
         assert cov.time_max is None
 
-
-class TestBuildCoverageSchema:
-    def test_state_array_uses_custom_name(self):
+    with table_row(subtests, "state_array_uses_custom_name", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write("g", ["g/a"], ts_index=0, time_val=None, aligned=True)
 
         cov = tracker.build_coverage(state_array_name="custom_state")[0]
         assert cov.state_array == "g/custom_state"
 
-    def test_state_deleted_value_default(self):
+    with table_row(subtests, "state_deleted_value_default", tmp_path):
         tracker = CoverageTracker()
         tracker.record_write("g", ["g/a"], ts_index=0, time_val=None, aligned=True)
 
         cov = tracker.build_coverage()[0]
         assert cov.state_deleted_value == 2
 
-    def test_timestamps_written_property(self):
+    with table_row(subtests, "timestamps_written_property", tmp_path):
         tracker = CoverageTracker()
         for i in range(5):
             tracker.record_write("g", ["g/a"], ts_index=i, time_val=None, aligned=True)
@@ -159,7 +154,7 @@ class TestBuildCoverageSchema:
         cov = tracker.build_coverage()[0]
         assert cov.timestamps_written == 5
 
-    def test_api_not_reexported(self):
+    with table_row(subtests, "api_not_reexported", tmp_path):
         import firecube.ingestor.api as api_module
 
         assert not hasattr(api_module, "CoverageTracker")

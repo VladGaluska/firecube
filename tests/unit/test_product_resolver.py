@@ -39,21 +39,15 @@ def test_resolve_file_uri_returns_product_identity() -> None:
     assert identity.product_uri.authority is None
 
 
-def test_resolve_bare_name_rejected_with_full_uri_hint() -> None:
-    with pytest.raises(ValueError, match="full URI"):
-        ProductResolver.resolve("TEST_PRODUCT.zarr", "zarr", product_name="TEST_PRODUCT")
-
-
-def test_resolve_absolute_path_mentions_file_uri() -> None:
-    with pytest.raises(ValueError, match="file://"):
-        ProductResolver.resolve("/abs/path", "zarr", product_name="abs")
-
-
-def test_resolve_relative_path_mentions_rejected() -> None:
-    with pytest.raises(ValueError, match="rejected"):
-        ProductResolver.resolve("./relative", "zarr", product_name="relative")
-
-
-def test_resolve_invalid_uri_propagates_parse_error() -> None:
-    with pytest.raises(ValueError, match="unsupported"):
-        ProductResolver.resolve("ftp://host/path", "zarr", product_name="path")
+@pytest.mark.parametrize(
+    ("uri", "match"),
+    [
+        pytest.param("TEST_PRODUCT.zarr", "full URI", id="bare_name_rejected_with_full_uri_hint"),
+        pytest.param("/abs/path", "file://", id="absolute_path_mentions_file_uri"),
+        pytest.param("./relative", "rejected", id="relative_path_mentions_rejected"),
+        pytest.param("ftp://host/path", "unsupported", id="invalid_uri_propagates_parse_error"),
+    ],
+)
+def test_resolve_rejects_non_uri_inputs(uri: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        ProductResolver.resolve(uri, "zarr", product_name="p")

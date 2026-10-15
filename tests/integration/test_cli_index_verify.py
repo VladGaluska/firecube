@@ -39,6 +39,7 @@ from firecube.core.controlplane.types import (
     ResolvedIndexRecord,
     canonical_index_bytes,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.integration
 
@@ -153,17 +154,27 @@ def test_verify_help_lists_required_flags() -> None:
     assert "--plugin" in result.output
 
 
-def test_verify_valid_record_exits_zero(tmp_path: Path) -> None:
+def test_verify_valid_record_is_read_only(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """One verify of a valid record: exit 0 with the hash, and nothing written."""
     cube = tmp_path / "valid_cube"
     cube.mkdir()
     record = _seed_record(cube)
+    current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
+    original_bytes = current_json.read_bytes()
+    original_mtime = current_json.stat().st_mtime_ns
 
     result = CliRunner().invoke(cli, _verify_args(cube))
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    # Truncated identity_hash prefix helps operators grep logs.
-    assert record.identity_hash[:16] in result.stdout
+    with subtests.test(msg="test_verify_valid_record_exits_zero"):
+        assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "VERIFIED" in result.stdout
+        # Truncated identity_hash prefix helps operators grep logs.
+        assert record.identity_hash[:16] in result.stdout
+
+    with subtests.test(msg="test_verify_valid_record_does_not_write_to_disk"):
+        assert current_json.read_bytes() == original_bytes
+        assert current_json.stat().st_mtime_ns == original_mtime
+        assert record.identity_hash[:16] in result.stdout
 
 
 def test_verify_corrupt_record_exits_one_with_identity_hash_mismatch(tmp_path: Path) -> None:
@@ -200,18 +211,25 @@ def test_verify_no_record_exits_3(tmp_path: Path) -> None:
     assert "No index record" in result.stderr
 
 
-def test_verify_plugin_match_exits_0(tmp_path: Path) -> None:
-    cube = tmp_path / "plugin_match_cube"
-    cube.mkdir()
-    record = _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+# (row id = former test name, plugin that both rebuilds and verifies the cube)
+_PLUGIN_MATCH_ROWS = (
+    ("test_verify_plugin_match_exits_0", "index_spec_single"),
+    ("test_verify_plugin_uses_lowercase_time_dim_name", "index_spec_custom_dim"),
+)
 
-    result = CliRunner().invoke(
-        cli, _verify_args(cube, "index_spec_single", "--plugin", "index_spec_single")
-    )
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    assert record.identity_hash[:16] in result.stdout
+def test_verify_plugin_match_exits_0(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    for row_id, plugin in _PLUGIN_MATCH_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            cube = workdir / "plugin_match_cube"
+            cube.mkdir()
+            record = _rebuild_cube(cube, plugin, plugin)
+
+            result = CliRunner().invoke(cli, _verify_args(cube, plugin, "--plugin", plugin))
+
+            assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            assert "VERIFIED" in result.stdout
+            assert record.identity_hash[:16] in result.stdout
 
 
 def test_verify_plugin_mismatch_exits_1(tmp_path: Path) -> None:
@@ -255,21 +273,6 @@ def test_verify_attrs_absent_exits_0(tmp_path: Path) -> None:
     assert record.identity_hash[:16] in result.stdout
 
 
-def test_verify_plugin_uses_lowercase_time_dim_name(tmp_path: Path) -> None:
-    cube = tmp_path / "custom_dim_cube"
-    cube.mkdir()
-    record = _rebuild_cube(cube, "index_spec_custom_dim", "index_spec_custom_dim")
-
-    result = CliRunner().invoke(
-        cli,
-        _verify_args(cube, "index_spec_custom_dim", "--plugin", "index_spec_custom_dim"),
-    )
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    assert record.identity_hash[:16] in result.stdout
-
-
 def test_verify_missing_product_name_raises_click_usage_error(tmp_path: Path) -> None:
     cube = tmp_path / "any_cube"
     cube.mkdir()
@@ -280,19 +283,3 @@ def test_verify_missing_product_name_raises_click_usage_error(tmp_path: Path) ->
 
     assert result.exit_code == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "--product-name" in result.stderr
-
-
-def test_verify_valid_record_does_not_write_to_disk(tmp_path: Path) -> None:
-    cube = tmp_path / "readonly_cube"
-    cube.mkdir()
-    record = _seed_record(cube)
-    current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
-    original_bytes = current_json.read_bytes()
-    original_mtime = current_json.stat().st_mtime_ns
-
-    result = CliRunner().invoke(cli, _verify_args(cube))
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert current_json.read_bytes() == original_bytes
-    assert current_json.stat().st_mtime_ns == original_mtime
-    assert record.identity_hash[:16] in result.stdout

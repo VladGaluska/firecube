@@ -95,10 +95,15 @@ def _zarr_json_files(target_dir: Path) -> list[Path]:
 
 
 def test_option_forwards_to_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--option values reach index_spec(ctx): engine keys typed, x_* keys raw strings."""
     target_dir = tmp_path / "out.zarr"
     import direct_zarr_capable_test_plugin as plugin_module
 
-    def index_spec_using_option(self, ctx):
+    seen: dict[str, object] = {}
+
+    def index_spec_using_options(self, ctx):
+        seen["pipeline_workers"] = ctx.options.get("pipeline_workers")
+        seen["x_experimental_flag"] = ctx.options.get("x_experimental_flag")
         marker = str(ctx.options.get("x_test_key", "default"))
         return IndexSpec(
             name=f"forwarded_{marker}_v1",
@@ -116,12 +121,13 @@ def test_option_forwards_to_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         plugin_module.DirectZarrCapableTestIngestor,
         "index_spec",
-        index_spec_using_option,
+        index_spec_using_options,
     )
 
+    options = ("x_test_key=hello", "pipeline_workers=7", "x_experimental_flag=true")
     result = CliRunner().invoke(
         cli,
-        _args(f"file://{target_dir}", "--option", "x_test_key=hello"),
+        _args(f"file://{target_dir}", *(arg for opt in options for arg in ("--option", opt))),
     )
 
     assert result.exit_code == 0, result.output
@@ -130,45 +136,13 @@ def test_option_forwards_to_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert not _legacy_current_json_path(target_dir).exists()
     record = json.loads(current_json.read_text())
     assert record["index"]["name"] == "forwarded_hello_v1", record
-
-
-def test_typed_coercion_for_int_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target_dir = tmp_path / "out.zarr"
-    import direct_zarr_capable_test_plugin as plugin_module
-
-    seen: dict[str, object] = {}
-
-    def index_spec_capturing_type(self, ctx):
-        value = ctx.options.get("pipeline_workers")
-        seen["value"] = value
-        seen["type"] = type(value).__name__
-        return IndexSpec(
-            name="typed_v1",
-            groups={
-                "data": RegularTimeAxis(
-                    coordinate="timestamp",
-                    epoch="2026-01-01T00:00:00Z",
-                    cadence_s=1,
-                    mode="exact",
-                    slot_count=10,
-                )
-            },
-        )
-
-    monkeypatch.setattr(
-        plugin_module.DirectZarrCapableTestIngestor,
-        "index_spec",
-        index_spec_capturing_type,
+    # Typed coercion of an int engine option: int 7, not str "7".
+    assert type(seen["pipeline_workers"]) is int, f"expected int 7, got {seen!r}"
+    assert seen["pipeline_workers"] == 7, f"expected int 7, got {seen!r}"
+    # x_* experimental keys pass through without typed coercion.
+    assert seen["x_experimental_flag"] == "true", (
+        f"expected raw 'true' string in x_* namespace (no typed coercion), got {seen!r}"
     )
-
-    result = CliRunner().invoke(
-        cli,
-        _args(f"file://{target_dir}", "--option", "pipeline_workers=7"),
-    )
-
-    assert result.exit_code == 0, result.output
-    assert seen["value"] == 7, f"expected int 7, got {seen!r}"
-    assert seen["type"] == "int", f"expected int, got {seen['type']!r} ({seen['value']!r})"
 
 
 def test_unknown_option_rejected_before_any_write(
@@ -215,44 +189,6 @@ def test_unknown_option_rejected_before_any_write(
     )
     assert _zarr_json_files(target_dir) == [], (
         f"no Zarr metadata should exist after fail-fast, found {_zarr_json_files(target_dir)!r}"
-    )
-
-
-def test_x_namespace_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target_dir = tmp_path / "out.zarr"
-    import direct_zarr_capable_test_plugin as plugin_module
-
-    received: dict[str, object] = {}
-
-    def index_spec_reading_x_key(self, ctx):
-        received["flag"] = ctx.options.get("x_experimental_flag")
-        return IndexSpec(
-            name="x_namespace_v1",
-            groups={
-                "data": RegularTimeAxis(
-                    coordinate="timestamp",
-                    epoch="2026-01-01T00:00:00Z",
-                    cadence_s=1,
-                    mode="exact",
-                    slot_count=10,
-                )
-            },
-        )
-
-    monkeypatch.setattr(
-        plugin_module.DirectZarrCapableTestIngestor,
-        "index_spec",
-        index_spec_reading_x_key,
-    )
-
-    result = CliRunner().invoke(
-        cli,
-        _args(f"file://{target_dir}", "--option", "x_experimental_flag=true"),
-    )
-
-    assert result.exit_code == 0, result.output
-    assert received["flag"] == "true", (
-        f"expected raw 'true' string in x_* namespace (no typed coercion), got {received!r}"
     )
 
 
