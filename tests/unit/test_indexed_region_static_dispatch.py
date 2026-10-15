@@ -320,3 +320,81 @@ def test_static_replay_dtype_safety(tmp_path: Path, dtype: Any, data: np.ndarray
     strategy.write_groups(group_to_intents={"g": [intent]})
     # Replay with identical data — must NOT raise
     strategy.write_groups(group_to_intents={"g": [intent]})
+
+
+# Static resume across array ranks (#84). The replay check must read back a
+# committed static array of any rank, including 0-d scalars such as a CF
+# grid-mapping variable (``spatial_ref``), which plugins emit as numpy scalars.
+_STATIC_RANK_CASES = [
+    pytest.param(np.int32(0), np.int32(1), id="0d-numpy-scalar"),
+    pytest.param(np.array(7.5), np.array(8.5), id="0d-array"),
+    pytest.param(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 4.0]), id="1d"),
+    pytest.param(np.arange(6.0).reshape(2, 3), np.arange(1.0, 7.0).reshape(2, 3), id="2d"),
+]
+
+
+def _static_strategy(tmp_path: Path, data: Any) -> IndexedRegionStrategy:
+    """A fresh strategy, as each run builds one, for a single static array."""
+    template = np.asarray(data)
+    schema = [
+        ZarrGroupSpec(
+            group="g",
+            arrays=[
+                ZarrArraySpec(
+                    name="static",
+                    shape=template.shape,
+                    dtype=template.dtype,
+                    time_indexed=False,
+                )
+            ],
+        )
+    ]
+    return IndexedRegionStrategy(store_uri=f"file://{tmp_path}", schema=schema)
+
+
+def _write_static(tmp_path: Path, data: Any) -> None:
+    intent = WriteIntent(group="g", array="static", ts_index=0, data=data, kind="static")
+    _static_strategy(tmp_path, data).write_groups(group_to_intents={"g": [intent]})
+
+
+def _read_static(tmp_path: Path) -> tuple[np.ndarray, Any]:
+    root = zarr.open_group(store=LocalStore(str(tmp_path)), mode="r", zarr_format=3)
+    arr = cast(Any, root["g/static"])
+    return np.asarray(arr[...]), arr.attrs.get("firecube_static_written")
+
+
+@pytest.mark.parametrize("data, _divergent", _STATIC_RANK_CASES)
+def test_static_resume_replays_identical_data_for_every_rank(
+    tmp_path: Path, data: Any, _divergent: Any
+) -> None:
+    _write_static(tmp_path, data)
+    _write_static(tmp_path, data)
+
+    stored, written = _read_static(tmp_path)
+    np.testing.assert_array_equal(stored, np.asarray(data))
+    assert stored.shape == np.shape(data)
+    assert written is True
+
+
+@pytest.mark.parametrize("data, divergent", _STATIC_RANK_CASES)
+def test_static_resume_divergent_data_raises_for_every_rank(
+    tmp_path: Path, data: Any, divergent: Any
+) -> None:
+    _write_static(tmp_path, data)
+
+    with pytest.raises(SchemaDriftError, match="diverged"):
+        _write_static(tmp_path, divergent)
+
+    stored, _ = _read_static(tmp_path)
+    np.testing.assert_array_equal(stored, np.asarray(data))
+
+
+def test_static_resume_replays_0d_nan_as_identical(tmp_path: Path) -> None:
+    """A 0-d NaN replays as identical data, not as drift."""
+    data = np.array(np.nan)
+    _write_static(tmp_path, data)
+    _write_static(tmp_path, data)
+
+    stored, _ = _read_static(tmp_path)
+    assert stored.shape == ()
+    assert np.isnan(stored)
