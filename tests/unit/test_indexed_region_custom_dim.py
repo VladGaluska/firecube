@@ -33,6 +33,7 @@ class _RecordingWriter:
         write_empty_chunks=None,
         on_write=None,
         track_units=False,
+        fixed_extent=False,
     ):
         self.store_uri = store_uri
         self.store = store

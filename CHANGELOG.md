@@ -80,6 +80,11 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   and the changed auxiliary objects, and deletes the target objects of units
   the run emptied. It never shrinks an array, and it keeps the target's
   existing attributes when it publishes array metadata.
+- Slot-window (parallel) `DirectZarrIngestor` runs now open each array once
+  per writer for region writes, not once per write. A run does not detect
+  growth of an array by another process while it runs. An example is
+  `firecube zarr preallocate` run again with a larger slot count. Do not
+  change the slot count of a target while a slot-window run writes to it.
 - `firecube archive create` no longer prints the codec on the size line of
   its summary. The line now reads `Size: <n> MB`.
 - `firecube chunks delete-span` now exits 1 when it reports errors. It
@@ -180,6 +185,13 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   is unsharded with `min(256, slots)` slots per chunk, and its declared
   shards are not used, as before.
   Existing arrays keep their layout, and preallocate still accepts them.
+- A serial or staged `DirectZarrIngestor` run with `pipeline_workers` above 1
+  could overwrite slots that another batch had just written. This happened
+  when the time chunk of an array holds more than one slot and the array grew
+  during the run. Each region write and each 1-D slot write took its array
+  handle before it took its locks. Each now reads the shape of the array while
+  it holds its locks. A write to a slot beyond the extent of the array is
+  refused with `IndexError` after the locks are taken, and nothing is written.
 
 ## [0.1.7] - 2026-09-19
 

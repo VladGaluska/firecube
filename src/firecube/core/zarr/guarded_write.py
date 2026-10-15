@@ -140,9 +140,9 @@ def array_with_write_empty_chunks(arr: Any, write_empty_chunks: bool | None) -> 
     ``Array.with_config`` returns a new handle over the same metadata and store
     path, without I/O; ``zarr.config`` and every other handle keep their
     setting, so two threads can write with different values at once. ``None``
-    returns ``arr`` as opened.
+    returns ``arr`` as opened, and so does a value ``arr`` already has.
     """
-    if write_empty_chunks is None:
+    if write_empty_chunks is None or arr.config.write_empty_chunks == bool(write_empty_chunks):
         return arr
     return arr.with_config({"write_empty_chunks": bool(write_empty_chunks)})
 
@@ -282,6 +282,7 @@ def guarded_write(
     hold: ArrayHold | None = None,
     track_units: bool = False,
     on_result: Callable[[WriteResult], None] | None = None,
+    reopen: Callable[[], Any] | None = None,
 ) -> WriteResult:
     """Run ``arr[selection] = payload`` under the lock of every unit ``footprint`` touches.
 
@@ -292,11 +293,13 @@ def guarded_write(
     this thread, the held whole-array lock is used instead.
 
     Args:
-        arr: The array, opened by the caller with its current shape and layout.
-        footprint: Cells the write may change; its path must be ``arr``'s and
-            its box must fit ``arr``'s shape. A ``selection`` of integers,
-            slices and ``...`` must lie inside the box; any other selection
-            is refused.
+        arr: The array whose stored layout the locks are taken for. Without
+            ``reopen`` the write goes through it, so open it with its current
+            shape; with ``reopen`` its shape may be stale.
+        footprint: Cells the write may change; its path must be the written
+            handle's and its box must fit that handle's shape. A
+            ``selection`` of integers, slices and ``...`` must lie inside the
+            box; any other selection is refused.
         selection: Passed to ``arr.__setitem__`` unchanged.
         payload: Passed to ``arr.__setitem__`` unchanged.
         store: Store identity the locks are keyed by (``_store_identity``).
@@ -315,6 +318,9 @@ def guarded_write(
             writes to one unit reach it in the order of the writes. It runs
             under those locks, so it must not take a stored-unit lock or wait
             for another writer. What it raises propagates, after the write.
+        reopen: Returns the handle the write goes through, read again after
+            the locks are taken, so another writer's growth is seen. What it
+            raises propagates, and nothing is written.
 
     Returns:
         The touched units and, when tracked, the absent and deleted ones.
@@ -322,18 +328,15 @@ def guarded_write(
     Raises:
         ValueError: The footprint names another array or does not fit its
             shape, the selection is not integers, slices and at most one
-            ``...``, the selection leaves the footprint, or ``hold`` is for
-            another array or not held by this thread.
+            ``...``, the selection leaves the footprint, ``hold`` is for
+            another array or not held by this thread, or the reopened handle
+            has another path or stored unit than ``arr``.
     """
     _require_basic_selection(selection)
-    _require_footprint_fits(arr, footprint, selection)
-    configured = array_with_write_empty_chunks(arr, write_empty_chunks)
-    unit_shape, _ = stored_write_unit(configured)
-    units = tuple(units_touched(footprint.box, unit_shape))
-    track_units = track_units and not (
-        configured.config.write_empty_chunks
-        and _writes_every_cell(selection, configured.shape, footprint.box)
-    )
+    if reopen is None:
+        _require_footprint_fits(arr, footprint, selection)
+    layout = stored_write_unit(arr)
+    units = tuple(units_touched(footprint.box, layout[0]))
     held = current_hold(store, footprint.array_path)
     if hold is not None and hold != held:
         raise ValueError(
@@ -346,10 +349,37 @@ def guarded_write(
         else _UNIT_LOCKS.hold((store, footprint.array_path, unit) for unit in units)
     )
     with locks:
+        target = arr if reopen is None else _reopened(reopen, arr, layout, footprint, selection)
+        configured = array_with_write_empty_chunks(target, write_empty_chunks)
+        track_units = track_units and not (
+            configured.config.write_empty_chunks
+            and _writes_every_cell(selection, configured.shape, footprint.box)
+        )
         result = _write_tracked(configured, footprint, units, selection, payload, track_units)
         if on_result is not None:
             on_result(result)
         return result
+
+
+def _reopened(
+    reopen: Callable[[], Any],
+    arr: Any,
+    layout: tuple[tuple[int, ...], str],
+    footprint: WriteFootprint,
+    selection: Any,
+) -> Any:
+    """Return the handle ``reopen`` reads, refused unless the locks taken for ``arr`` cover it."""
+    fresh = reopen()
+    path, fresh_path = canonical_array_path(arr.path), canonical_array_path(fresh.path)
+    if fresh_path != path:
+        raise ValueError(f"reopen returned {fresh_path!r}; the locks were taken for {path!r}")
+    fresh_layout = stored_write_unit(fresh)
+    if fresh_layout != layout:
+        raise ValueError(
+            f"stored unit of {path!r} is now {fresh_layout}; the locks were taken for {layout}"
+        )
+    _require_footprint_fits(fresh, footprint, selection)
+    return fresh
 
 
 def _write_tracked(

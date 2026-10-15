@@ -396,7 +396,11 @@ class IndexedRegionStrategy:
                 )
                 coord_names = coord_names | static_names
             writer = self._new_writer(
-                coord_names, zarr_write_empty_chunks, on_write=on_write, track_units=track_units
+                coord_names,
+                zarr_write_empty_chunks,
+                on_write=on_write,
+                track_units=track_units,
+                fixed_extent=slot_range is not None,
             )
 
             intents_with_ts = [
@@ -617,7 +621,13 @@ class IndexedRegionStrategy:
         *,
         on_write: Callable[[WriteResult], None] | None = None,
         track_units: bool = False,
+        fixed_extent: bool = False,
     ) -> RegionZarrWriter:
+        """Build a batch writer; pass ``fixed_extent`` only for slot-window batches.
+
+        Pod startup creates a slot-window batch's arrays at the full slot count
+        and its writer never grows them. Growth by another process is not detected.
+        """
         return RegionZarrWriter(
             self._store_uri,
             store=self._session_store(mode="a"),
@@ -626,6 +636,7 @@ class IndexedRegionStrategy:
             write_empty_chunks=write_empty_chunks,
             on_write=on_write,
             track_units=track_units,
+            fixed_extent=fixed_extent,
         )
 
     @staticmethod

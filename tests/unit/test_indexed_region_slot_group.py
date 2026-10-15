@@ -107,6 +107,31 @@ def test_slot_group_set_skips_writes_for_other_groups(
     assert any("slot_group" in r.getMessage() and "'B'" in r.getMessage() for r in warnings)
 
 
+def test_slot_window_batches_build_fixed_extent_writers_and_serial_batches_do_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[bool] = []
+
+    def record_writer(*args, **kwargs):
+        built.append(kwargs["fixed_extent"])
+        return _Writer()
+
+    monkeypatch.setattr(
+        "firecube.ingestor.runtime.zarr.strategies.indexed_region.RegionZarrWriter",
+        record_writer,
+    )
+    monkeypatch.setattr(
+        IndexedRegionStrategy, "_dispatch_intent", staticmethod(lambda writer, intent: None)
+    )
+    strategy = IndexedRegionStrategy(store_uri=str(tmp_path / "test.zarr"))
+
+    strategy.write_groups(group_to_intents={"A": [_intent("A", 5)]}, slot_range=(0, 100))
+    strategy.write_groups(group_to_intents={"A": [_intent("A", 5)]}, slot_range=None)
+
+    assert built == [True, False], f"fixed_extent per batch (slot window, serial): {built}"
+
+
 def test_slot_group_none_validates_all_groups_intents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

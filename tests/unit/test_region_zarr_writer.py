@@ -153,7 +153,111 @@ class TestEnsureTimestampSlot:
         assert writer._open_root()["grp/data"].shape == (1, 10)
 
 
+def _write_while_another_batch_grows_the_array(store_path, monkeypatch, shape, chunks, write):
+    """Hold writer A's write of slot 8 before its unit locks while writer B grows to 12 slots.
+
+    ``write(writer, slot, value)`` writes one slot. A writes slot 8 with 8.0 after B has grown the
+    array from 9 to 12 slots and written slots 9, 10 and 11 with their own number. Returns the
+    array as stored after both finished.
+    """
+    from firecube.core.zarr._unit_locks import _UNIT_LOCKS
+
+    kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": chunks}
+    writer_a = RegionZarrWriter(store_path)
+    writer_a.ensure_group("grp/data", shape=shape, **kwargs)
+    reached, release = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    holder: list[threading.Thread] = []
+    original_hold = _UNIT_LOCKS.hold
+    first = [True]
+
+    def hold(keys):
+        if threading.current_thread() is holder[0] and first[0]:
+            first[0] = False
+            reached.set()
+            if not release.wait(30.0):
+                raise AssertionError("writer A was never released")
+        return original_hold(keys)
+
+    monkeypatch.setattr(_UNIT_LOCKS, "hold", hold)
+
+    def run_a():
+        try:
+            write(writer_a, 8, 8.0)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_a)
+    holder.append(thread)
+    thread.start()
+    try:
+        assert reached.wait(30.0), "writer A never reached its unit locks"
+        writer_b = RegionZarrWriter(store_path)
+        writer_b.ensure_group("grp/data", shape=(12, *shape[1:]), allow_grow=True, **kwargs)
+        for slot in (9, 10, 11):
+            write(writer_b, slot, float(slot))
+    finally:
+        release.set()
+        thread.join(30.0)
+    assert not thread.is_alive(), "writer A never finished"
+    if errors:
+        raise errors[0]
+    return zarr.open_array(f"{store_path}/grp/data", mode="r")
+
+
 class TestWriteRegion:
+    def test_stale_extent_does_not_erase_slots_another_batch_wrote(self, store_path, monkeypatch):
+        def write(w, slot, value):
+            w.write_region(
+                "grp",
+                "data",
+                ts_index=slot,
+                y_slice=slice(None),
+                data=np.full((4, 4), value, dtype=np.float32),
+            )
+
+        stored = _write_while_another_batch_grows_the_array(
+            store_path, monkeypatch, (9, 4, 4), (4, 4, 4), write
+        )
+
+        assert stored.shape == (12, 4, 4)
+        slots = np.asarray(stored[8:12, 0, 0]).tolist()
+        assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
+
+    def test_serial_writer_reads_the_grown_extent_on_every_write(self, store_path):
+        kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": (4, 4, 4)}
+        writer_a = RegionZarrWriter(store_path)
+        writer_a.ensure_group("grp/data", shape=(9, 4, 4), **kwargs)
+        writer_b = RegionZarrWriter(store_path)
+
+        def write(w, slot):
+            data = np.full((4, 4), float(slot), dtype=np.float32)
+            w.write_region("grp", "data", ts_index=slot, y_slice=slice(None), data=data)
+
+        write(writer_a, 0)
+        writer_b.ensure_group("grp/data", shape=(12, 4, 4), allow_grow=True, **kwargs)
+        for slot in (9, 10, 11):
+            write(writer_b, slot)
+        write(writer_a, 8)
+
+        stored = zarr.open_array(f"{store_path}/grp/data", mode="r")
+        slots = np.asarray(stored[8:12, 0, 0]).tolist()
+        assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
+
+    def test_fixed_extent_writer_drops_its_handle_when_it_grows_the_array(self, store_path):
+        kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": (4, 4, 4)}
+        w = RegionZarrWriter(store_path, fixed_extent=True)
+        w.ensure_group("grp/data", shape=(9, 4, 4), **kwargs)
+        data = np.full((4, 4), 5.0, dtype=np.float32)
+        w.write_region("grp", "data", ts_index=0, y_slice=slice(None), data=data)
+
+        w.ensure_group("grp/data", shape=(12, 4, 4), allow_grow=True, **kwargs)
+        w.write_region("grp", "data", ts_index=10, y_slice=slice(None), data=data)
+
+        stored = zarr.open_array(f"{store_path}/grp/data", mode="r")
+        assert stored.shape == (12, 4, 4)
+        assert np.asarray(stored[10, 0, 0]).item() == 5.0
+
     def test_3d_write(self, writer):
         writer.ensure_group(
             "grp/data",
@@ -194,7 +298,47 @@ class TestWriteRegion:
             writer.write_region("grp", "vec", ts_index=0, y_slice=slice(0, 5), data=np.zeros(5))
 
 
+@pytest.mark.parametrize("entry", ["write_region", "write_1d"])
+@pytest.mark.parametrize(
+    ("ts_index", "slot"), [(-1, 11), (10, 10)], ids=["negative_index", "newly_grown_index"]
+)
+def test_cached_handle_follows_another_writers_growth(store_path, entry, ts_index, slot):
+    shape, chunks = ((9, 4, 4), (4, 4, 4)) if entry == "write_region" else ((9,), (4,))
+    kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": chunks}
+    writer_a = RegionZarrWriter(store_path)
+    writer_a.ensure_group("grp/data", shape=shape, **kwargs)
+
+    def write(w, index, value):
+        if entry == "write_region":
+            data = np.full((4, 4), value, dtype=np.float32)
+            w.write_region("grp", "data", ts_index=index, y_slice=slice(None), data=data)
+        else:
+            w.write_1d("grp", "data", ts_index=index, data=np.float32(value))
+
+    write(writer_a, 0, 1.0)
+    RegionZarrWriter(store_path).ensure_group(
+        "grp/data", shape=(12, *shape[1:]), allow_grow=True, **kwargs
+    )
+    write(writer_a, ts_index, 7.0)
+
+    stored = zarr.open_array(f"{store_path}/grp/data", mode="r")
+    cell = (slot, 0, 0) if entry == "write_region" else (slot,)
+    assert np.asarray(stored[cell]).item() == 7.0
+
+
 class TestWrite1D:
+    def test_stale_extent_does_not_erase_slots_another_batch_wrote(self, store_path, monkeypatch):
+        def write(w, slot, value):
+            w.write_1d("grp", "data", ts_index=slot, data=np.float32(value))
+
+        stored = _write_while_another_batch_grows_the_array(
+            store_path, monkeypatch, (9,), (4,), write
+        )
+
+        assert stored.shape == (12,)
+        slots = np.asarray(stored[8:12]).tolist()
+        assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
+
     def test_writes_slot(self, writer):
         writer.ensure_group(
             "grp/cal",

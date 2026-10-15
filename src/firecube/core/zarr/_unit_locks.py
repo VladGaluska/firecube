@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import threading
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -45,13 +46,15 @@ def _store_identity(store_uri: str, store: object | None) -> str:
 _PATH_PROBE_STORE = MemoryStore()
 
 
+@functools.lru_cache(maxsize=4096)
 def canonical_array_path(path: str) -> str:
     """The path zarr stores ``path`` under, spelled one way for locks and ledgers.
 
     Zarr drops leading, trailing and repeated slashes and reads a backslash as a
     slash, so ``vec``, ``vec/``, ``/vec`` and ``data//vec`` address one node.
     The public ``StorePath`` applies that rule, so the lock table never
-    restates it.
+    restates it. Results are memoized, because every write spells its array
+    path several times; a refused path is not.
 
     Raises:
         ValueError: A ``.`` or ``..`` segment, which zarr refuses too.
