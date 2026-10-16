@@ -49,6 +49,23 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 - `firecube archive create` records each run in the source product's control plane.
 
 ### Changed
+- `firecube zarr slots` refuses a plan of more than 1,000,000 ranges. The
+  refusal names the range count, and the range count and slot size of each
+  group. It also names the smallest `--slot-size` that gives an executable plan
+  within the limit. If no such size exists, the refusal says so. To emit the plan anyway,
+  add `--yes-i-really-mean-it`. A plan of exactly 1,000,000 ranges is emitted.
+  The JSON costs about 390 bytes per range, so 44 million ranges are about
+  17 GB.
+- `firecube zarr slots` prints one hint on stderr for a plan of more than
+  100,000 ranges. The output format (`v1` JSON, table and CSV) is unchanged.
+- `firecube zarr slots` now plans one range per slot by default for a plugin
+  that declares neither chunks nor shards. This holds only if no
+  worker-written array of the target requires larger ranges. Version 0.1.7 planned the whole axis as one
+  range. To choose the range size, pass `--slot-size`.
+- A DirectZarr plan covers the stored chunk or shard of every worker-written
+  array that the target already has. Plans therefore fit stores that an
+  earlier release created. An explicit `--slot-size` that would split one is
+  refused. The refusal names the multiple that the slot size needs.
 - A `DirectZarrIngestor` run can time out at shutdown while it waits for
   in-flight batches. If workspace cleanup is enabled, Firecube now keeps the
   staged workspace and logs an error that names its path. Before, it deleted
@@ -129,6 +146,10 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Fixed
 
+- `firecube zarr slots` no longer holds the whole plan in memory. It writes
+  each range as it computes it, so the number of ranges does not change its
+  memory use. A plan of 44 million ranges needed more than 100 GB.
+  The remaining-coverage intervals and the resolved index stay in memory.
 - `DirectZarrIngestor` no longer loses slots silently when writers share a
   chunk or shard along time. The writers are slot-window workers,
   `pipeline_workers` threads in one process, and staged promotion. Firecube

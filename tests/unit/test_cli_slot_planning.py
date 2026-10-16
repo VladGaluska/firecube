@@ -25,6 +25,7 @@ import click
 import numpy as np
 import pytest
 
+from firecube.cli import _slot_planning
 from firecube.cli._slot_planning import (
     PLAN_SCHEMA_VERSION,
     _chunk_aligned_remaining,
@@ -111,3 +112,23 @@ def test_resolve_per_group_slot_sizes_auto() -> None:
     ]
     result = _resolve_per_group_slot_sizes(schema, explicit=None)
     assert result["g1"] == 200  # LCM(100, 200)
+
+
+@pytest.mark.parametrize(
+    ("remaining", "total", "unit", "ceiling", "expected"),
+    [
+        pytest.param([(0, 11)], 11, 1, 10, 2, id="fresh"),
+        pytest.param([(1, 12)], 12, 1, 5, None, id="misaligned"),
+        pytest.param([(i, i + 1) for i in range(0, 21, 2)], 21, 1, 10, None, id="fragmented"),
+        pytest.param([(4, 100)], 100, 2, 30, 4, id="unit2"),
+        # The interval (0, 251) ends inside the stored unit [250, 500): pod startup refuses
+        # that window at any size, so no --slot-size may be suggested for it.
+        pytest.param([(0, 251), (500, 750)], 3000, 250, 2, None, id="end_splits_unit"),
+    ],
+)
+def test_smallest_executable_slot_size(
+    remaining: list[tuple[int, int]], total: int, unit: int, ceiling: int, expected: int | None
+) -> None:
+    helper = getattr(_slot_planning, "_smallest_executable_slot_size", None)
+    assert helper is not None, "_smallest_executable_slot_size is not defined"
+    assert helper({"g": remaining}, {"g": total}, {"g": unit}, ceiling) == expected

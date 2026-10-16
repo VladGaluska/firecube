@@ -327,7 +327,7 @@ OPTION_GROUPS.update(
             },
             {
                 "name": "Options",
-                "options": ["--slot-size", "--no-resume", "--format"],
+                "options": ["--slot-size", "--no-resume", "--format", "--yes-i-really-mean-it"],
             },
         ],
         "firecube zarr multires": [

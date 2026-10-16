@@ -16,13 +16,16 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import tracemalloc
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import numpy as np
 import pytest
+import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
@@ -465,3 +468,94 @@ def test_slots_option_reaches_plugin_hook(tmp_path: Path) -> None:
     payload = json.loads(result.output)
     group = next(g for g in payload["groups"] if g["name"] == "data")
     assert group["total_slots"] == 24
+
+
+def _register_sized_plugin(name: str, slots: int, chunks: tuple[int, int] | None = (1, 10)) -> None:
+    array = ZarrArraySpec(name="data", chunks=chunks, shape=(slots, 10), dtype=np.float32)
+    members = {
+        "PRODUCT_NAME": name,
+        "index_spec": lambda self, ctx: _cli_index_spec(slots),
+        "zarr_schema": lambda self, ctx: [ZarrGroupSpec(group="data", arrays=[array])],
+    }
+    register_ingestor(name)(type(name, (_SlotsCapablePlugin,), members))
+
+
+def test_zarr_slots_streams_large_plan_in_bounded_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = '"FIRECUBE_SLOT_START"'
+    seen, tail = 0, ""
+
+    def write(text: str) -> int:
+        nonlocal seen, tail
+        window = tail + text
+        seen += window.count(marker)
+        tail = window[-(len(marker) - 1) :]
+        return len(text)
+
+    sink = SimpleNamespace(write=write, flush=lambda: None, isatty=lambda: False)
+    _register_sized_plugin("slots_test_stream", 100_000)
+    args = [*_required_args(tmp_path, "slots_test_stream"), "--no-resume"]
+    monkeypatch.setattr("sys.stdout", sink)
+    tracemalloc.start()
+    try:
+        cli.main(args, prog_name="firecube", standalone_mode=False)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert seen == 100_000
+    assert peak < 32 * 1024 * 1024
+
+
+def test_zarr_slots_refuses_plan_above_range_ceiling_unless_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("firecube.cli._slot_planning.PLAN_RANGE_CEILING", 10, raising=False)
+    _register_sized_plugin("slots_test_ceiling", 11)
+    args = [*_required_args(tmp_path, "slots_test_ceiling"), "--no-resume"]
+
+    refused = CliRunner().invoke(cli, args)
+    confirmed = CliRunner().invoke(cli, [*args, "--yes-i-really-mean-it"])
+
+    assert refused.exit_code != 0
+    assert refused.stdout == ""
+    assert all(s in refused.output for s in ("11", "--slot-size 2", "--yes-i-really-mean-it"))
+    assert confirmed.exit_code == 0, confirmed.output
+    assert len(json.loads(confirmed.output)["ranges"]) == 11
+
+
+def test_zarr_slots_hints_on_stderr_above_range_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("firecube.cli._slot_planning.PLAN_RANGE_HINT", 5, raising=False)
+    _register_sized_plugin("slots_test_hint", 11, chunks=None)
+
+    result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_hint"))
+
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.stdout)["ranges"]) == 11
+    hints = [ln for ln in capfd.readouterr().err.splitlines() if "--slot-size" in ln]
+    assert len(hints) == 1
+    assert "11" in hints[0]
+
+
+@pytest.mark.parametrize(
+    ("chunks", "shards"),
+    [pytest.param((250, 10), None, id="chunked"), pytest.param((1, 10), (250, 10), id="sharded")],
+)
+def test_zarr_slots_aligns_to_stored_units_of_existing_arrays(
+    tmp_path: Path, chunks: tuple[int, int], shards: tuple[int, int] | None
+) -> None:
+    _register_sized_plugin("slots_test_stored", 1000, chunks=None)
+    group = zarr.open_group(tmp_path / "x.zarr", mode="w", zarr_format=3).require_group("data")
+    group.create_array("data", shape=(1000, 10), chunks=chunks, shards=shards, dtype="float32")
+    args = [*_required_args(tmp_path, "slots_test_stored"), "--no-resume"]
+
+    planned = CliRunner().invoke(cli, args)
+    refused = CliRunner().invoke(cli, [*args, "--slot-size", "100"])
+
+    assert planned.exit_code == 0, planned.output
+    plan = json.loads(planned.output)
+    assert (plan["groups"][0]["slot_size"], len(plan["ranges"])) == (250, 4)
+    assert refused.exit_code != 0
+    assert "250" in refused.output

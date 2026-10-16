@@ -104,8 +104,25 @@ firecube zarr slots <plugin> \
 Each row contains a group and a half-open range such as `[0, 144)`. The slot
 size must cover whole stored chunks or shards of every worker-written
 time-indexed array. It must also cover the chunks or shards that the time
-coordinate declares. Omit `--format table` to receive the JSON plan used by
-schedulers.
+coordinate declares, and those stored in the target for every worker-written
+array. If an explicit `--slot-size` would split one, the command refuses it and
+names the multiple that the slot size needs. Omit `--format table` to receive
+the JSON plan used by schedulers.
+
+The command writes each range as it computes it. The number of ranges does not
+change its memory use. The remaining-coverage intervals and the resolved index
+stay in memory.
+
+If a plugin declares neither chunks nor shards, and no worker-written array of
+the target requires larger ranges, the command plans one range per slot. Pass
+`--slot-size` to choose a larger range.
+
+A plan of more than 100,000 ranges prints one hint on stderr. A plan of more
+than 1,000,000 ranges is refused. The refusal names the range count, and the
+range count and slot size of each group. It also names the smallest
+`--slot-size` that gives an executable plan within the limit. If no such size exists, the refusal says so.
+Use the size it names. To emit the plan anyway, add `--yes-i-really-mean-it`.
+The JSON costs about 390 bytes per range, so 44 million ranges are about 17 GB.
 
 Planning is resume-aware by default: completed ranges are excluded. Use
 `--no-resume` only when the scheduler must deliberately ignore recorded
