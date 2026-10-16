@@ -34,15 +34,15 @@ from firecube.core.storage import StorageWriteResult
 from firecube.core.storage.completion import StagedPromotionUnits
 from firecube.core.storage.session import StorageSession
 from firecube.core.storage.uri import StorageUri
-from firecube.core.zarr import metadata_authority
-from firecube.core.zarr.guarded_write import WriteResult
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard import metadata_authority
+from firecube.core.zarr.guard.guarded_write import WriteResult
+from firecube.core.zarr.guard.metadata_authority import (
     MetadataAuthority,
     MetadataScope,
     set_attributes,
     update_document,
 )
-from firecube.core.zarr.unit_ownership import StagedSlotWrite, WriteFootprint
+from firecube.core.zarr.guard.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.ingestor.api import IngestResult, OutputPaths, PipelineMetrics, ResultMetrics
 from firecube.ingestor.runtime.engine import PipelineExecutor
 from firecube.ingestor.runtime.zarr.write_session import WriteSessionStateError, ZarrWriteSession

@@ -38,10 +38,10 @@ from typing import Any
 
 import numpy as np
 
-from firecube.core.zarr._unit_locks import _UNIT_LOCKS, canonical_array_path
 from firecube.core.zarr._zarr_compat import sync
-from firecube.core.zarr.chunk_geometry import Bounds, units_touched
-from firecube.core.zarr.unit_ownership import WriteFootprint, stored_write_unit
+from firecube.core.zarr.guard._unit_locks import _UNIT_LOCKS, canonical_array_path
+from firecube.core.zarr.guard.chunk_geometry import Bounds, units_touched
+from firecube.core.zarr.guard.unit_ownership import WriteFootprint, stored_write_unit
 
 Unit = tuple[int, ...]
 """Index of one stored unit (shard if sharded, else chunk) in the unit grid."""

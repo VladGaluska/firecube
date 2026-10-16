@@ -30,7 +30,7 @@ import pandas as pd
 import xarray as xr
 
 from firecube.core.storage.session import StorageSession, storage_config_from_binding
-from firecube.core.zarr.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr.guard.chunk_geometry import chunk_index_to_region
 from firecube.core.zarr.time_decode import decode_or_passthrough, decode_time_array
 from firecube.ingestor.errors import (
     AppendOverwriteRefused,

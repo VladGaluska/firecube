@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stored-unit ownership and staged-coverage checks of the DirectZarr write path.
+"""Stored-unit ownership and staged-coverage checks for parallel Zarr writers.
 
 A slot window must cover whole stored units (chunk, or shard when sharded) of every
 pod-written time-indexed array, and a staged run must write every cell of each unit it
@@ -27,8 +27,8 @@ from operator import index as operator_index
 from typing import Any
 
 from firecube.core.errors import ConfigurationError
-from firecube.core.zarr._unit_locks import canonical_array_path
-from firecube.core.zarr.chunk_geometry import (
+from firecube.core.zarr.guard._unit_locks import canonical_array_path
+from firecube.core.zarr.guard.chunk_geometry import (
     Bounds,
     incompletely_written_units,
     staged_partial_unit_refusal,
@@ -38,7 +38,7 @@ from firecube.core.zarr.chunk_geometry import (
     window_straddling_units,
     write_unit_shape,
 )
-from firecube.core.zarr.engine_owned import _array_or_none
+from firecube.core.zarr.guard.engine_owned import _array_or_none
 
 
 @dataclass(frozen=True)

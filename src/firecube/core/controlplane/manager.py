@@ -76,8 +76,8 @@ from firecube.core.slot_index import (
     SlotIndexModel,
 )
 from firecube.core.storage.binding import StorageBinding
-from firecube.core.zarr._unit_locks import _store_identity
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.metadata_authority import (
     HeldClaim,
     MetadataScope,
     adopt_held_claim,
@@ -701,7 +701,7 @@ class ChunkManager:
         """
 
         # Function-scope import: avoid module-level cycle with core.zarr.
-        from firecube.core.zarr.chunk_geometry import chunk_axis_range
+        from firecube.core.zarr.guard.chunk_geometry import chunk_axis_range
 
         domain = WriteDomain(
             product=product,

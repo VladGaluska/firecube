@@ -50,7 +50,7 @@ from firecube.core.slot_index import (
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
-from firecube.core.zarr.metadata_authority import _NODE_LOCKS
+from firecube.core.zarr.guard.metadata_authority import _NODE_LOCKS
 
 
 def _make_manager(tmp_path: Path) -> ChunkManager:

@@ -137,7 +137,7 @@ No two concurrent writers may read-modify-write one stored unit. A stored unit i
 
 The rule is enforced on the stored layout. It is never inferred from declarations. Four components uphold it.
 
-- Layout at creation (`core/zarr/_layout.py`): it decides the layout of every array that the spec loop, pod startup and the serial path create. It is not the only creator of a coordinate. It never applies a default to an existing array.
+- Layout at creation (`core/zarr/guard/_layout.py`): it decides the layout of every array that the spec loop, pod startup and the serial path create. It is not the only creator of a coordinate. It never applies a default to an existing array.
   - An undeclared pod-written time-indexed array (no chunks, no shards) keeps the whole-array chunks of zarr if their time chunk is already 1. No warning is logged.
   - If the time chunk is not 1, the array gets time chunk 1, the heuristic of zarr for the per-slot shape, and no shards. One warning is logged.
   - A shards-only declaration keeps the declared shards.
@@ -156,12 +156,12 @@ Threads inside one process (`pipeline_workers`) are serialised by a lock table. 
 
 ### Guarded writes in DirectZarr flows
 
-- Payload writes: every DirectZarr payload write passes one chokepoint, `guarded_write` (`core/zarr/guarded_write.py`).
+- Payload writes: every DirectZarr payload write passes one chokepoint, `guarded_write` (`core/zarr/guard/guarded_write.py`).
   - It takes the unit locks. If this thread already holds a whole-array lock, it reuses that hold and takes no unit lock.
   - It applies `write_empty_chunks` to the array it writes. It never changes `zarr.config`.
   - It writes, then reports the result to the write session of the run before it releases the locks.
   - Staged runs also record which units the write left without an object.
-- Metadata: in DirectZarr flows, `zarr.json` changes only under a metadata authority (`core/zarr/metadata_authority.py`).
+- Metadata: in DirectZarr flows, `zarr.json` changes only under a metadata authority (`core/zarr/guard/metadata_authority.py`).
   - An authority is either a held claim (`CLAIM`, cross-process exclusion) or `PROCESS_LOCAL`.
   - `PROCESS_LOCAL` excludes the threads of this process only. No claim stands behind it.
   - The operations create, grow (never smaller) and add or replace attributes. Each operation checks the authority before it touches the store.

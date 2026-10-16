@@ -77,8 +77,8 @@ from zarr.errors import GroupNotFoundError, NodeNotFoundError, NodeTypeValidatio
 from zarr.storage import FsspecStore, LocalStore, ObjectStore
 
 from firecube.core.errors import FirecubeError
-from firecube.core.zarr._unit_locks import _store_identity, canonical_array_path
 from firecube.core.zarr._zarr_compat import sync
+from firecube.core.zarr.guard._unit_locks import _store_identity, canonical_array_path
 
 __all__ = [
     "AuthorityBasis",

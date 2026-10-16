@@ -30,8 +30,8 @@ from firecube.cli._product import resolve_product_identity
 from firecube.core.controlplane import ChunkManager
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
-from firecube.core.zarr._layout import slot_window_layout
-from firecube.core.zarr.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.guard._layout import slot_window_layout
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
 from firecube.ingestor.api import ZarrGroupSpec
 
 #: Plan JSON schema version. Independent of control-plane SCHEMA_VERSION.

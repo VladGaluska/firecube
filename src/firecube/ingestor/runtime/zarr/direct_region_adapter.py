@@ -31,15 +31,15 @@ from typing import TYPE_CHECKING, Any
 
 from firecube.core.api import ExtentUnknownError
 from firecube.core.errors import ConfigurationError
-from firecube.core.zarr._layout import resolve_effective_layout
-from firecube.core.zarr.engine_owned import (
+from firecube.core.zarr.guard._layout import resolve_effective_layout
+from firecube.core.zarr.guard.engine_owned import (
     is_engine_owned_spec,
     is_pod_written_slot_array,
     require_engine_owned_ownership,
     require_engine_owned_slots,
     verify_engine_owned_writes,
 )
-from firecube.core.zarr.unit_ownership import (
+from firecube.core.zarr.guard.unit_ownership import (
     StagedSlotWrite,
     require_planned_slots_fill_units,
     require_window_owns_stored_units,

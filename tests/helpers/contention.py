@@ -65,7 +65,7 @@ def force_contended_units(monkeypatch, *units):
 
 
 def force_contended_static(monkeypatch, store, array_path):
-    from firecube.core.zarr._unit_locks import _store_identity
+    from firecube.core.zarr.guard._unit_locks import _store_identity
     from firecube.core.zarr.region_writer import RegionZarrWriter
 
     root = local_path(store)
@@ -106,7 +106,7 @@ def force_contended_static(monkeypatch, store, array_path):
 
 
 def _observe_lock_contention(monkeypatch, arrived):
-    from firecube.core.zarr import _unit_locks
+    from firecube.core.zarr.guard import _unit_locks
 
     class _ObservedLock:
         def __init__(self, lock, event):

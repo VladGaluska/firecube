@@ -26,8 +26,8 @@ import zarr.core.array as zarr_array
 from zarr.core.sync import sync
 from zarr.storage import LocalStore
 
-from firecube.core.zarr.guarded_write import WriteResult, unit_store_key
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard.guarded_write import WriteResult, unit_store_key
+from firecube.core.zarr.guard.metadata_authority import (
     AuthorityBasis,
     MetadataAuthorityError,
     hold_authority,
@@ -155,7 +155,7 @@ class TestEnsureTimestampSlot:
 
 class TestWriteRegion:
     def test_stale_extent_does_not_erase_slots_another_batch_wrote(self, store_path, monkeypatch):
-        from firecube.core.zarr._unit_locks import _UNIT_LOCKS
+        from firecube.core.zarr.guard._unit_locks import _UNIT_LOCKS
 
         kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": (4, 4, 4)}
         writer_a = RegionZarrWriter(store_path)

@@ -112,7 +112,7 @@ def _promote(
         StorageError: The roots differ or the plan cannot be proved.
         ConfigurationError: The plan holds such an uncovered data object.
     """
-    from firecube.core.zarr.promotion_plan import unclaimed_data_objects
+    from firecube.core.zarr.guard.promotion_plan import unclaimed_data_objects
 
     if staged_units is None:
         return session.upload_tree(src, dst, parallel_workers=parallel_workers)

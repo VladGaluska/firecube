@@ -52,9 +52,9 @@ from firecube.core.zarr._coord_lifecycle import (
     resolve_coord_lifecycle,
 )
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
-from firecube.core.zarr._unit_locks import _store_identity
-from firecube.core.zarr.chunk_geometry import Bounds
-from firecube.core.zarr.guarded_write import (
+from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.chunk_geometry import Bounds
+from firecube.core.zarr.guard.guarded_write import (
     ArrayHold,
     WriteFootprint,
     WriteResult,
@@ -62,14 +62,14 @@ from firecube.core.zarr.guarded_write import (
     guarded_write,
     hold_array,
 )
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard.metadata_authority import (
     MetadataAuthority,
     MetadataScope,
     create_or_open_array,
     set_attributes,
 )
-from firecube.core.zarr.metadata_authority import ensure_group as _authorized_ensure_group
-from firecube.core.zarr.unit_ownership import _axis_index
+from firecube.core.zarr.guard.metadata_authority import ensure_group as _authorized_ensure_group
+from firecube.core.zarr.guard.unit_ownership import _axis_index
 
 log = logging.getLogger("firecube.core.zarr.region_writer")
 
@@ -464,7 +464,7 @@ class RegionZarrWriter:
             object after the write and which the write deleted (two
             ``exists`` calls per unit). Requires ``on_write``.
         authority: The authority every ``zarr.json`` change of this writer is
-            made under (`firecube.core.zarr.metadata_authority`), the root
+            made under (`firecube.core.zarr.guard.metadata_authority`), the root
             group's creation included. ``None`` means a ``PROCESS_LOCAL``
             authority over the writer's whole store: the threads of this
             process are excluded per node, other processes are not. Only an

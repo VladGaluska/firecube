@@ -35,7 +35,7 @@ from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession  # pyright: ignore[reportMissingImports]
 from firecube.core.storage.uri import StorageUri  # pyright: ignore[reportMissingImports]
-from firecube.core.zarr.promotion_plan import (
+from firecube.core.zarr.guard.promotion_plan import (
     PlannedObject,
     PromotionAction,
     PromotionPlan,

@@ -50,8 +50,8 @@ from zarr.storage import LocalStore
 
 from firecube.core.storage.uri import StorageUri
 from firecube.core.zarr._zarr_compat import sync
-from firecube.core.zarr.chunk_geometry import chunk_index_to_region
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr.guard.metadata_authority import (
     MetadataAuthority,
     MetadataAuthorityError,
     publish_document,

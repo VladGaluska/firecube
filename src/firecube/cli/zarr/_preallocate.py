@@ -49,7 +49,6 @@ from firecube.core.observability.metrics import TelemetryService, emit_index_ens
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
-from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
 from firecube.core.zarr.coord_materialization import (
     array_schema_mismatches,
     axis_has_resolvable_extent,
@@ -58,7 +57,8 @@ from firecube.core.zarr.coord_materialization import (
     materialize_irregular_coord_array,
     materialize_regular_coord_array,
 )
-from firecube.core.zarr.engine_owned import (
+from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
+from firecube.core.zarr.guard.engine_owned import (
     collect_engine_owned_values,
     engine_owned_adoption_error,
     engine_owned_creation_attrs,
@@ -67,7 +67,7 @@ from firecube.core.zarr.engine_owned import (
     is_engine_owned_spec,
     materialize_engine_owned_array,
 )
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard.metadata_authority import (
     HeldClaim,
     MetadataAuthority,
     adopt_held_claim,

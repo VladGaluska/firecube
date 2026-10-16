@@ -50,7 +50,7 @@ from firecube.ingestor.types.context import (
 
 if TYPE_CHECKING:
     from firecube.core.storage.completion import StagedPromotionUnits
-    from firecube.core.zarr.metadata_authority import MetadataAuthority
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthority
 
 
 @runtime_checkable

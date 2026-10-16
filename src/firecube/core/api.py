@@ -93,7 +93,7 @@ from firecube.core.zarr._sealing_markers import (
     ATTR_COORD_MANAGED,
     ATTR_PREALLOCATED,
 )
-from firecube.core.zarr.chunk_geometry import (
+from firecube.core.zarr.guard.chunk_geometry import (
     axis_selection_is_chunk_aligned,
     chunk_axis_range,
     physical_chunk_keys_for_region,

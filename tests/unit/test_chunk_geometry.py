@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from firecube.core.zarr.chunk_geometry import (
+from firecube.core.zarr.guard.chunk_geometry import (
     axis_selection_is_chunk_aligned,
     chunk_axis_range,
     chunk_index_to_region,

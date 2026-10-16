@@ -39,7 +39,7 @@ from zarr.storage import LocalStore
 
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import WriteDomain
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard.metadata_authority import (
     EMPTY_GROUP_DOCUMENT,
     AuthorityBasis,
     MetadataAuthority,
@@ -391,7 +391,7 @@ def test_a_document_a_writer_creates_meanwhile_is_not_replaced(tmp_path: Path) -
     document. Only a copier that decides under the lock keeps the writer's
     document; deciding before it reverts the stamp.
     """
-    from firecube.core.zarr import metadata_authority
+    from firecube.core.zarr.guard import metadata_authority
 
     store = LocalStore(tmp_path)
     auth = MetadataAuthority.process_local(_scope(tmp_path))
@@ -763,7 +763,7 @@ def test_update_document_merges_the_current_document_under_the_node_lock(
     (two users). Under the lock the peer waits, so its stamp lands after the
     put instead of being reverted by it.
     """
-    from firecube.core.zarr import metadata_authority
+    from firecube.core.zarr.guard import metadata_authority
 
     _local_root(tmp_path)
     store = LocalStore(tmp_path)

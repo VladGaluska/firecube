@@ -28,10 +28,10 @@ import zarr
 
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import WriteDomain
-from firecube.core.zarr.guarded_write import WriteResult
-from firecube.core.zarr.metadata_authority import AuthorityBasis, MetadataAuthority
+from firecube.core.zarr.guard.guarded_write import WriteResult
+from firecube.core.zarr.guard.metadata_authority import AuthorityBasis, MetadataAuthority
+from firecube.core.zarr.guard.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.core.zarr.region_writer import RegionZarrWriter
-from firecube.core.zarr.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import IndexedRegionStrategy
 from firecube.ingestor.runtime.zarr.write_session import (
     SessionState,

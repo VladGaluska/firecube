@@ -66,10 +66,15 @@ from firecube.core.zarr._reserved_attrs import (
     RESERVED_ARRAY_ATTRS,
 )
 from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
-from firecube.core.zarr._unit_locks import _store_identity
-from firecube.core.zarr.guarded_write import ArrayHold, guarded_write, hold_array, selection_box
+from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.guarded_write import (
+    ArrayHold,
+    guarded_write,
+    hold_array,
+    selection_box,
+)
+from firecube.core.zarr.guard.unit_ownership import WriteFootprint
 from firecube.core.zarr.region_writer import RegionZarrWriter
-from firecube.core.zarr.unit_ownership import WriteFootprint
 
 log = logging.getLogger("firecube.core.zarr.coord_materialization")
 

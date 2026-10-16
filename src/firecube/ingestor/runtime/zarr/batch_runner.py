@@ -32,7 +32,7 @@ from firecube.ingestor.runtime.zarr.strategies.append import AppendStrategy
 from firecube.ingestor.runtime.zarr.write_context import ZarrWriteContext
 
 if TYPE_CHECKING:
-    from firecube.core.zarr.metadata_authority import MetadataAuthority
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthority
 
 
 def seed_staged_metadata_for_batch(
@@ -56,7 +56,7 @@ def seed_staged_metadata_for_batch(
     if not write_mode_policy(write_mode).seeds_staged_metadata or final_target_uri is None:
         return
 
-    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthorityError
     from firecube.ingestor.runtime.zarr.staged_metadata import (
         StagedMetadataError,
         seed_staged_store_metadata,

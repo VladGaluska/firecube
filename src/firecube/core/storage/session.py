@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from firecube.core.storage.driver_config import (
         StorageDriverConfig,
     )
-    from firecube.core.zarr.promotion_plan import PlannedObject, PromotionPlan
+    from firecube.core.zarr.guard.promotion_plan import PlannedObject, PromotionPlan
 
 __all__ = [
     "_DUCKDB_OBSTORE_REMOTE_MESSAGE",
@@ -332,7 +332,7 @@ class StorageSession:
                 (every cell equals the fill value); they become deletes.
 
         Returns:
-            The plan of :func:`~firecube.core.zarr.promotion_plan.build_promotion_plan`.
+            The plan of :func:`~firecube.core.zarr.guard.promotion_plan.build_promotion_plan`.
             An object the run did not write is unchanged when the target holds
             the same bytes (one read of the target object). A ``zarr.json`` is
             also unchanged when the target array is longer on its first axis
@@ -342,10 +342,13 @@ class StorageSession:
 
         Raises:
             ValueError: ``src`` is not a local directory, or the units fail
-                :func:`~firecube.core.zarr.promotion_plan.build_promotion_plan`'s
+                :func:`~firecube.core.zarr.guard.promotion_plan.build_promotion_plan`'s
                 checks.
         """
-        from firecube.core.zarr.promotion_plan import build_promotion_plan, list_workspace_objects
+        from firecube.core.zarr.guard.promotion_plan import (
+            build_promotion_plan,
+            list_workspace_objects,
+        )
 
         source_path = _local_tree_root(src, "plan_promotion")
         fs = self.fs()
@@ -426,7 +429,7 @@ class StorageSession:
                 ones not done.
             ValueError: ``src`` is not a local directory.
         """
-        from firecube.core.zarr.promotion_plan import PromotionAction
+        from firecube.core.zarr.guard.promotion_plan import PromotionAction
 
         source_path = _local_tree_root(src, "publish_plan")
         operations = [obj for obj in plan.objects if obj.action is not PromotionAction.UNCHANGED]
@@ -576,7 +579,7 @@ def _refuse_unsafe_plan(
     malformed key would put or delete an object outside the product (or a
     different one inside it) rather than fail.
     """
-    from firecube.core.zarr.promotion_plan import PromotionAction
+    from firecube.core.zarr.guard.promotion_plan import PromotionAction
 
     malformed = [obj.key for obj in plan.objects if not _is_canonical_key(obj.key)]
     if malformed:

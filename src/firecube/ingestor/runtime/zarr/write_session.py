@@ -77,21 +77,21 @@ from zarr.buffer import default_buffer_prototype
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.errors import ConfigurationError, StorageError
 from firecube.core.storage.completion import StagedPromotionUnits
-from firecube.core.zarr._unit_locks import canonical_array_path
 from firecube.core.zarr._zarr_compat import sync
-from firecube.core.zarr.guarded_write import Unit, WriteResult, unit_store_key
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard._unit_locks import canonical_array_path
+from firecube.core.zarr.guard.guarded_write import Unit, WriteResult, unit_store_key
+from firecube.core.zarr.guard.metadata_authority import (
     HeldClaim,
     MetadataAuthority,
     update_document,
 )
-from firecube.core.zarr.region_writer import RegionZarrWriter
-from firecube.core.zarr.unit_ownership import (
+from firecube.core.zarr.guard.unit_ownership import (
     StagedSlotWrite,
     require_staged_units_fully_written,
     require_target_within_clipped_units,
     staged_unit_object_keys,
 )
+from firecube.core.zarr.region_writer import RegionZarrWriter
 
 
 def _target_array_shape(store: Any, path: str) -> tuple[int, ...] | None:

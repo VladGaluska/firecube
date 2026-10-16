@@ -28,7 +28,7 @@ from zarr.core.sync import sync
 from zarr.storage import LocalStore, MemoryStore
 
 from firecube.cli.main import cli
-from firecube.core.zarr.guarded_write import (
+from firecube.core.zarr.guard.guarded_write import (
     WriteFootprint,
     guarded_write,
     hold_array,
@@ -326,7 +326,7 @@ def test_guarded_write_refuses_other_than_basic_selections_before_locking(
     def no_lock(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("a unit lock was taken for an unsupported selection")
 
-    monkeypatch.setattr("firecube.core.zarr.guarded_write._UNIT_LOCKS.hold", no_lock)
+    monkeypatch.setattr("firecube.core.zarr.guard.guarded_write._UNIT_LOCKS.hold", no_lock)
 
     with pytest.raises(ValueError, match="int, slice and Ellipsis selections only") as raised:
         guarded_write(arr, WriteFootprint("data/v", ((0, 2),)), selection, 0.0, store="test")

@@ -57,9 +57,9 @@ from firecube.core.api import (
 )
 from firecube.core.errors import ClaimConflictError, IndexedWriteCompilationError
 from firecube.core.indexed_write import IndexedWrite
-from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
-from firecube.core.zarr.engine_owned import is_engine_owned_spec
-from firecube.core.zarr.metadata_authority import MetadataAuthority, hold_authority
+from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.guard.metadata_authority import MetadataAuthority, hold_authority
 from firecube.ingestor.api import (
     BaseIngestor,
     ConfigurationError,

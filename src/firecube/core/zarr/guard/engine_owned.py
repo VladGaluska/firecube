@@ -49,7 +49,7 @@ from firecube.core.zarr._sealing_markers import (
     ATTR_ENGINE_OWNED_COMPLETE,
     ATTR_ENGINE_OWNED_SLOTS,
 )
-from firecube.core.zarr.metadata_authority import MetadataAuthority, set_attributes
+from firecube.core.zarr.guard.metadata_authority import MetadataAuthority, set_attributes
 
 PREALLOCATE_COMMAND = (
     "firecube zarr preallocate <plugin> --target <uri> --product-name <name> "
@@ -381,7 +381,7 @@ def materialize_engine_owned_array(
     node below *root* from the store first, never through *arr*.
     """
     # Function-scope import: guarded_write imports unit_ownership, which imports this module.
-    from firecube.core.zarr.guarded_write import WriteFootprint, guarded_write, hold_array
+    from firecube.core.zarr.guard.guarded_write import WriteFootprint, guarded_write, hold_array
 
     def stamp(attrs: Mapping[str, Any]) -> None:
         set_attributes(authority, root, array_path, attrs)

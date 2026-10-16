@@ -40,18 +40,18 @@ from firecube.core.uris import storage_uri_from_target
 from firecube.core.zarr._drift import (
     arrays_equal_missing_aware as _arrays_equal_missing_aware,
 )
-from firecube.core.zarr._layout import resolve_effective_layout, warn_default_layout
-from firecube.core.zarr.chunk_geometry import physical_chunk_keys_for_region
-from firecube.core.zarr.engine_owned import is_engine_owned_spec, is_pod_written_slot_array
-from firecube.core.zarr.guarded_write import WriteResult
-from firecube.core.zarr.metadata_authority import (
+from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
+from firecube.core.zarr.guard.chunk_geometry import physical_chunk_keys_for_region
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec, is_pod_written_slot_array
+from firecube.core.zarr.guard.guarded_write import WriteResult
+from firecube.core.zarr.guard.metadata_authority import (
     HeldClaim,
     MetadataAuthority,
     adopt_held_claim,
     ensure_group,
 )
+from firecube.core.zarr.guard.unit_ownership import require_window_owns_stored_units
 from firecube.core.zarr.region_writer import RegionZarrWriter, open_root_read_only
-from firecube.core.zarr.unit_ownership import require_window_owns_stored_units
 from firecube.ingestor.runtime.coverage import CoverageTracker
 from firecube.ingestor.runtime.parallel_evidence import log_filter_evidence
 

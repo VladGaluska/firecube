@@ -21,8 +21,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from firecube.core.index_resolve import ExtentUnknownError
-from firecube.core.zarr._layout import slot_window_layout
-from firecube.core.zarr.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.guard._layout import slot_window_layout
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
 from firecube.ingestor.errors import (
     ConfigurationError,
     UnboundedAxisError,

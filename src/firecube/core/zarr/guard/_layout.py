@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The one definition of the chunk layout a DirectZarr array is created with.
+"""The one definition of the chunk layout a time-indexed Zarr array is created with.
 
 Every site that creates a time-indexed array (``zarr preallocate``, pod
 startup, the serial write path) and every planner that aligns slot windows to

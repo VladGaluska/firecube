@@ -462,7 +462,7 @@ _SEEDED_DOCUMENTS = {"zarr.json", "G/zarr.json", "G/timestamp/zarr.json", "G/val
 
 
 def _workspace_authority(temp: Path):
-    from firecube.core.zarr.metadata_authority import MetadataAuthority
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthority
     from firecube.core.zarr.region_writer import RegionZarrWriter
 
     return MetadataAuthority.process_local(RegionZarrWriter(str(temp)).metadata_scope())
@@ -528,7 +528,7 @@ def test_seed_with_authority_writes_every_document_through_it(
 @pytest.mark.parametrize("strict", [True, False])
 def test_seed_with_released_authority_refuses_and_leaves_no_document(tmp_path, strict):
     """A released authority refuses in strict and best-effort mode; no document lands."""
-    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthorityError
 
     final = tmp_path / "final.zarr"
     _make_v3_target(final)
@@ -545,7 +545,7 @@ def test_seed_with_released_authority_refuses_and_leaves_no_document(tmp_path, s
 
 def test_seed_for_batch_does_not_swallow_a_refused_authority(tmp_path):
     """The best-effort batch wrapper propagates the refusal instead of logging it away."""
-    from firecube.core.zarr.metadata_authority import MetadataAuthorityError
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthorityError
     from firecube.ingestor.runtime.zarr.batch_runner import seed_staged_metadata_for_batch
 
     final = tmp_path / "final.zarr"
@@ -576,7 +576,7 @@ def test_staged_session_seeding_authority_is_process_local_and_released_on_close
     """The session's seeding authority covers the whole workspace and ends with the session."""
     import contextlib
 
-    from firecube.core.zarr.metadata_authority import AuthorityBasis
+    from firecube.core.zarr.guard.metadata_authority import AuthorityBasis
     from firecube.ingestor.runtime.zarr.write_session import ZarrWriteSession
 
     def session(write_mode: str, workspace_uri: str | None) -> ZarrWriteSession:
@@ -661,7 +661,7 @@ def test_concurrent_seed_never_replaces_a_document_a_writer_changed(tmp_path):
 
     from zarr.storage import LocalStore
 
-    from firecube.core.zarr.metadata_authority import set_attributes
+    from firecube.core.zarr.guard.metadata_authority import set_attributes
 
     final = tmp_path / "final.zarr"
     _make_v3_target(final)

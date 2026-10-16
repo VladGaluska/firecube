@@ -19,8 +19,8 @@ from typing import Protocol, cast
 
 from firecube.core.index_spec import RegularTimeAxis, effective_regular_time_policy
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
-from firecube.core.zarr._layout import ArraySpecLike, resolve_effective_layout
-from firecube.core.zarr.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.guard._layout import ArraySpecLike, resolve_effective_layout
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
 
 
 class _ResolvedIndexLike(Protocol):
