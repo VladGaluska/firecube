@@ -157,7 +157,9 @@ Implemented target lanes for the testing overhaul:
 | Extended storage | Storage-driver and S3 parity | s3, obstore/fsspec remote integration, larger upload paths |
 | Release | Full pre-tag evidence | strict deps, warnings as errors, coverage, docs build, package checks |
 
-The command for each lane lives in `plans/TEST.md` ("Lanes") and nowhere else.
+The command for each lane is defined in `plans/TEST.md` ("Lanes"). `README.md`,
+`CONTRIBUTING.md`, the PR template, `.prompts/`, `plans/RELEASE.md` and the CI
+workflows repeat those commands and follow `plans/TEST.md` when one changes.
 
 Do not add a new lane marker unless the marker is registered, documented, and
 assigned a clear command in `plans/TEST.md`.
@@ -245,7 +247,7 @@ Before an agent adds or edits tests, it must:
 Agents must not add broad snapshot, static grep, or xfail tests to make progress
 look measurable. Test count is not a quality metric.
 
-### Table-driven merges (added 2026-10-14, test diet)
+### Table-driven merges (added 2026-10-14)
 
 Fold tests into one `subtests` table only when they share one body and differ
 only in data, and only when the table plus body is smaller than the tests it
@@ -254,8 +256,8 @@ state (no fixture, tmp path, or mutable object shared between rows). Delete a
 mirror or duplicate only when a surviving test guards the same failure mode,
 proved with a mutant. Tests with distinct bodies stay separate tests, and
 parametrizations that are already compact stay as they are. Case count is an
-outcome, not a target. Record each merge in the node's survivor mapping (old
-name to row id).
+outcome, not a target. Record each merge (old test name to row id) in the
+change that makes it, so a reviewer can find where a deleted test went.
 
 ## Review Checklist
 

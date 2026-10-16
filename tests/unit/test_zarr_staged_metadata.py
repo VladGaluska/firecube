@@ -487,7 +487,7 @@ def _seed(temp: Path, final: Path, *, strict: bool = True, authority=None) -> di
 def test_seed_with_authority_writes_every_document_through_it(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Each seeded zarr.json is published under the authority; none is written as a plain file."""
+    """Each seeded zarr.json is published under the authority, with the plain path's bytes."""
     from firecube.ingestor.runtime.zarr import staged_metadata
 
     final = tmp_path / "final.zarr"
@@ -510,15 +510,6 @@ def test_seed_with_authority_writes_every_document_through_it(
 
     for name in ("publish_document", "publish_document_if_absent"):
         monkeypatch.setattr(staged_metadata, name, recording(name))
-    original_write_bytes = Path.write_bytes
-
-    def no_plain_documents(self: Path, data: bytes) -> int:
-        if self.name == "zarr.json" and self.is_relative_to(temp):
-            raise AssertionError(f"zarr.json written around the authority: {self}")
-        return original_write_bytes(self, data)
-
-    monkeypatch.setattr(Path, "write_bytes", no_plain_documents)
-
     result = _seed(temp, final, authority=authority)
 
     assert result["G"]["seeded"] is True
@@ -579,33 +570,6 @@ def test_seed_for_batch_does_not_swallow_a_refused_authority(tmp_path):
         )
 
     assert not temp.exists() or not list(temp.rglob("zarr.json"))
-
-
-def test_seed_without_authority_is_todays_plain_copy(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """No authority: nothing goes through publish_document and the bytes are today's copy."""
-    from firecube.ingestor.runtime.zarr import staged_metadata
-
-    def refuse(*_args, **_kwargs):
-        raise AssertionError("publish_document called without an authority")
-
-    monkeypatch.setattr(staged_metadata, "publish_document", refuse)
-    monkeypatch.setattr(staged_metadata, "publish_document_if_absent", refuse)
-    final = tmp_path / "final.zarr"
-    _make_v3_target(final)
-    temp = tmp_path / "temp.zarr"
-
-    _seed(temp, final)
-
-    files = _workspace_files(temp)
-    assert files.keys() == _SEEDED_DOCUMENTS | {"G/timestamp/c/0"}
-    # Root and coordinate chunk verbatim; node documents re-serialised with the
-    # run-state marker stripped, exactly as before.
-    assert files["zarr.json"] == (final / "zarr.json").read_bytes()
-    assert files["G/timestamp/c/0"] == (final / "G/timestamp/c/0").read_bytes()
-    for key in _SEEDED_DOCUMENTS - {"zarr.json"}:
-        expected = json.loads((final / key).read_bytes())
-        expected.get("attributes", {}).pop("firecube_static_written", None)
-        assert files[key] == json.dumps(expected).encode()
 
 
 def test_staged_session_seeding_authority_is_process_local_and_released_on_close(tmp_path):

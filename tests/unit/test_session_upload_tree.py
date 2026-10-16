@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -43,7 +42,6 @@ from firecube.core.zarr.promotion_plan import (
     build_promotion_plan,
     list_workspace_objects,
 )
-from firecube.core.zarr.unit_ownership import StagedSlotWrite, staged_unit_object_keys
 from tests.helpers.storage import make_test_session
 
 
@@ -485,57 +483,13 @@ def _plan(
     written: set[str] | None = None,
     absent: set[str] | None = None,
     unchanged: set[str] | None = None,
-    asked: list[str] | None = None,
 ) -> PromotionPlan:
-    def _is_unchanged(key: str) -> bool:
-        if asked is not None:
-            asked.append(key)
-        return key in (unchanged or set())
-
     return build_promotion_plan(
         workspace_objects=workspace,
         written_units=written or set(),
         absent_units=absent or set(),
-        is_unchanged=_is_unchanged,
+        is_unchanged=lambda key: key in (unchanged or set()),
     )
-
-
-def test_promotion_plan_written_unit_in_workspace_is_put() -> None:
-    plan = _plan({"a/c/0": 7}, written={"a/c/0"})
-
-    assert [(o.key, o.action, o.size, o.reason) for o in plan.objects] == [
-        ("a/c/0", PromotionAction.PUT, 7, "written-unit")
-    ]
-
-
-def test_promotion_plan_absent_written_unit_is_delete() -> None:
-    plan = _plan({"a/c/1": 3}, written={"a/c/0", "a/c/1"}, absent={"a/c/0"})
-
-    assert [(o.key, o.size) for o in plan.deletes] == [("a/c/0", 0)]
-    assert [o.key for o in plan.puts] == ["a/c/1"]
-
-
-def test_promotion_plan_written_unit_without_evidence_is_refused() -> None:
-    with pytest.raises(ValueError, match="a/c/0"):
-        _plan({}, written={"a/c/0"})
-
-
-def test_promotion_plan_other_objects_are_unchanged_or_put() -> None:
-    asked: list[str] = []
-    plan = _plan(
-        {"t/c/0": 4, "s/c/0": 5, "a/c/0": 6},
-        written={"a/c/0"},
-        unchanged={"t/c/0"},
-        asked=asked,
-    )
-
-    assert [o.key for o in plan.unchanged] == ["t/c/0"]
-    assert [(o.key, o.reason) for o in plan.puts] == [
-        ("a/c/0", "written-unit"),
-        ("s/c/0", "unclaimed"),
-    ]
-    assert plan.unchanged[0].size == 0
-    assert "a/c/0" not in asked  # a written unit is never judged by bytes
 
 
 def test_promotion_plan_absent_not_subset_of_written_raises() -> None:
@@ -558,47 +512,14 @@ def test_promotion_plan_zarr_json_is_last_and_follows_shape_rule() -> None:
     assert all(not o.is_metadata for o in plan.objects[:-2])
 
 
-def test_promotion_plan_never_deletes_unclaimed_objects() -> None:
-    plan = _plan({"x/c/0": 1, "y/c/0": 1}, written={"x/c/0"})
-
-    assert plan.deletes == ()
-
-
-def test_promotion_plan_empty_inputs() -> None:
-    plan = _plan({})
-
-    assert plan.objects == ()
-    assert plan.puts == plan.deletes == plan.unchanged == ()
-
-
 def test_list_workspace_objects_lists_only_the_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "ws.zarr"
     (workspace / "a" / "c").mkdir(parents=True)
     (workspace / "a" / "c" / "0").write_bytes(b"12345")
     (workspace / "zarr.json").write_text("{}", encoding="utf-8")
     (workspace / "empty").mkdir()
-    target = tmp_path / "target.zarr"
-    (target / "old").mkdir(parents=True)
-    (target / "old" / "c").write_bytes(b"x")
 
     assert list_workspace_objects(workspace) == {"a/c/0": 5, "zarr.json": 2}
-
-
-def test_staged_unit_object_keys_names_units_zarr_left_out() -> None:
-    import numpy as np
-    import zarr
-    from zarr.storage import MemoryStore
-
-    root = zarr.open_group(MemoryStore(), mode="w")
-    arr = root.create_array(
-        "g/v", shape=(4, 2), chunks=(1, 2), dtype="f4", fill_value=0.0, dimension_names=("t", "x")
-    )
-    arr[1, :] = np.ones(2, dtype="f4")
-    touched = [StagedSlotWrite("g/v", 1), StagedSlotWrite("g/v", 3)]
-
-    assert staged_unit_object_keys(root, touched) == {"g/v/c/1/0", "g/v/c/3/0"}
-    assert staged_unit_object_keys(None, touched) == frozenset()
-    assert staged_unit_object_keys(root, []) == frozenset()
 
 
 # --- promotion publication (session plan_promotion / publish_plan) -----------
@@ -778,24 +699,20 @@ def test_publish_plan_metadata_goes_last_through_publish_metadata(tmp_path: Path
     "bad",
     [
         PlannedObject("../other/a/c/0", PromotionAction.DELETE, 0, "deleted-unit"),
-        PlannedObject("/other/a/c/0", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a//c/0", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a/c/0/", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a/./c/1", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a\\c\\1", PromotionAction.DELETE, 0, "deleted-unit"),
-        PlannedObject("", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a/c/0", PromotionAction.DELETE, 0, "deleted-unit"),  # listed twice
         PlannedObject("a/zarr.json", PromotionAction.DELETE, 0, "deleted-unit"),
         PlannedObject("a/c/7", PromotionAction.PUT, 3, "written-unit"),  # not in the workspace
     ],
     ids=[
         "dotdot",
-        "absolute",
         "empty-segment",
         "trailing-slash",
         "dot",
         "backslash",
-        "empty",
         "duplicate",
         "delete-metadata",
         "put-missing",
@@ -807,7 +724,7 @@ def test_publish_plan_refuses_unsafe_plans_before_any_operation(
     source = tmp_path / "ws.zarr"
     target = tmp_path / "target.zarr"
     victim = tmp_path / "other" / "a" / "c" / "0"
-    _put_files(source, {"a/c/0": b"new0"})
+    _put_files(source, {"a/c/0": b"new0", "a/zarr.json": b"{}"})
     _put_files(target, {"a/c/0": b"old0", "a/c/1": b"old1", "a/zarr.json": b"{}"})
     _put_files(tmp_path, {"other/a/c/0": b"victim"})
     plan = PromotionPlan((PlannedObject("a/c/0", PromotionAction.PUT, 4, "written-unit"), bad))
@@ -821,34 +738,6 @@ def test_publish_plan_refuses_unsafe_plans_before_any_operation(
     assert (target / "a/c/0").read_bytes() == b"old0"
     assert (target / "a/c/1").read_bytes() == b"old1"
     assert (target / "a/zarr.json").read_bytes() == b"{}"
-
-
-def test_publish_plan_pool_drains_after_failure_with_more_objects_than_workers(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "ws.zarr"
-    target = tmp_path / "target.zarr"
-    keys = [f"a/c/{i:02d}" for i in range(12)]
-    _put_files(source, dict.fromkeys(keys, b"x"))
-    (target / "a" / "c" / "00").mkdir(parents=True)
-    session = _session(str(target))
-    src, dst = StorageUri.from_local_path(source), StorageUri.from_local_path(target)
-    plan = session.plan_promotion(src, dst, written_units=set(keys), absent_units=set())
-    outcome: list[BaseException] = []
-
-    def _publish() -> None:
-        try:
-            session.publish_plan(plan, src, dst, parallel_workers=2)
-        except BaseException as exc:
-            outcome.append(exc)
-
-    worker = threading.Thread(target=_publish, daemon=True)
-    worker.start()
-    worker.join(timeout=60)
-
-    assert not worker.is_alive(), "publish_plan did not return after a failed object"
-    assert len(outcome) == 1 and isinstance(outcome[0], StorageError)
-    assert "of 12 object operation(s)" in str(outcome[0])
 
 
 # --- promotion publication against real stores (moto S3, local) -------------

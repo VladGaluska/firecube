@@ -6,8 +6,8 @@ Set the chunk shape of the arrays your plugin writes. Chunking decides how
 much data one read has to fetch. Decide it before the first real run: a
 written cube keeps its chunk shape, and appends must match it, so changing
 it later means writing a new cube. Without a setting, `GenericZarrIngestor`
-lets Zarr pick a shape itself (for a `(2, 720, 1440)` array it chose
-`(1, 180, 720)`). `DirectZarrIngestor` has its own default, described below.
+lets Zarr pick a shape itself. For a `(2, 720, 1440)` array it chose
+`(1, 180, 720)`. `DirectZarrIngestor` has its own default, described below.
 
 | Template | Where the chunk shape comes from |
 |---|---|
@@ -104,8 +104,11 @@ ZarrArraySpec(
 For a new worker-written time-indexed array, omit `chunks=` and `shards=` to
 use one slot per chunk. Firecube creates the array without sharding. Zarr
 selects the other chunk dimensions. Set `chunks=` to choose a chunk shape. Set
-`shards=` to choose a shard shape. Declared shards remain unchanged when you
-omit `chunks=`. Slot ranges must cover whole stored chunks or shards; see
+`shards=` to choose a shard shape. If you omit `chunks=`, Firecube keeps the
+declared shards.
+
+Slot ranges must cover whole stored chunks or shards. This includes the chunks
+that a time coordinate declares. See
 [Chunk Ownership Refusals](../../operations/parallel-zarr-writes.md#chunk-ownership-refusals).
 
 Time coordinates and engine-owned arrays use dense chunks by default. Existing

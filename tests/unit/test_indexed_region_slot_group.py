@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -44,10 +46,14 @@ def _intent(group: str, ts_index: int) -> WriteIntent:
 def _patch_writer(
     monkeypatch: pytest.MonkeyPatch,
     dispatched: list[tuple[str, int]],
+    on_build: Callable[[dict[str, Any]], None] = lambda kwargs: None,
 ) -> None:
+    def build(*args, **kwargs) -> _Writer:
+        on_build(kwargs)
+        return _Writer()
+
     monkeypatch.setattr(
-        "firecube.ingestor.runtime.zarr.strategies.indexed_region.RegionZarrWriter",
-        lambda *args, **kwargs: _Writer(),
+        "firecube.ingestor.runtime.zarr.strategies.indexed_region.RegionZarrWriter", build
     )
     monkeypatch.setattr(
         IndexedRegionStrategy,
@@ -112,18 +118,7 @@ def test_slot_window_batches_build_fixed_extent_writers_and_serial_batches_do_no
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     built: list[bool] = []
-
-    def record_writer(*args, **kwargs):
-        built.append(kwargs["fixed_extent"])
-        return _Writer()
-
-    monkeypatch.setattr(
-        "firecube.ingestor.runtime.zarr.strategies.indexed_region.RegionZarrWriter",
-        record_writer,
-    )
-    monkeypatch.setattr(
-        IndexedRegionStrategy, "_dispatch_intent", staticmethod(lambda writer, intent: None)
-    )
+    _patch_writer(monkeypatch, [], on_build=lambda kwargs: built.append(kwargs["fixed_extent"]))
     strategy = IndexedRegionStrategy(store_uri=str(tmp_path / "test.zarr"))
 
     strategy.write_groups(group_to_intents={"A": [_intent("A", 5)]}, slot_range=(0, 100))

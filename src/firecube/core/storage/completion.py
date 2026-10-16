@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from firecube.core.config import StorageConfig
-from firecube.core.errors import StorageError
+from firecube.core.errors import ConfigurationError, StorageError
 from firecube.core.product import CompletionRoute, write_mode_policy
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.product.target import ProductTarget
@@ -72,6 +72,9 @@ class StagedPromotionUnits:
             relative to ``target``) under the run's authority over the target;
             returns ``False`` when it wrote nothing, which promotion then
             does not count as written.
+        ledger_arrays: ``group/array`` paths whose writes the run records.
+            Promotion refuses a changed data object of these arrays that
+            ``written`` does not hold.
     """
 
     workspace: str
@@ -79,6 +82,7 @@ class StagedPromotionUnits:
     written: frozenset[str]
     absent: frozenset[str]
     publish_metadata: Callable[[str, bytes], bool | None]
+    ledger_arrays: frozenset[str] = frozenset()
 
 
 def _same_root(left: str, right: StorageUri) -> bool:
@@ -100,9 +104,16 @@ def _promote(
 
     A delta is refused, before anything is written to ``dst``, when the
     units name other roots than ``src`` and ``dst`` (their keys would land on
-    other objects) or when the plan cannot be proved (a written unit neither
-    in the workspace nor reported absent).
+    other objects), when the plan cannot be proved (a written unit neither
+    in the workspace nor reported absent), or when it would publish a changed
+    data object of a ledger array that no recorded write covers.
+
+    Raises:
+        StorageError: The roots differ or the plan cannot be proved.
+        ConfigurationError: The plan holds such an uncovered data object.
     """
+    from firecube.core.zarr.promotion_plan import unclaimed_data_objects
+
     if staged_units is None:
         return session.upload_tree(src, dst, parallel_workers=parallel_workers)
     if not _same_root(staged_units.workspace, src) or not _same_root(staged_units.target, dst):
@@ -117,6 +128,15 @@ def _promote(
         )
     except ValueError as exc:
         raise StorageError(f"staged promotion refused, target untouched: {exc}") from exc
+    uncovered = unclaimed_data_objects(plan, staged_units.ledger_arrays)
+    if uncovered:
+        raise ConfigurationError(
+            f"staged promotion refused, target untouched: {len(uncovered)} workspace data "
+            "object(s) differ from the target, but no write of this run covers them: "
+            f"{list(uncovered[:20])}. Publishing them would overwrite target data this run "
+            "never wrote. They come from outside this run's batches, for example a reused "
+            "workspace; rerun with a fresh workspace."
+        )
     return session.publish_plan(
         plan,
         src,
@@ -144,6 +164,9 @@ class StorageCompleter:
         Raises:
             StorageError: No target session, the staged output is missing,
                 the delta is refused (nothing written), or an upload fails.
+            ConfigurationError: The delta would publish a changed data object
+                of ``staged_units.ledger_arrays`` that no recorded write
+                covers; nothing is written.
         """
         session = _output_session(ctx)
         if session is None:

@@ -56,7 +56,8 @@ promotion until `close`, a ``PROCESS_LOCAL`` authority over the whole target
 store: a staged run holds no cross-process claim at promotion, so only this
 process's threads are excluded. `staged_promotion_units` hands promotion the
 units the run proved written and the absent ones, as object keys, with a
-``zarr.json`` publisher bound to that authority. The publisher never drops an
+``zarr.json`` publisher bound to that authority, and the arrays whose
+uncovered data objects promotion refuses. The publisher never drops an
 attribute the target array already has: markers such as engine ownership live
 only in the target, and the run's workspace copy may be a shell without them.
 """
@@ -68,7 +69,7 @@ import enum
 import functools
 import json
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any
 
 from zarr.buffer import default_buffer_prototype
@@ -76,6 +77,7 @@ from zarr.buffer import default_buffer_prototype
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.errors import ConfigurationError, StorageError
 from firecube.core.storage.completion import StagedPromotionUnits
+from firecube.core.zarr._unit_locks import canonical_array_path
 from firecube.core.zarr._zarr_compat import sync
 from firecube.core.zarr.guarded_write import Unit, WriteResult, unit_store_key
 from firecube.core.zarr.metadata_authority import (
@@ -230,7 +232,8 @@ class StagedWriteLedger:
     """Slot writes of one staged run: touched before dispatch, written after success.
 
     Promotion copies whole workspace objects over the target, so before it
-    every touched unit must have been written in every cell.
+    every touched unit must have been written in every cell. ``arrays``
+    names the arrays whose every promoted data object a ledger entry must cover.
     """
 
     def __init__(self) -> None:
@@ -238,11 +241,21 @@ class StagedWriteLedger:
         self.store_uri: str | None = None
         self.touched: list[StagedSlotWrite] = []
         self.written: list[StagedSlotWrite] = []
+        self.arrays: set[str] = set()
 
-    def record(self, store_uri: str, writes: Sequence[StagedSlotWrite], *, written: bool) -> None:
+    def record(
+        self,
+        store_uri: str,
+        writes: Sequence[StagedSlotWrite],
+        *,
+        written: bool,
+        arrays: Iterable[str] = (),
+    ) -> None:
+        """Add *writes* and the ledger *arrays*; ``written`` selects the list."""
         with self._lock:
             self.store_uri = store_uri
             (self.written if written else self.touched).extend(writes)
+            self.arrays.update(canonical_array_path(path) for path in arrays)
 
 
 class ZarrWriteSession:
@@ -472,7 +485,9 @@ class ZarrWriteSession:
         left without an object (all fill), which promotion deletes. A unit a
         guarded write left absent but the ledger does not prove written
         (time coordinate, static, engine-owned arrays) is not listed: it is
-        never deleted. Keys are relative to the workspace root, which is
+        never deleted. ``ledger_arrays`` names the pod-written arrays the
+        batches recorded; promotion refuses their changed data objects that
+        ``written`` lacks. Keys are relative to the workspace root, which is
         also the target root. ``publish_metadata`` puts a promoted
         ``zarr.json`` under the session's authority over the target, keeping
         the target's attributes of an array it already holds; it is refused
@@ -523,6 +538,7 @@ class ZarrWriteSession:
                 written=written,
                 absent=absent,
                 publish_metadata=functools.partial(_publish_promoted_document, authority, store),
+                ledger_arrays=frozenset(ledger.arrays),
             )
 
     def _promotion_keys(
@@ -571,6 +587,11 @@ class ZarrWriteSession:
         with self._operation():
             return self._open_final_root(ctx)
 
+    def staged_root(self, store_uri: str) -> Any | None:
+        """The staged workspace at *store_uri*, read-only; ``None`` when it does not exist."""
+        with self._operation():
+            return self._open_root(store_uri)
+
     def engine_owned_checked(self) -> bool:
         with self._operation(), self._results_lock:
             return self._engine_owned_checked
@@ -607,9 +628,16 @@ class ZarrWriteSession:
                 owner_id=f"{self.run_id}:{group}:slot={ts_index}",
             )
 
-    def record_touched(self, store_uri: str, writes: Sequence[StagedSlotWrite]) -> None:
+    def record_touched(
+        self, store_uri: str, writes: Sequence[StagedSlotWrite], *, arrays: Iterable[str] = ()
+    ) -> None:
+        """Record slot writes about to run, and the arrays whose writes the ledger holds.
+
+        Promotion refuses a changed data object of *arrays* that no written
+        entry covers.
+        """
         with self._operation():
-            self._ledger.record(store_uri, writes, written=False)
+            self._ledger.record(store_uri, writes, written=False, arrays=arrays)
 
     def record_written(self, store_uri: str, writes: Sequence[StagedSlotWrite]) -> None:
         with self._operation():

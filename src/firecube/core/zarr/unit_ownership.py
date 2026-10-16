@@ -123,10 +123,15 @@ class StagedSlotWrite:
 
     Attributes:
         array_path: ``group/array`` written.
-        ts_index: The slot.
+        ts_index: The slot the write addressed, absolute: a slot counted from
+            the end is resolved before it is recorded.
         rows: Region ``(start, stop)`` along the second axis (slice semantics,
             ``None`` ends allowed), or ``None`` for every row.
         channel: Region channel of a rank-4 array, or ``None`` for every channel.
+
+    Raises:
+        TypeError: ``ts_index`` is not an integer.
+        ValueError: ``ts_index`` is negative.
     """
 
     array_path: str
@@ -137,8 +142,21 @@ class StagedSlotWrite:
     def __post_init__(self) -> None:
         # One spelling per array, so two spellings of it cannot split its ledger.
         object.__setattr__(self, "array_path", canonical_array_path(self.array_path))
+        # A slot counted from the end names another slot once the array grows.
+        ts_index = operator_index(self.ts_index)
+        if ts_index < 0:
+            raise ValueError(
+                f"staged slot write to {self.array_path} has ts_index {ts_index}; "
+                "the ledger records absolute slots only"
+            )
+        object.__setattr__(self, "ts_index", ts_index)
 
     def bounds(self, shape: Sequence[int]) -> Bounds:
+        """The cells this write covers in an array of *shape*.
+
+        Raises:
+            IndexError: The slot, or the channel, lies outside *shape*.
+        """
         ts_index = _axis_index(self.ts_index, int(shape[0]))
         out: list[tuple[int, int]] = [(ts_index, ts_index + 1)]
         if len(shape) > 1:

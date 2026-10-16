@@ -206,8 +206,12 @@ the full contract.
 
 ### Pick Chunks For Pod-Written Arrays
 
-The example uses `chunks=(1, 4)` for `value`: one slot per chunk, so any slot
-range is safe. See
+The example uses `chunks=(1, 4)` for `value`. That is one slot per chunk, so
+`value` does not constrain the slot ranges. The example also declares
+`chunks=(24,)` for the time coordinate `timestamp`. A time coordinate that
+declares chunks constrains the slot ranges. In this example, each slot range
+must start and end on a multiple of 24 slots. Plan the ranges with
+`firecube zarr slots`. See
 [Configure Zarr Chunking](configure-zarr-chunking.md#in-a-directzarringestor-schema)
 for the defaults and how to override them.
 
@@ -253,24 +257,18 @@ def inspect_item(self, item: object, ctx: PluginContext) -> ItemInfo | None:
 `build_write_intents` does not change. It still writes only the arrays that
 workers write.
 
-Firecube stores each value in the dtype of its array. A float array rounds a
-finite number to the nearest value its dtype holds, and accepts NaN and
-infinity. `firecube zarr preallocate` refuses a value it cannot store without
-changing it, before it creates or writes any array:
+For an integer array, `firecube zarr preallocate` refuses these values:
 
-- NaN or infinity for an integer array.
-- A fraction (such as `2.5`) or a number outside the dtype's range for an
-  integer array. A whole float such as `3.0` is accepted.
-- Anything but a `bool` or `numpy.bool_` for a bool array. The integer `1` is
-  refused.
-- A finite number too large for a float array, such as `1e300` for `float32`,
-  because it would be stored as infinity.
+- NaN
+- infinity
+- a fraction
+- a number that is out of range
 
-The message names the array, the item, the value and the reason, for example
-`which cannot be stored as int32: not a whole number`.
-
-Firecube reads `ItemInfo.values` only when the schema declares an engine-owned
-array. Without one, it ignores `values` and does not check its keys.
+It refuses the value before it creates or writes any array. The message names
+the array, the item, the value and the reason. Firecube can round a finite
+float to the dtype of the array.
+[`ItemInfo`](../../reference/parallelism.md#firecube.ingestor.api.ItemInfo)
+lists the casting rules and all refusals.
 
 Run `firecube zarr preallocate` with `--input-data` before ingest. Run it once
 for the whole product, without slot flags. Rerun it after an interruption or

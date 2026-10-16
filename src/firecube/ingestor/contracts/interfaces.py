@@ -316,30 +316,6 @@ class _StagedPromotionUnits(Protocol):
     def _staged_promotion_units(self) -> StagedPromotionUnits | None: ...
 
 
-@runtime_checkable
-class StagedPromotionHost(
-    _SparseWindowRefusal,
-    _IncompleteUnitsRefusal,
-    _StagedSeedingAuthority,
-    _StagedPromotionUnits,
-    Protocol,
-):
-    """Internal capability: a host that checks staged unit coverage.
-
-    The engine calls the two refusals for staged runs only: the first before
-    any batch exists, the second just before promotion. It asks for the
-    seeding authority before each batch of a Zarr output and seeds the
-    workspace metadata under it (``None``: seeded as for any other host).
-    After the second refusal passed it asks a staged run for its promotion
-    units and, when given some, promotes the object delta they prove
-    (deletions of units left all fill included) instead of the whole
-    workspace tree (``None``: the whole tree, as before). It checks each
-    hook independently, so a host may implement any of them alone; a host
-    without the seeding hook seeds as before, one without the units hook
-    promotes as before. Not part of the plugin contract and not exported.
-    """
-
-
 __all__ = [
     "AppendWriteStrategy",
     "DatasetProducer",

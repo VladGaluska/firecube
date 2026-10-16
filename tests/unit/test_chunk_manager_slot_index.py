@@ -312,16 +312,13 @@ def test_root_creation_by_a_paused_mirror_does_not_erase_a_completed_mirror(
 
     second = threading.Thread(target=run_second_mirror)
 
-    def second_settled() -> bool:
-        """The second mirror finished, or is queued behind the first on a node lock."""
-        with _NODE_LOCKS._guard:
-            queued = any(entry.users >= 2 for entry in _NODE_LOCKS._entries.values())
-        return second_done.is_set() or queued
-
     def wait_until_second_settled(timeout_s: float = 30.0) -> bool:
+        """Wait until the second mirror finished, or is queued behind the first on a node lock."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if second_settled():
+            with _NODE_LOCKS._guard:
+                queued = any(entry.users >= 2 for entry in _NODE_LOCKS._entries.values())
+            if second_done.is_set() or queued:
                 return True
             time.sleep(0.005)
         return False

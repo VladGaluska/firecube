@@ -18,8 +18,8 @@ The plugin must:
 
 - subclass `DirectZarrIngestor`;
 - declare `index_spec(ctx)` with a regular time axis;
-- implement `inspect_item(item, ctx)` to return `ItemInfo(coordinate=...)`
-  (with `values=` when the schema has engine-owned arrays);
+- implement `inspect_item(item, ctx)` to return `ItemInfo(coordinate=...)`,
+  with `values=` when the schema has engine-owned arrays;
 - declare the complete Zarr schema;
 - map source values to deterministic indexes through the resolved index.
 
@@ -103,7 +103,8 @@ firecube zarr slots <plugin> \
 
 Each row contains a group and a half-open range such as `[0, 144)`. The slot
 size must cover whole stored chunks or shards of every worker-written
-time-indexed array. Omit `--format table` to receive the JSON plan used by
+time-indexed array. It must also cover the chunks or shards that the time
+coordinate declares. Omit `--format table` to receive the JSON plan used by
 schedulers.
 
 Planning is resume-aware by default: completed ranges are excluded. Use
@@ -227,17 +228,13 @@ claims.
 
 ## Chunk Ownership Refusals
 
-Each worker must own disjoint ranges of whole stored units. A stored unit is a
-shard for a sharded array. Otherwise, it is a chunk. Use `firecube zarr slots`
-to plan ranges. In staged mode, write every cell of each unit you touch. Use
-`--write-mode direct` for partial-unit updates.
+Firecube refuses a slot range that splits a stored chunk or shard of an array
+the workers write. It raises `ConfigurationError` before the worker writes.
 
-To allow one-slot ranges, create a new array without sharding and with time
-chunk 1.
-
-Firecube does not change an existing array's layout. A slot-alignment refusal
-leaves product data unchanged. A partial-unit staged refusal leaves the target
-unchanged. See [Recover A Blocked Plan](#recover-a-blocked-plan).
+Plan the ranges with `firecube zarr slots`, as in step 2. To see a refusal and
+its fix, follow [Fix A Chunk Ownership Refusal](fix-chunk-ownership-refusal.md).
+For the reasons, read [Chunk Ownership](../concepts/output-formats/zarr/chunk-ownership.md).
+For a blocked plan, see [Recover A Blocked Plan](#recover-a-blocked-plan).
 
 ## Recover A Blocked Plan
 

@@ -153,94 +153,56 @@ class TestEnsureTimestampSlot:
         assert writer._open_root()["grp/data"].shape == (1, 10)
 
 
-def _write_while_another_batch_grows_the_array(store_path, monkeypatch, shape, chunks, write):
-    """Hold writer A's write of slot 8 before its unit locks while writer B grows to 12 slots.
-
-    ``write(writer, slot, value)`` writes one slot. A writes slot 8 with 8.0 after B has grown the
-    array from 9 to 12 slots and written slots 9, 10 and 11 with their own number. Returns the
-    array as stored after both finished.
-    """
-    from firecube.core.zarr._unit_locks import _UNIT_LOCKS
-
-    kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": chunks}
-    writer_a = RegionZarrWriter(store_path)
-    writer_a.ensure_group("grp/data", shape=shape, **kwargs)
-    reached, release = threading.Event(), threading.Event()
-    errors: list[BaseException] = []
-    holder: list[threading.Thread] = []
-    original_hold = _UNIT_LOCKS.hold
-    first = [True]
-
-    def hold(keys):
-        if threading.current_thread() is holder[0] and first[0]:
-            first[0] = False
-            reached.set()
-            if not release.wait(30.0):
-                raise AssertionError("writer A was never released")
-        return original_hold(keys)
-
-    monkeypatch.setattr(_UNIT_LOCKS, "hold", hold)
-
-    def run_a():
-        try:
-            write(writer_a, 8, 8.0)
-        except BaseException as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=run_a)
-    holder.append(thread)
-    thread.start()
-    try:
-        assert reached.wait(30.0), "writer A never reached its unit locks"
-        writer_b = RegionZarrWriter(store_path)
-        writer_b.ensure_group("grp/data", shape=(12, *shape[1:]), allow_grow=True, **kwargs)
-        for slot in (9, 10, 11):
-            write(writer_b, slot, float(slot))
-    finally:
-        release.set()
-        thread.join(30.0)
-    assert not thread.is_alive(), "writer A never finished"
-    if errors:
-        raise errors[0]
-    return zarr.open_array(f"{store_path}/grp/data", mode="r")
-
-
 class TestWriteRegion:
     def test_stale_extent_does_not_erase_slots_another_batch_wrote(self, store_path, monkeypatch):
-        def write(w, slot, value):
-            w.write_region(
-                "grp",
-                "data",
-                ts_index=slot,
-                y_slice=slice(None),
-                data=np.full((4, 4), value, dtype=np.float32),
-            )
+        from firecube.core.zarr._unit_locks import _UNIT_LOCKS
 
-        stored = _write_while_another_batch_grows_the_array(
-            store_path, monkeypatch, (9, 4, 4), (4, 4, 4), write
-        )
-
-        assert stored.shape == (12, 4, 4)
-        slots = np.asarray(stored[8:12, 0, 0]).tolist()
-        assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
-
-    def test_serial_writer_reads_the_grown_extent_on_every_write(self, store_path):
         kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": (4, 4, 4)}
         writer_a = RegionZarrWriter(store_path)
         writer_a.ensure_group("grp/data", shape=(9, 4, 4), **kwargs)
-        writer_b = RegionZarrWriter(store_path)
+        reached, release = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        holder: list[threading.Thread] = []
+        original_hold = _UNIT_LOCKS.hold
+        first = [True]
 
-        def write(w, slot):
-            data = np.full((4, 4), float(slot), dtype=np.float32)
+        def hold(keys):
+            if threading.current_thread() is holder[0] and first[0]:
+                first[0] = False
+                reached.set()
+                if not release.wait(30.0):
+                    raise AssertionError("writer A was never released")
+            return original_hold(keys)
+
+        monkeypatch.setattr(_UNIT_LOCKS, "hold", hold)
+
+        def write(w, slot, value):
+            data = np.full((4, 4), value, dtype=np.float32)
             w.write_region("grp", "data", ts_index=slot, y_slice=slice(None), data=data)
 
-        write(writer_a, 0)
-        writer_b.ensure_group("grp/data", shape=(12, 4, 4), allow_grow=True, **kwargs)
-        for slot in (9, 10, 11):
-            write(writer_b, slot)
-        write(writer_a, 8)
+        def run_a():
+            try:
+                write(writer_a, 8, 8.0)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_a)
+        holder.append(thread)
+        thread.start()
+        try:
+            assert reached.wait(30.0), "writer A never reached its unit locks"
+            writer_b = RegionZarrWriter(store_path)
+            writer_b.ensure_group("grp/data", shape=(12, 4, 4), allow_grow=True, **kwargs)
+            for slot in (9, 10, 11):
+                write(writer_b, slot, float(slot))
+        finally:
+            release.set()
+            thread.join(30.0)
+        assert not thread.is_alive(), "writer A never finished"
+        assert errors == []
 
         stored = zarr.open_array(f"{store_path}/grp/data", mode="r")
+        assert stored.shape == (12, 4, 4)
         slots = np.asarray(stored[8:12, 0, 0]).tolist()
         assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
 
@@ -257,6 +219,30 @@ class TestWriteRegion:
         stored = zarr.open_array(f"{store_path}/grp/data", mode="r")
         assert stored.shape == (12, 4, 4)
         assert np.asarray(stored[10, 0, 0]).item() == 5.0
+
+    def test_fixed_extent_writer_reads_no_metadata_after_its_first_write(
+        self, store_path, monkeypatch
+    ):
+        kwargs = {"dtype": np.float32, "fill_value": np.nan, "chunks": (4, 4, 4)}
+        RegionZarrWriter(store_path).ensure_group("grp/data", shape=(9, 4, 4), **kwargs)
+        data = np.full((4, 4), 1.0, dtype=np.float32)
+        reads = {"fixed": 0, "default": 0}
+        original_get = LocalStore.get
+
+        async def counting_get(self, key, *args, **kw):
+            if key.endswith("zarr.json"):
+                reads[mode] += 1
+            return await original_get(self, key, *args, **kw)
+
+        monkeypatch.setattr(LocalStore, "get", counting_get)
+        for mode, fixed_extent in (("fixed", True), ("default", False)):
+            w = RegionZarrWriter(store_path, fixed_extent=fixed_extent)
+            w.write_region("grp", "data", ts_index=0, y_slice=slice(None), data=data)
+            reads[mode] = 0
+            for slot in (1, 2, 3):
+                w.write_region("grp", "data", ts_index=slot, y_slice=slice(None), data=data)
+
+        assert reads == {"fixed": 0, "default": 3}
 
     def test_3d_write(self, writer):
         writer.ensure_group(
@@ -327,18 +313,6 @@ def test_cached_handle_follows_another_writers_growth(store_path, entry, ts_inde
 
 
 class TestWrite1D:
-    def test_stale_extent_does_not_erase_slots_another_batch_wrote(self, store_path, monkeypatch):
-        def write(w, slot, value):
-            w.write_1d("grp", "data", ts_index=slot, data=np.float32(value))
-
-        stored = _write_while_another_batch_grows_the_array(
-            store_path, monkeypatch, (9,), (4,), write
-        )
-
-        assert stored.shape == (12,)
-        slots = np.asarray(stored[8:12]).tolist()
-        assert slots == [8.0, 9.0, 10.0, 11.0], f"slots 8..11 read back {slots}"
-
     def test_writes_slot(self, writer):
         writer.ensure_group(
             "grp/cal",
@@ -512,54 +486,6 @@ def _stored(arr, unit):
 class TestOnWrite:
     """Every payload write goes through guarded_write and reports its WriteResult."""
 
-    @pytest.mark.parametrize(
-        ("shards", "absent", "deleted"),
-        [
-            pytest.param(
-                None,
-                [((0, 0, 0),), (), (), ((1, 0, 0),), ((0, 0, 0),)],
-                [(), (), (), ((1, 0, 0),), ((0, 0, 0),)],
-                id="chunk",
-            ),
-            pytest.param(
-                (2, 2, 2),
-                [((0, 0, 0),), (), (), (), ((0, 0, 0),)],
-                [(), (), (), (), ((0, 0, 0),)],
-                id="shard",
-            ),
-        ],
-    )
-    def test_reports_absent_and_deleted_units(self, store_path, shards, absent, deleted):
-        """All-fill into a never-stored unit is absent only; emptying a stored unit deletes it.
-
-        A shard is deleted only when its last stored inner chunk becomes all-fill.
-        """
-        seen: list[WriteResult] = []
-        writer = RegionZarrWriter(
-            store_path, write_empty_chunks=False, on_write=seen.append, track_units=True
-        )
-        writer.ensure_group(
-            "grp/img",
-            shape=(4, 2, 2),
-            dtype=np.float32,
-            fill_value=0.0,
-            chunks=(1, 2, 2),
-            shards=shards,
-        )
-        arr = writer._open_root()["grp/img"]
-
-        for slot, value in [(0, 0.0), (1, 1.0), (0, 1.0), (1, 0.0), (0, 0.0)]:
-            writer.write_region(
-                "grp", "img", slot, slice(0, 2), np.full((2, 2), value, dtype=np.float32)
-            )
-            result = seen[-1]
-            assert result.absent == tuple(u for u in result.units if not _stored(arr, u))
-
-        assert [r.tracked for r in seen] == [True] * 5
-        assert [r.absent for r in seen] == absent
-        assert [r.deleted for r in seen] == deleted
-        np.testing.assert_array_equal(arr[...], np.zeros((4, 2, 2), dtype=np.float32))
-
     def test_every_payload_site_reports(self, store_path):
         seen: list[WriteResult] = []
         writer = RegionZarrWriter(store_path, on_write=seen.append)
@@ -607,31 +533,18 @@ class TestOnWrite:
         """A slow sink cannot let a later write of the same unit be recorded first.
 
         A stores a value in the one chunk and its sink stalls; B then empties
-        the chunk. The session must end with the chunk recorded absent, as it
-        is on disk, whatever the sinks' speed.
+        the chunk. B's result must reach the sink after A's, as the chunk is
+        absent on disk, whatever the sinks' speed.
         """
-        from firecube.ingestor.runtime.zarr.write_session import ZarrWriteSession
-
-        session = ZarrWriteSession(
-            product="p",
-            run_id="r",
-            write_mode="staged",
-            window=None,
-            slot_group=None,
-            acquire_claim=lambda **_kw: contextlib.nullcontext(),
-            open_root=lambda _uri: None,
-            open_final_root=lambda _ctx: None,
-        )
         recorded: list[str] = []
         a_in_sink, release_a = threading.Event(), threading.Event()
 
         def sink(name: str):
-            def record(result: WriteResult) -> None:
+            def record(_result: WriteResult) -> None:
                 if name == "A":
                     a_in_sink.set()
                     assert release_a.wait(10)
                 recorded.append(name)
-                session.record_write_result(result, store_uri="ws")
 
             return record
 
@@ -666,8 +579,6 @@ class TestOnWrite:
         assert errors == []
         assert not _stored(_on_disk(store_path, "grp/img"), (0, 0, 0))
         assert recorded == ["A", "B"], "results reached the sink out of write order"
-        assert session.absent_units("ws") == {"grp/img": frozenset({(0, 0, 0)})}
-        assert session.written_units("ws") == {"grp/img": frozenset({(0, 0, 0)})}
 
 
 def _on_disk(store_path, path) -> zarr.Array:

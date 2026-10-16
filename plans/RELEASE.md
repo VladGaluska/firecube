@@ -97,7 +97,7 @@ At minimum, a release must verify:
 - `uv run ruff format --check`
 - `uv run pyright`
 - `uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning`
-- `uv run pytest --strict-deps -m "not slow and not s3" --cov=firecube --cov-report=term-missing --cov-report=xml -q`
+- `uv run pytest --strict-deps -m "not slow and not s3 and not race" --cov=firecube --cov-report=term-missing --cov-report=xml -q`
 - `uv run pytest tests/unit/test_version_consistency.py -q`
 - `uv run mkdocs build --strict --site-dir /tmp/firecube-mkdocs-check`
 - `uv build`

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from firecube.core.api import ExtentUnknownError
@@ -299,13 +300,69 @@ class DirectRegionAdapter:
 
     # --- staged footprints -----------------------------------------------------------
 
+    def absolute_slots(self, store_uri: str, intents: Sequence[WriteIntent]) -> list[WriteIntent]:
+        """Return a staged batch's *intents* with every negative ``ts_index`` made absolute.
+
+        The slot counts from the end of the workspace array the intent writes,
+        read once here. The ledger records and the writer receives that slot,
+        so a later batch that grows the array cannot change it. A
+        ``timestamp`` intent counts on its group's time coordinate. A slot
+        window refuses negative slots instead, as the strategy does; a run
+        that is not staged gets *intents* unchanged.
+
+        Raises:
+            ConfigurationError: A negative slot addresses an array the
+                workspace does not hold yet, or lies before its first slot.
+            WriteIntentRangeError: In a slot window, a slot lies outside the window.
+        """
+        session = self._session
+        slotted = ("region", "1d", "timestamp")
+        if not session.staged or not any(
+            intent.kind in slotted and intent.ts_index is not None and int(intent.ts_index) < 0
+            for intent in intents
+        ):
+            return list(intents)
+        window = session.window
+        if window is not None:
+            owned: dict[str, list[WriteIntent]] = {}
+            for intent in intents:
+                if session.slot_group is None or intent.group == session.slot_group:
+                    owned.setdefault(intent.group, []).append(intent)
+            require_intents_in_slot_window(owned, window, session.slot_group)
+            return list(intents)
+        root = session.staged_root(store_uri)
+        lengths: dict[str, int | None] = {}
+        out: list[WriteIntent] = []
+        for intent in intents:
+            if intent.kind not in slotted or intent.ts_index is None or int(intent.ts_index) >= 0:
+                out.append(intent)
+                continue
+            name = self._coord_name if intent.kind == "timestamp" else intent.array
+            path = f"{intent.group}/{name}"
+            if path not in lengths:
+                arr = open_zarr_array(root, path) if root is not None else None
+                lengths[path] = int(arr.shape[0]) if arr is not None and arr.ndim > 0 else None
+            length = lengths[path]
+            slot = int(intent.ts_index) + (length or 0)
+            if length is None or slot < 0:
+                held = "does not hold it yet" if length is None else f"holds {length} slot(s)"
+                raise ConfigurationError(
+                    f"WriteIntent.{intent.kind} for '{path}' has ts_index={intent.ts_index}, "
+                    f"which counts from the end of the array, but the staged workspace {held}; "
+                    "emit an absolute slot instead"
+                )
+            out.append(replace(intent, ts_index=slot))
+        return out
+
     def staged_footprints(
         self, intents: Sequence[WriteIntent]
     ) -> tuple[list[StagedSlotWrite], list[StagedSlotWrite]]:
         """Slot writes of a staged batch: ``(touched, written on success)``.
 
         A strided row selection is touched but never counts as written, so a
-        unit it lands in is refused rather than promoted half-filled.
+        unit it lands in is refused rather than promoted half-filled. Pass
+        *intents* through :meth:`absolute_slots` first: a negative slot raises
+        ``ValueError``.
         """
         window = self._session.window
         slot_group = self._session.slot_group
@@ -347,14 +404,17 @@ class DirectRegionAdapter:
         """Run the batch's writes as one admitted batch of the session.
 
         In a staged run the touched units are recorded before the writes and
-        the written ones only when the body returns normally.
+        the written ones only when the body returns normally. Every
+        pod-written array of the schema is recorded as a ledger array, whose
+        uncovered data objects promotion refuses.
         """
         with self._session.admit_write():
             if not self._session.staged:
                 yield
                 return
             touched, written = self.staged_footprints(intents)
-            self._session.record_touched(store_uri, touched)
+            arrays = [path for path, _, _ in self.pod_written_specs(None)]
+            self._session.record_touched(store_uri, touched, arrays=arrays)
             yield
             if written:
                 self._session.record_written(store_uri, written)

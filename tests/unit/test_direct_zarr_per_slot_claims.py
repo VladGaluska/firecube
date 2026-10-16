@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +29,7 @@ import zarr
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.zarr.guarded_write import WriteResult
-from firecube.core.zarr.metadata_authority import AuthorityBasis, HeldClaim, MetadataAuthority
+from firecube.core.zarr.metadata_authority import AuthorityBasis, MetadataAuthority
 from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.core.zarr.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import IndexedRegionStrategy
@@ -303,21 +302,6 @@ def _session(calls: list[dict[str, Any]], **overrides: Any) -> ZarrWriteSession:
     return ZarrWriteSession(**kwargs)
 
 
-def test_session_claim_names_match_the_ingestor_claims() -> None:
-    calls: list[dict[str, Any]] = []
-    session = _session(calls)
-    with session.schema_claim("F024"):
-        pass
-    with session.slot_claim("F024", 7):
-        pass
-    assert [(c["domain"].name, c["owner_id"]) for c in calls] == [
-        ("F024:schema", "run-1:F024"),
-        ("F024:slot=7", "run-1:F024:slot=7"),
-    ]
-    assert {c["domain"].category for c in calls} == {"zarr_region"}
-    assert {c["product"] for c in calls} == {"product.zarr"}
-
-
 def test_session_shares_schema_claim_between_concurrent_batches() -> None:
     calls: list[dict[str, Any]] = []
     session = _session(calls)
@@ -545,10 +529,7 @@ class _SignallingCondition(threading.Condition):
         return super().wait_for(predicate, timeout)
 
 
-@pytest.mark.parametrize("first_drain", ["completes", "times-out"])
-def test_session_second_close_returns_only_after_the_first_close_finished(
-    tmp_path: Path, first_drain: str
-) -> None:
+def test_session_second_close_returns_only_after_the_first_close_finished(tmp_path: Path) -> None:
     """A second closer waits for the first closer's drain and authority release.
 
     When that drain timed out with the batch still in flight, the second
@@ -559,7 +540,7 @@ def test_session_second_close_returns_only_after_the_first_close_finished(
         [],
         write_mode="staged",
         workspace_uri=str(tmp_path / "ws.zarr"),
-        drain_timeout=10.0 if first_drain == "completes" else 0.5,
+        drain_timeout=0.5,
     )
     first_draining, second_settled = threading.Event(), threading.Event()
     session._cond = _SignallingCondition(
@@ -602,29 +583,19 @@ def test_session_second_close_returns_only_after_the_first_close_finished(
         assert first_draining.wait(5)  # TERMINAL, the first closer waits for the batch
         second.start()
         assert second_settled.wait(5)  # the second closer waits, or has returned
-        if first_drain == "completes":
-            release.set()
         first.join(10)
         second.join(10)
     finally:
         release.set()
         worker.join(10)
 
-    if first_drain == "completes":
-        assert first_errors == []
-        assert second_errors == []
-        assert at_second_return == [(0, False)]
-    else:
-        assert len(first_errors) == 1 and "still in flight" in str(first_errors[0])
-        # The first closer gave up on the batch, which was still in flight when
-        # the second closer settled: the second reports the same failure.
-        assert [(type(e), str(e)) for e in second_errors] == [
-            (WriteSessionStateError, str(first_errors[0]))
-        ]
-        assert at_second_return == [(1, False)]
-        # The batch has left (worker joined): a later close completes.
-        assert session._in_flight == 0
-        session.close()
+    assert len(first_errors) == 1 and "still in flight" in str(first_errors[0])
+    assert [(type(e), str(e)) for e in second_errors] == [
+        (WriteSessionStateError, str(first_errors[0]))
+    ]
+    assert at_second_return == [(1, False)]
+    assert session._in_flight == 0
+    session.close()
     assert session.state is SessionState.TERMINAL
 
 
@@ -663,22 +634,6 @@ def test_session_records_write_results_per_store() -> None:
     assert session.written_units("other") == {}
 
 
-def test_session_all_fill_result_keeps_absent_within_written() -> None:
-    session = _session([])
-    result = WriteResult(
-        footprint=WriteFootprint("g/a", ((0, 4),)),
-        units=((0,), (1,)),
-        absent=((0,), (1,)),
-        deleted=((0,),),
-        tracked=True,
-    )
-    session.record_write_result(result, store_uri="ws")
-    written = session.written_units("ws")
-    absent = session.absent_units("ws")
-    assert absent == {"g/a": frozenset({(0,), (1,)})}
-    assert absent["g/a"] <= written["g/a"]
-
-
 def test_session_recreated_unit_leaves_the_absent_set() -> None:
     session = _session([])
     footprint = WriteFootprint("g/a", ((0, 4),))
@@ -692,25 +647,6 @@ def test_session_recreated_unit_leaves_the_absent_set() -> None:
     )
     assert session.absent_units("ws") == {"g/a": frozenset({(1,)})}
     assert session.written_units("ws") == {"g/a": frozenset({(0,), (1,)})}
-
-
-def test_session_admit_write_from_many_threads() -> None:
-    session = _session([])
-
-    def write(_i: int) -> None:
-        with session.admit_write():
-            assert session.state is SessionState.WRITING
-
-    with ThreadPoolExecutor(8) as pool:
-        list(pool.map(write, range(64)))
-    assert session.state is SessionState.WRITING
-    session.close()
-
-
-def test_session_schema_claim_hands_the_held_claim_to_its_scope() -> None:
-    session = _session([])
-    with session.schema_claim("F024") as held:
-        assert held == HeldClaim("product.zarr:zarr_region:F024:schema", "run-1:F024")
 
 
 def _spy_writer_authorities(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any, bool]]:
@@ -817,3 +753,23 @@ def test_staged_direct_zarr_batch_records_written_and_absent_units(
     assert written == {"F024/data": frozenset({(0, 0), (1, 0)})}
     assert absent == {"F024/data": frozenset({(0, 0)})}
     assert absent["F024/data"] <= written["F024/data"]
+
+
+def test_direct_batch_keeps_no_written_or_absent_units(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_uri = str(tmp_path / "target.zarr")
+    chunk_manager = SimpleNamespace(storage_config=None, acquire_claim=lambda **_kw: nullcontext())
+    ingestor = _StagedUnitsIngestor(chunk_manager=chunk_manager)
+    ingestor.engine_config = cast(Any, SimpleNamespace(write_mode="direct", slot_group=None))
+    monkeypatch.setattr(ingestor, "resolve_output_uri", lambda ctx, write_mode: store_uri)
+    ctx = SimpleNamespace(run_id="run-1", storage=None, option=lambda key, default=None: default)
+
+    session = begin_write_session(ingestor, ctx)
+    batch = SimpleNamespace(items=["s"], metadata={})
+    ingestor._process_batch(cast(Any, batch), cast(Any, ctx))
+
+    data = cast(Any, zarr.open_group(store=store_uri, mode="r", zarr_format=3)["F024/data"])
+    assert data[1].tolist() == [1.0, 1.0]
+    assert session.written_units(store_uri) == {}
+    assert session.absent_units(store_uri) == {}

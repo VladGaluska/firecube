@@ -33,17 +33,19 @@ Each mechanism has a specific purpose. Use the right one, and always supply a re
 
 ## Lanes
 
-This is the only place that states the lane commands. `tests/README.md` and
-`plans/TESTING_STANDARDS.md` point here. Run from the repository root after
+This is the canonical statement of the lane commands. `README.md`,
+`CONTRIBUTING.md`, the PR template, `.prompts/` and `plans/RELEASE.md` repeat
+them; when a command changes here, change those copies and
+`.github/workflows/` with it. Run from the repository root after
 `uv sync --extra test` and `uv pip install -e tests/fixtures/firecube_test_plugins`.
 
 | Lane | Command | Collected |
 |---|---|---|
-| Fast behavior (primary gate; CI `test` job adds `-n auto` and coverage) | `uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short` | 4170 |
-| Docs/static drift (CI `docs` job also runs `uv run --group docs mkdocs build --strict`) | `uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short` | 48 |
+| Fast behavior (primary gate; CI `test` job adds `-n auto` and coverage) | `uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short` | 3634 |
+| Docs/static drift (CI `docs` job first runs `uv run mkdocs build --strict --site-dir /tmp/firecube-mkdocs-check`) | `uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short` | 38 |
 | Extended storage (S3) | `uv run pytest --strict-deps -m "s3 and not race" -q --tb=short` | 37 |
 | Slow | `uv run pytest --strict-deps -m "slow and not race" -q --tb=short` | 3 |
-| Full run before merge or release | `uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning` | 4257 |
+| Full run before merge or release | `uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning` | 3711 |
 | Race (red by design, explicit only) | `uv run pytest -m race` | 30 |
 
 Counts are `--collect-only` totals at the time of writing and move with the
@@ -53,8 +55,12 @@ The `--strict-deps` flag (registered in `tests/conftest.py`) causes pytest colle
 
 `pyproject.toml` sets `addopts = "-ra -q --strict-markers -m 'not race'"`. A CLI
 `-m` expression REPLACES that `-m 'not race'` filter, so every explicit `-m`
-invocation other than the race lane must carry `and not race` itself; omitting
-it runs the red-by-design race characterization and fails the lane. Invocations
+invocation other than the race lane must carry `and not race` itself wherever a
+race test could match the expression; omitting it there runs the red-by-design
+race characterization and fails the lane. An explicit `-m` filter replaces the
+default exclusion and can select race tests: a negative expression such as
+`not slow` matches the race tests, because they carry neither `s3` nor
+`slow`. Invocations
 without `-m` (the full run, `uv run pytest -q`) keep the `addopts` filter.
 
 The fast lane is the primary behavior gate for agentic workloads. The docs/static
@@ -90,6 +96,10 @@ uv run pytest tests/unit/test_chunk_manager.py -q
 | `race` | Red-by-design characterization of a known legacy race; excluded from the default lane and all CI lanes. Run explicitly via `-m race`. |
 | `gate` | Deterministic concurrency-invariant gates (e.g. coordinate-materialization serialization). Run in the default lane; use `-m gate` to run them alone. |
 | `concurrency` | Tests parallel/concurrent behaviour |
+| `benchmark` | Remote-reader timing check: the one test carrying it, `test_remote_open_time` in `tests/integration/test_open_time_default_reader.py`, opens the store at `FIRECUBE_OBJSTORE_URL` with default reader settings and asserts elapsed time within a budget; it skips when `FIRECUBE_OBJSTORE_URL` is unset, so it skips in the fast lane unless that variable is set |
+| `benchmark_evidence` | Long-form, high-fidelity benchmark evidence; manual, not part of the default CI lane |
+
+`pyproject.toml` registers these 14 markers. `--strict-markers` is on, so an unregistered marker is a collection error.
 
 Mark tests at definition time. Unmarked tests are still collected; markers exist to let you filter, not to gate collection.
 
@@ -113,8 +123,6 @@ fixture modules keep their individual names (`cli_test_plugin`,
 
 Plugin-specific compatibility tests belong in each plugin's own repository,
 not here: core's test bench must not depend on sibling plugin checkouts.
-
-`tests/benchmarks/lazy_writeintent_harness/peak_retained_payload_campaign.py` is operator-run; its RSS and baseline checks are no longer CI gates.
 
 ## Test Suite Options
 

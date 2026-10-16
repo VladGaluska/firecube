@@ -1635,6 +1635,9 @@ class DirectZarrIngestor(BaseIngestor):
                     metrics={**prep_metrics, "count": len(intents)},
                     success=True,
                 )
+            # Staged: the ledger and the writer must name one slot, whatever
+            # another batch later does to the array's extent.
+            intents_to_write = adapter.absolute_slots(str(store_uri), intents_to_write)
 
             strategy = IndexedRegionStrategy(
                 store_uri=store_uri,
@@ -1740,8 +1743,10 @@ class DirectZarrIngestor(BaseIngestor):
                         None,
                     ),
                     zarr_write_empty_chunks=zarr_write_empty_chunks,
-                    on_write=functools.partial(
-                        session.record_write_result, store_uri=str(store_uri)
+                    on_write=(
+                        functools.partial(session.record_write_result, store_uri=str(store_uri))
+                        if session.staged
+                        else None
                     ),
                     track_units=session.staged,
                 )

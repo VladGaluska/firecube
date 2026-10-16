@@ -127,45 +127,93 @@ These entries record audit findings that were reviewed and accepted rather than 
 
 Arrays declared `engine_owned=True` are single-writer surfaces: ingest pods never write them. A time-coordinate array is one once `firecube zarr preallocate` has marked it (`firecube_preallocated` or `firecube_coord_managed`); pods then only verify it. A coordinate that carries neither marker (no preallocate ran, or a store from before the markers) is written by pods per slot, and two slot-disjoint processes sharing one of its chunks can lose a timestamp (see plans/TODO.md).
 
-The engine materializes coordinate values during `firecube zarr preallocate`. Pods that run later verify the stored value against the incoming coordinate and raise `SchemaDriftError` on mismatch. They never overwrite. For a marked coordinate this eliminates the read-modify-write race that the legacy per-slot chunk model exposed under parallel ingestion.
+The engine materializes coordinate values during `firecube zarr preallocate`. Pods that run later verify the stored value against the incoming coordinate and raise `SchemaDriftError` on mismatch. They never overwrite. For a marked coordinate this removes the race of the unmarked case above: there, each pod writes its own slot of the coordinate, a slot write reads, modifies and writes back the whole chunk, and two pods whose slots share a chunk overwrite each other.
 
 The same invariant covers any rank-1 time-indexed plugin array declared `ZarrArraySpec(engine_owned=True)`. Preallocate inspects every source item (any axis kind, `--input-data` required), collects `ItemInfo.values[name]`, refuses missing, unknown and conflicting values, writes the array whole under a whole-extent materialization claim, and stamps `firecube_engine_owned`. Pods drop intents aimed at it and verify the stored value against the final target (also in staged mode, so promotion has nothing of it to write back). Ingest into a target where it is not materialized is refused, and a pod-written array later declared engine-owned is refused.
 
 ### Chunk-ownership rule for pod-written arrays
 
-No two concurrent writers may read-modify-write one stored write unit (the shard if sharded, else the chunk). A chunk is a read-modify-write unit, so a shared unit loses one writer's slot silently. The rule is enforced on the stored layout, never inferred from declarations:
+No two concurrent writers may read-modify-write one stored unit. A stored unit is the shard if the array is sharded, else the chunk. A chunk is a read-modify-write unit, so a shared unit silently loses the slot of one writer. A slot window is the range of time slots that one pod writes.
 
-- Creation: `core/zarr/_layout.py` decides the creation layout of every array the spec loop, pod startup and the serial path create; it is not the only creator of a coordinate. Undeclared pod-written time-indexed arrays (no chunks, no shards) keep zarr's own whole-array chunks when their time chunk is already 1 (no warning), else get time chunk 1 (zarr's heuristic for the per-slot shape, unsharded) and one warning. A shards-only declaration keeps the declared shards; a rank-1 time-indexed array (pod-written, engine-owned or the time coordinate) gets as its chunk the largest divisor of its shard that is at most `min(256, slots)`. Other declared layouts pass through; the time coordinate and engine-owned arrays without shards stay dense. Coordinate materialization creates its own coordinates (an observed regular coordinate in preallocate, or a coordinate without a spec) with `resolve_coord_chunks`, unsharded, and does not use declared shards. The default is never applied to an existing array.
-- Slot windows: at pod startup and per batch, a window covering a stored unit only partly is refused (`ConfigurationError`) before any write outside `.firecube/`. Units wholly inside the window are legal at any size. Existing unsafe stores (e.g. an undeclared array preallocated dense by an earlier version) are refused by the same rule; they are not repaired.
-- Staged runs: promotion replaces whole objects, so every promoted unit must be written completely in all dimensions (sparse writes by seeding are deferred, see TODO). Window runs are refused before batches; serial runs and partially written rows/channels are refused just before promotion, after workspace writes, with the target untouched.
-- In-process threads (`pipeline_workers`): read-modify-write of one (store, array, unit) is serialised by a per-process lock table; a run's own batches share its schema claim. A static array's marker check, write and stamp run under one whole-array lock, so a concurrent batch with a different payload raises `SchemaDriftError`. Cross-process safety is the ownership rule above, not locks.
+The rule is enforced on the stored layout. It is never inferred from declarations. Four components uphold it.
+
+- Layout at creation (`core/zarr/_layout.py`): it decides the layout of every array that the spec loop, pod startup and the serial path create. It is not the only creator of a coordinate. It never applies a default to an existing array.
+  - An undeclared pod-written time-indexed array (no chunks, no shards) keeps the whole-array chunks of zarr if their time chunk is already 1. No warning is logged.
+  - If the time chunk is not 1, the array gets time chunk 1, the heuristic of zarr for the per-slot shape, and no shards. One warning is logged.
+  - A shards-only declaration keeps the declared shards.
+  - A rank-1 time-indexed array (pod-written, engine-owned or the time coordinate) that declares shards and no chunks gets as its chunk the largest divisor of its shard that is at most `min(256, slots)`. A declared `chunks=` is kept as declared.
+  - Other declared layouts are used as declared. The time coordinate and engine-owned arrays without shards stay dense.
+- Coordinate materialization: it creates its own coordinates with `resolve_coord_chunks`, unsharded, and does not use declared shards. These coordinates are an observed regular coordinate in preallocate, or a coordinate without a spec.
+- Slot-window check: a window that covers a stored unit only partly is refused (`ConfigurationError`). A unit wholly inside the window is legal at any size. The check covers the arrays that pods write; the time coordinate, engine-owned arrays and static arrays are exempt from it.
+  - At pod startup, the check refuses before any write outside `.firecube/`.
+  - Per batch, the check refuses before the writes of that batch. Earlier batches of the run may already have written.
+  - The check also refuses an existing store with an unsafe layout, for example an undeclared array that was preallocated dense. The check does not change the store.
+- Staged promotion check: promotion replaces whole objects, so every promoted unit must be written completely in all dimensions. Sparse writes into a promoted unit are not supported; they would need seeding.
+  - A window run is refused before its batches.
+  - A serial run, or a run with partially written rows or channels, is refused just before promotion, after the workspace writes, with the target untouched.
+
+Threads inside one process (`pipeline_workers`) are serialised by a lock table. The table is per process. It covers the read-modify-write of one (store, array, unit). The batches of a run share its schema claim. A static array runs its marker check, write and stamp under one whole-array lock. A concurrent batch with a different payload therefore raises `SchemaDriftError`. Safety across processes comes from the ownership rule, not from locks.
 
 ### Guarded writes in DirectZarr flows
 
-- Payload writes: every DirectZarr payload write passes one chokepoint, `guarded_write` (`core/zarr/guarded_write.py`). It takes the unit locks (or reuses a whole-array hold this thread already has, in which case it takes none), applies `write_empty_chunks` to the array it writes (never `zarr.config`), writes, and reports the result to the run's write session before the locks are released. Staged runs also record which units the write left without an object.
-- Metadata: in DirectZarr flows `zarr.json` changes only under a metadata authority (`core/zarr/metadata_authority.py`). An authority is either a held claim (`CLAIM`, cross-process exclusion) or `PROCESS_LOCAL` (the threads of this process only; no claim stands behind it). Its operations create, grow (never smaller) and add or replace attributes; each checks the authority before it touches the store and re-reads the node under a per-node lock.
-- Run write session: every DirectZarr run kind (serial, window, staged) builds one run write session at pod startup. It is required and fails closed: a batch or promotion step without one raises `ConfigurationError`. `close` stops new admissions and drains in-flight writes within `drain_timeout`, then ends the session. If the drain times out waiting for in-flight batches or session operations, the first closer raises `WriteSessionStateError` naming the stuck count and the failure is remembered: every later or concurrent `close` raises the same error while work is still in flight and returns normally once nothing is. The first `close` still revokes both authorities (seeding, publishing). The host keeps its session reference after a failed close; when workspace cleanup is enabled the run's cleanup then skips deleting the staged workspace and logs one ERROR naming its path, so the operator removes it after the writes stop; with cleanup disabled (the default) the workspace is never deleted and the failed close is logged as a warning only. The next run on the same host closes the previous session first and is refused while it is stuck. The standard engine joins its workers before it closes, so this is a safety net.
-- `PROCESS_LOCAL` authorities, named exactly. These exclude threads of one process and nothing else:
-  - the legacy unmarked time coordinate (written per slot by pods under the whole-array lock);
-  - the static marker stamp when no claim is held: a window run, setup without a control plane, library use (a run that holds the group's schema claim stamps under it). Cross-process static write-once is deferred;
-  - group schema creation, attribute changes and the static stamp whenever no claim is held: setup without a control plane (`chunk_manager is None`), and the strategy's schema step when its claim callback is absent or yields no held claim;
-  - the control plane's loser recovery mirrors (the root attributes a loser re-mirrors outside the winner's claim);
-  - staged workspace seeding, which is private to the run's process;
-  - promotion's metadata publication: a staged run holds no cross-process claim at promotion;
-  - root and ancestor group creation in ingest (`ensure_group_ancestors`), whatever claim the group holds. `firecube zarr preallocate` adopts the materialization claim for its root and ancestor creation when it holds one (`CLAIM`) and is `PROCESS_LOCAL` only without it. On the `PROCESS_LOCAL` creation paths, on backends whose conditional create is exists-then-put (fsspec), two processes creating the root at once can lose attributes the peer just published. Root creation is therefore safe only when one process initialises the target. This is a named limit; no claim is taken for it.
-- Staged promotion of a DirectZarr run publishes the delta, not the workspace tree: a PUT of every changed object, a DELETE of the target object of a unit the run wrote entirely as fill (the old target values do not survive), only when the array handle does not keep empty chunks and the ledger proves the unit written (never a time-coordinate, static or engine-owned unit), and the `zarr.json` documents last, only when every data operation succeeded. A target array never shrinks: when the target is longer on axis 0 the larger extent is kept, and a structural difference refuses the promotion. A unit the workspace array ends inside (its stored chunk or shard extends past the workspace extent) is proved written only up to that extent: when the run's promotion units are built, the target array's shape is read from its `zarr.json`, and the promotion is refused with the target untouched if the target is longer on an axis where that unit is clipped (the target grew into the unit after the workspace was seeded, for example under a concurrent force-reingest), because the put or delete replaces the whole object and would erase target cells the run never wrote. Units wholly inside the workspace extent are never checked, and a missing, equal, shorter or different-rank target promotes as before. Attributes the target array already has win over the workspace copy. The final merge of each promoted document is atomic under the node lock for the threads of this process only; no other process is excluded.
-- GenericZarr is unchanged: it keeps its ordered write gate, its staged seeding and its whole-workspace upload (`upload_tree`).
+- Payload writes: every DirectZarr payload write passes one chokepoint, `guarded_write` (`core/zarr/guarded_write.py`).
+  - It takes the unit locks. If this thread already holds a whole-array lock, it reuses that hold and takes no unit lock.
+  - It applies `write_empty_chunks` to the array it writes. It never changes `zarr.config`.
+  - It writes, then reports the result to the write session of the run before it releases the locks.
+  - Staged runs also record which units the write left without an object.
+- Metadata: in DirectZarr flows, `zarr.json` changes only under a metadata authority (`core/zarr/metadata_authority.py`).
+  - An authority is either a held claim (`CLAIM`, cross-process exclusion) or `PROCESS_LOCAL`.
+  - `PROCESS_LOCAL` excludes the threads of this process only. No claim stands behind it.
+  - The operations create, grow (never smaller) and add or replace attributes. Each operation checks the authority before it touches the store.
+  - The editing operations re-read the node and write under one per-node lock.
+  - `publish_document` replaces the whole document without re-reading it, so it can erase a marker that the payload lacks.
+  - `publish_document_if_absent` writes only where no document exists.
+- Run write session: every DirectZarr run kind (serial, window, staged) builds one write session at pod startup.
+  - The session is required and fails closed. A batch or promotion step without a session raises `ConfigurationError`.
+  - `close` stops new admissions and drains in-flight writes within `drain_timeout`. Then it ends the session.
+  - If the drain times out waiting for in-flight batches or session operations, the first closer raises `WriteSessionStateError` naming the stuck count.
+  - The failure is remembered. Every later or concurrent `close` raises the same error while work is in flight, and returns normally once nothing is.
+  - The first `close` revokes both authorities (seeding, publishing), also after a timeout.
+  - After a failed close, the host keeps its session reference. If workspace cleanup is enabled, the cleanup of the run skips deleting the staged workspace and logs one ERROR naming its path. The operator removes the workspace after the writes stop.
+  - If workspace cleanup is disabled (the default), the workspace is never deleted and the failed close is logged as a warning only.
+  - The next run on the same host closes the previous session first. It is refused while that session is stuck.
+  - The standard engine joins its workers before it closes.
+- `PROCESS_LOCAL` authorities cover these cases. They exclude threads of one process and nothing else.
+  - An unmarked time coordinate (written per slot by pods under the whole-array lock).
+  - The static marker stamp when no claim is held: a window run, setup without a control plane, library use. A run that holds the schema claim of the group stamps under that claim.
+  - Group schema creation, attribute changes and the static stamp whenever no claim is held: setup without a control plane (`chunk_manager is None`), and the schema step of the strategy when its claim callback is absent or yields no held claim.
+  - The loser recovery mirrors of the control plane (the root attributes that a loser re-mirrors outside the claim of the winner).
+  - Staged workspace seeding (the workspace is private to the process of the run).
+  - The metadata publication of promotion (a staged run holds no cross-process claim at promotion).
+  - Root and ancestor group creation in ingest (`ensure_group_ancestors`), whatever claim the group holds. `firecube zarr preallocate` adopts the materialization claim for its root and ancestor creation when it holds one (`CLAIM`). Without that claim it is `PROCESS_LOCAL`.
+- Staged promotion of a DirectZarr run publishes a delta, not the workspace tree.
+  - It PUTs every changed object.
+  - It DELETEs the target object of a unit that the run wrote entirely as fill, so the old target values do not survive. It deletes only when the array handle does not keep empty chunks and the ledger proves the unit written. It never deletes a time-coordinate, static or engine-owned unit.
+  - It publishes the `zarr.json` documents last, and only when every data operation succeeded.
+  - A target array never shrinks. When the target is longer on axis 0, the larger extent is kept, and a structural difference then refuses the promotion. When the target is equal or shorter, the workspace metadata is published and no structural comparison runs.
+  - A unit that the workspace array ends inside (its stored chunk or shard extends past the workspace extent) is proved written only up to that extent. When the promotion units of the run are built, the shape of the target array is read from its `zarr.json`. If the target is longer on an axis where that unit is clipped, the promotion is refused with the target untouched. The target can have grown into the unit after the workspace was seeded, for example under a concurrent force-reingest. The put or delete replaces the whole object and would erase target cells that the run never wrote.
+  - A unit wholly inside the workspace extent is never checked. A missing, equal, shorter or different-rank target promotes.
+  - Attributes that the target array already has win over the workspace copy.
+  - The final merge of each promoted document is atomic under the node lock for the threads of this process only. No other process is excluded.
+- GenericZarr is outside the guarded write layer.
+  - Its payload writes go through the `to_zarr` of xarray, not through `guarded_write`.
+  - Its `zarr.json` writes are outside the metadata authority.
+  - It seeds staged metadata itself.
+  - It promotes a staged run with `upload_tree`, which uploads the whole workspace tree.
+  - It keeps its ordered write gate.
 
 Not guaranteed:
 
-- A payload committed by a batch that outlives a timed-out `close` fails at recording (the session is terminal) and promotion is refused. A workspace retained after such a close needs operator cleanup.
-- A target that grows into a clipped unit after the promotion check and before the put is not detected; closing that window needs a cross-process claim.
-- Group `zarr.json` documents are published from the workspace as they are: a root attribute written to the final target after the last seed is overwritten by promotion.
-- Coordinate-chunk seeding checks whether the workspace already holds a chunk, then copies it from the target; the check and the copy are not atomic, and the target's chunk can change between them.
-- The whole-array lock and the unit locks do not exclude each other. An array is written under unit locks or under a whole-array hold, never both: static arrays and the legacy unmarked time coordinate under the whole-array hold (a write inside it takes no unit lock), pod-written time-indexed arrays under unit locks.
+- Write-once of a static array across processes.
+- A payload committed by a batch that outlives a timed-out `close` fails at recording (the session is terminal), and promotion is refused. A workspace retained after such a close needs operator cleanup.
+- A target that grows into a clipped unit after the promotion check and before the put is not detected. Closing that window needs a cross-process claim.
+- Group `zarr.json` documents are published from the workspace as they are. A root attribute written to the final target after the last seed is overwritten by promotion.
+- Coordinate-chunk seeding checks whether the workspace already holds a chunk, then copies it from the target. The check and the copy are not atomic, and the chunk of the target can change between them.
+- The whole-array lock and the unit locks do not exclude each other. An array is written under unit locks or under a whole-array hold, never both. Static arrays and an unmarked time coordinate use the whole-array hold, and a write inside it takes no unit lock. Pod-written time-indexed arrays use unit locks.
 - Repeated staged root seeding replaces the workspace root document, so a workspace-root attribute stamped by a plugin group spec with `group=''` is lost on the next seed.
-- Staged metadata seeding writes the workspace through a local path: a non-local workspace is unsupported.
+- Staged metadata seeding writes the workspace through a local path. A non-local workspace is unsupported.
 - A plugin that sends both static and region intents to one array breaks the plugin contract. Nothing enforces it.
+- Root creation on the `PROCESS_LOCAL` creation paths: on backends whose conditional create is exists-then-put (fsspec), two processes that create the root at once can lose attributes that the peer just published. Root creation is safe only when one process initialises the target. No claim is taken for it.
 
 ### Axis regime table
 

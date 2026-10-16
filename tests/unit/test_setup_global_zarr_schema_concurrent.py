@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import pytest
 import zarr
 
 from firecube.core.zarr.metadata_authority import AuthorityBasis, MetadataAuthority
@@ -157,7 +158,10 @@ def _schema_with_group_attrs() -> list[ZarrGroupSpec]:
     ]
 
 
-def test_setup_changes_metadata_under_the_authority_of_its_setup_claim(tmp_path, monkeypatch):
+@pytest.mark.parametrize("control_plane", ["fake", "none"])
+def test_setup_changes_metadata_under_the_authority_naming_its_basis(
+    tmp_path, monkeypatch, control_plane
+):
     store_path = tmp_path / "fresh.zarr"
     events: list[str] = []
 
@@ -173,46 +177,29 @@ def test_setup_changes_metadata_under_the_authority_of_its_setup_claim(tmp_path,
         global_expected={"data": 4},
         product="product",
         run_id="run-1",
-        chunk_manager=_Manager(),
+        chunk_manager=_Manager() if control_plane == "fake" else None,
     )
 
     assert [name for name, *_ in seen] == ["ensure_group", "set_group_attrs"]
     for name, authority, active, before in seen:
         assert isinstance(authority, MetadataAuthority), f"{name} ran without an authority"
-        assert authority.basis is AuthorityBasis.CLAIM
-        assert authority.claim_domain == "product:zarr_schema_global:data:setup"
-        assert authority.owner_id == "run-1:data:schema_global"
-        assert authority.scope.prefix == "data"
-        assert active and before[-1] == "claim-in", f"{name} ran outside the setup claim"
-        assert not authority.active  # released with the claim
-    assert events == [
-        "acquire product:zarr_schema_global:data:setup run-1:data:schema_global",
-        "claim-in",
-        "claim-out",
-    ]
+        assert active
+        if control_plane == "fake":
+            assert authority.basis is AuthorityBasis.CLAIM
+            assert authority.claim_domain == "product:zarr_schema_global:data:setup"
+            assert authority.owner_id == "run-1:data:schema_global"
+            assert authority.scope.prefix == "data"
+            assert before[-1] == "claim-in", f"{name} ran outside the setup claim"
+            assert not authority.active  # released with the claim
+        else:
+            assert authority.basis is AuthorityBasis.PROCESS_LOCAL
+            assert authority.claim_domain is None
+    if control_plane == "fake":
+        assert events == [
+            "acquire product:zarr_schema_global:data:setup run-1:data:schema_global",
+            "claim-in",
+            "claim-out",
+        ]
     root = zarr.open_group(store=str(store_path), mode="r", zarr_format=3)
     assert cast(Any, root["data/data"]).shape == (4, 3, 2)
     assert dict(cast(Any, root["data"]).attrs) == {"title": "setup"}
-
-
-def test_setup_without_a_control_plane_names_a_process_local_authority(tmp_path, monkeypatch):
-    store_path = tmp_path / "fresh.zarr"
-    seen = _spy_metadata_writes(monkeypatch, [])
-    _setup_global_zarr_schema(
-        strategy=_strategy(str(store_path)),
-        schema=_schema_with_group_attrs(),
-        global_expected={"data": 4},
-        product="product",
-        run_id="run-1",
-        chunk_manager=None,
-    )
-
-    assert [name for name, *_ in seen] == ["ensure_group", "set_group_attrs"]
-    for name, authority, active, _before in seen:
-        assert isinstance(authority, MetadataAuthority), f"{name} ran without an authority"
-        assert authority.basis is AuthorityBasis.PROCESS_LOCAL
-        assert authority.claim_domain is None
-        assert active
-    assert dict(
-        cast(Any, zarr.open_group(store=str(store_path), mode="r", zarr_format=3)["data"]).attrs
-    ) == {"title": "setup"}

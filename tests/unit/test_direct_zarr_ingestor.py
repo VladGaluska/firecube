@@ -634,11 +634,9 @@ class TestRunStateClose:
                 with pytest.raises(WriteSessionStateError, match="still in flight"):
                     ingestor._close_run_state()
                 assert ingestor._zarr_write_session is session
-                assert ingestor._write_session() is session
                 # A retry meets the same session and the same failure.
                 with pytest.raises(WriteSessionStateError, match="still in flight"):
                     ingestor._close_run_state()
-                assert ingestor._write_session() is session
                 # So does the next run on this host: it is refused, the session stays.
                 with pytest.raises(WriteSessionStateError, match="still in flight"):
                     begin_write_session(ingestor, ctx)

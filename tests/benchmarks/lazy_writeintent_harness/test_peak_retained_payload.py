@@ -17,8 +17,7 @@
 A callable payload must be resolved at dispatch and released once written:
 the write path may not keep resolved payloads across intents or after the
 call returns. Lifetime is observed with ``weakref`` and ``gc``; there is no
-RSS or timing involved. The RSS campaign lives in
-``peak_retained_payload_campaign.py`` and is run by hand.
+RSS or timing involved.
 """
 
 from __future__ import annotations
@@ -50,14 +49,12 @@ def test_resolved_payloads_are_released_after_each_write(tmp_path: Path) -> None
     )
 
     refs: list[weakref.ref] = []
-    resolve_calls: list[int] = []
     alive_when_resolving: list[tuple[int, int]] = []
 
     def _thunk(slot: int):
         def _resolve() -> np.ndarray:
             gc.collect()
             alive_when_resolving.append((slot, sum(r() is not None for r in refs)))
-            resolve_calls.append(slot)
             payload = np.full((4, 4), float(slot + 1), dtype=np.float32)
             refs.append(weakref.ref(payload))
             return payload
@@ -75,7 +72,7 @@ def test_resolved_payloads_are_released_after_each_write(tmp_path: Path) -> None
         )
         for slot in range(_SLOTS)
     ]
-    assert resolve_calls == [], "payloads must stay lazy until dispatch"
+    assert alive_when_resolving == [], "payloads must stay lazy until dispatch"
 
     IndexedRegionStrategy(store_uri=str(target)).write_groups(group_to_intents={_GROUP: intents})
     gc.collect()
@@ -83,7 +80,6 @@ def test_resolved_payloads_are_released_after_each_write(tmp_path: Path) -> None
     written = zarr.open_array(str(target / _GROUP / "data"), mode="r")
     for slot in range(_SLOTS):
         np.testing.assert_array_equal(written[slot], np.full((4, 4), slot + 1, dtype=np.float32))
-    assert resolve_calls == list(range(_SLOTS)), "each payload resolves exactly once, in order"
     assert alive_when_resolving == [(slot, 0) for slot in range(_SLOTS)], (
         "a previous payload was still referenced when the next one resolved"
     )

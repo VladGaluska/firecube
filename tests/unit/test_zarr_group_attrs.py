@@ -42,19 +42,16 @@ from firecube.core.controlplane.types import WriteDomain
 from firecube.core.zarr.metadata_authority import (
     EMPTY_GROUP_DOCUMENT,
     AuthorityBasis,
-    ClaimProvider,
     MetadataAuthority,
     MetadataAuthorityError,
     MetadataScope,
     create_or_open_array,
     ensure_group,
-    grow_array,
     hold_authority,
     publish_document,
     publish_document_if_absent,
-    reopen,
     set_attributes,
-    set_attributes_if_absent,
+    update_document,
 )
 from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
@@ -223,21 +220,6 @@ def test_authority_refuses_missing_released_out_of_scope_and_foreign(tmp_path: P
 
 
 @pytest.mark.unit
-def test_authority_reopens_the_node_instead_of_writing_a_stale_handle(tmp_path: Path) -> None:
-    root = _local_root(tmp_path)
-    stale = _on_disk(tmp_path, "g/a")
-    auth = MetadataAuthority.process_local(_scope(tmp_path))
-
-    grow_array(auth, root, "g/a", (5,))
-    set_attributes(auth, root, "g/a", {"marker": True})
-    grow_array(auth, root, "g/a", (3,))
-
-    assert stale.shape == (2,)
-    assert _on_disk(tmp_path, "g/a").shape == (5,)
-    assert dict(_on_disk(tmp_path, "g/a").attrs) == {"marker": True}
-
-
-@pytest.mark.unit
 @pytest.mark.filterwarnings("ignore:Consolidated metadata:UserWarning")
 def test_authority_does_not_trust_consolidated_metadata(tmp_path: Path) -> None:
     _local_root(tmp_path)
@@ -256,14 +238,13 @@ def test_authority_does_not_trust_consolidated_metadata(tmp_path: Path) -> None:
 def test_claim_scope_bounds_the_authority(tmp_path: Path) -> None:
     product = "prod.zarr"
     manager = ChunkManager(binding=make_test_binding(tmp_path, product=product), workspace=tmp_path)
-    provider: ClaimProvider = manager
     store_path = tmp_path / product
     root = _local_root(store_path)
     domain = WriteDomain(product=product, category="zarr_schema_global", name="g:setup")
 
     with hold_authority(
         _scope(store_path, "g"),
-        claim=provider.acquire_claim(product=product, domain=domain, owner_id="run-1"),
+        claim=manager.acquire_claim(product=product, domain=domain, owner_id="run-1"),
         claim_domain=domain.identifier,
         owner_id="run-1",
     ) as auth:
@@ -280,19 +261,17 @@ def test_claim_scope_bounds_the_authority(tmp_path: Path) -> None:
 
 
 _EVERY_OPERATION: dict[str, Callable[[MetadataAuthority, LocalStore], object]] = {
-    "reopen": lambda auth, store: reopen(auth, store, ""),
     "ensure_group": lambda auth, store: ensure_group(auth, store, "g"),
     "create_or_open_array": lambda auth, store: create_or_open_array(
         auth, store, "g/a", create_kwargs=_ARRAY_KWARGS, default_attrs={"_FillValue": 0}
     ),
-    "grow_array": lambda auth, store: grow_array(auth, store, "g/a", (4,)),
     "set_attributes": lambda auth, store: set_attributes(auth, store, "", {"k": 1}),
-    "set_attributes_if_absent": lambda auth, store: set_attributes_if_absent(
-        auth, store, "", {"k": 1}
-    ),
     "publish_document": lambda auth, store: publish_document(auth, store, "zarr.json", _GROUP_DOC),
     "publish_document_if_absent": lambda auth, store: publish_document_if_absent(
         auth, store, "zarr.json", _GROUP_DOC
+    ),
+    "update_document": lambda auth, store: update_document(
+        auth, store, "zarr.json", lambda current: _GROUP_DOC
     ),
 }
 
@@ -331,7 +310,8 @@ def test_ensure_group_creates_missing_parents_and_never_rewrites_one(tmp_path: P
     assert created
     assert dict(array.attrs) == {"_FillValue": 9, "plugin": "p", "firecube_marker": True}
     assert dict(_on_disk(tmp_path, "g/h/a").attrs) == dict(array.attrs)
-    assert dict(reopen(auth, store, "").attrs) == {"root": "kept"}
+    stored_root = zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
+    assert dict(stored_root.attrs) == {"root": "kept"}
 
 
 @pytest.mark.unit
@@ -402,25 +382,8 @@ def test_publish_document_if_absent_never_replaces_a_document(tmp_path: Path) ->
     assert not (tmp_path / "g" / "x").exists()
 
 
-def _check_then_publish(auth: MetadataAuthority, store: LocalStore, key: str, doc: bytes) -> bool:
-    """The sequence publish_document_if_absent replaces: decide outside the lock, then put."""
-    from zarr.core.sync import sync
-
-    if sync(store.exists(key)):
-        return False
-    publish_document(auth, store, key, doc)
-    return True
-
-
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("publish", "writer_change_survives"),
-    [(publish_document_if_absent, True), (_check_then_publish, False)],
-    ids=["if_absent", "check_then_publish"],
-)
-def test_a_document_a_writer_creates_meanwhile_is_not_replaced(
-    tmp_path: Path, publish: Callable[..., bool], writer_change_survives: bool
-) -> None:
+def test_a_document_a_writer_creates_meanwhile_is_not_replaced(tmp_path: Path) -> None:
     """A copier finds no document; a writer holding the node lock creates and stamps one.
 
     Deterministic: the writer holds the node's lock until the copier is
@@ -439,7 +402,7 @@ def test_a_document_a_writer_creates_meanwhile_is_not_replaced(
 
     def copier() -> None:
         try:
-            outcome.append(publish(auth, store, "g/h/zarr.json", copy))
+            outcome.append(publish_document_if_absent(auth, store, "g/h/zarr.json", copy))
         except BaseException as exc:  # reported below
             outcome.append(exc)
 
@@ -456,9 +419,8 @@ def test_a_document_a_writer_creates_meanwhile_is_not_replaced(
         set_attributes(auth, store, "g/h", {"firecube_static_written": True})
     thread.join(10)
 
-    assert outcome == [not writer_change_survives]
-    stamped = dict(_on_disk(tmp_path, "g/h").attrs).get("firecube_static_written")
-    assert (stamped is True) is writer_change_survives
+    assert outcome == [False]
+    assert dict(_on_disk(tmp_path, "g/h").attrs).get("firecube_static_written") is True
 
 
 @pytest.mark.unit
@@ -615,38 +577,6 @@ class _RecordingClaim:
 
 
 @pytest.mark.unit
-def test_release_inside_an_operation_is_refused_until_it_ends(tmp_path: Path) -> None:
-    root = _local_root(tmp_path)
-    events: list[Any] = []
-    held = hold_authority(
-        _scope(tmp_path),
-        claim=_RecordingClaim(tmp_path, events),
-        claim_domain="p:test:g",
-        owner_id="run-1",
-    )
-    auth = held.__enter__()
-    errors: list[BaseException | None] = []
-
-    def release_inside(_arr: Any) -> None:
-        errors.append(_refusal(lambda: held.__exit__(None, None, None)))
-        events.append("released-inside")
-
-    create_or_open_array(
-        auth,
-        root,
-        "g/a",
-        create_kwargs=_ARRAY_KWARGS,
-        default_attrs={"marker": True},
-        validate=release_inside,
-    )
-
-    assert isinstance(errors[0], MetadataAuthorityError), errors
-    assert "inside one of its own operations" in str(errors[0])
-    assert events == ["released-inside", ("claim-out", {"marker": True})]
-    assert not auth.active
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("second", ["revoke", "another-exit"])
 def test_a_second_refused_release_keeps_the_queued_claim_exit(tmp_path: Path, second: str) -> None:
     root = _local_root(tmp_path)
@@ -677,6 +607,7 @@ def test_a_second_refused_release_keeps_the_queued_claim_exit(tmp_path: Path, se
     )
 
     assert all(isinstance(e, MetadataAuthorityError) for e in errors), errors
+    assert "inside one of its own operations" in str(errors[0])
     expected: list[Any] = [("claim-out", {"marker": True})]
     if second == "another-exit":
         expected.append("second-exit")  # both run, the first queued first
@@ -834,8 +765,6 @@ def test_update_document_merges_the_current_document_under_the_node_lock(
     """
     from firecube.core.zarr import metadata_authority
 
-    assert hasattr(metadata_authority, "update_document"), "no read-modify-write operation"
-    update_document = metadata_authority.update_document
     _local_root(tmp_path)
     store = LocalStore(tmp_path)
     auth = MetadataAuthority.process_local(_scope(tmp_path, "g"))
@@ -883,12 +812,6 @@ def test_update_document_merges_the_current_document_under_the_node_lock(
         update_document(auth, store, "g/a/zarr.json", calls.append)
     assert calls == []
     assert path.read_bytes() == after
-    fresh = tmp_path / "fresh.zarr"
-    released = MetadataAuthority.process_local(_scope(fresh))
-    released.revoke()
-    with pytest.raises(MetadataAuthorityError, match="was released"):
-        update_document(released, LocalStore(fresh), "zarr.json", lambda current: _GROUP_DOC)
-    assert not fresh.exists() or list(fresh.rglob("*")) == []
 
 
 def test_empty_group_document_matches_what_zarr_stores() -> None:

@@ -40,6 +40,7 @@ __all__ = [
     "PromotionPlan",
     "build_promotion_plan",
     "list_workspace_objects",
+    "unclaimed_data_objects",
 ]
 
 _METADATA_NAME = "zarr.json"
@@ -80,21 +81,6 @@ class PromotionPlan:
     """Ordered object delta of one staged run."""
 
     objects: tuple[PlannedObject, ...]
-
-    def of(self, action: PromotionAction) -> tuple[PlannedObject, ...]:
-        return tuple(obj for obj in self.objects if obj.action is action)
-
-    @property
-    def puts(self) -> tuple[PlannedObject, ...]:
-        return self.of(PromotionAction.PUT)
-
-    @property
-    def deletes(self) -> tuple[PlannedObject, ...]:
-        return self.of(PromotionAction.DELETE)
-
-    @property
-    def unchanged(self) -> tuple[PlannedObject, ...]:
-        return self.of(PromotionAction.UNCHANGED)
 
 
 def list_workspace_objects(root: Path) -> dict[str, int]:
@@ -182,3 +168,26 @@ def build_promotion_plan(
             )
     planned.sort(key=lambda obj: obj.is_metadata)  # stable: metadata last
     return PromotionPlan(tuple(planned))
+
+
+def unclaimed_data_objects(plan: PromotionPlan, array_paths: Collection[str]) -> tuple[str, ...]:
+    """Return the keys of unclaimed puts that are data objects of an array in *array_paths*.
+
+    An unclaimed put changes the target although no write of the run covers
+    it. For an array whose writes the run records, publishing it would copy
+    bytes the run never wrote over the target.
+
+    Args:
+        plan: The plan of :func:`build_promotion_plan`.
+        array_paths: ``group/array`` paths as zarr spells them (no leading,
+            trailing or repeated ``/``).
+    """
+    prefixes = tuple(f"{path}/" for path in array_paths)
+    return tuple(
+        obj.key
+        for obj in plan.objects
+        if obj.action is PromotionAction.PUT
+        and obj.reason == "unclaimed"
+        and prefixes
+        and obj.key.startswith(prefixes)
+    )

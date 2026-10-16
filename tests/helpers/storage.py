@@ -122,16 +122,6 @@ def assert_no_fsspec_bypass():
             raise AssertionError(f"Expected no _open_fsspec_url calls; observed {total}: {details}")
 
 
-def make_obstore_test_session(target_uri: str | StorageUri) -> StorageSession:
-    """Build an obstore-backed StorageSession."""
-    uri = _storage_uri_from_target(target_uri)
-    binding = StorageBinding(
-        identity=ProductIdentity.from_uri(uri, "zarr", product_name="test_product"),
-        driver=StorageDriverConfig(driver="obstore"),
-    )
-    return StorageSession(binding)
-
-
 def make_test_binding(
     tmp_path: Path,
     *,

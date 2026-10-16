@@ -147,6 +147,7 @@ nav:
         - GenericZarrIngestor (Append): concepts/output-formats/zarr/generic-append.md
         - DirectZarrIngestor (Region): concepts/output-formats/zarr/direct-region.md
         - How Parallel Writes Stay Safe: concepts/output-formats/zarr/parallel-writes.md
+        - Chunk Ownership: concepts/output-formats/zarr/chunk-ownership.md
       - Parquet: concepts/output-formats/parquet.md
       - Tensogram: concepts/output-formats/archive.md
     - Storage & ChunkManager:
@@ -178,6 +179,7 @@ nav:
       - Create an Intake Catalog: operations/intake-catalog.md
     - Zarr:
       - Run Parallel Zarr Writes: operations/parallel-zarr-writes.md
+      - Fix A Chunk Ownership Refusal: operations/fix-chunk-ownership-refusal.md
       - Compare Zarr Stores: operations/zarr-compare.md
       - Inspect And Manage The Resolved Index: operations/firecube-index.md
     - ChunkManager:

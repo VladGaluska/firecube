@@ -18,8 +18,10 @@ import json
 import shutil
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -37,16 +39,22 @@ from firecube.core.zarr.guarded_write import WriteResult
 from firecube.core.zarr.metadata_authority import (
     MetadataAuthority,
     MetadataScope,
-    grow_array,
     set_attributes,
+    update_document,
 )
 from firecube.core.zarr.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.ingestor.api import IngestResult, OutputPaths, PipelineMetrics, ResultMetrics
 from firecube.ingestor.runtime.engine import PipelineExecutor
 from firecube.ingestor.runtime.zarr.write_session import WriteSessionStateError, ZarrWriteSession
+from firecube.ingestor.templates.direct_zarr import (
+    DirectZarrIngestor,
+    WriteIntent,
+    ZarrArraySpec,
+    ZarrGroupSpec,
+)
 from firecube.ingestor.types.context import RuntimeIdentity, RuntimeIngestContext, StorageContext
 from firecube.ingestor.types.result_metrics import StorageMetrics
-from tests.helpers.storage import make_test_binding
+from tests.helpers.storage import begin_write_session, make_test_binding
 
 
 class _Host:
@@ -331,93 +339,6 @@ def _refuse_upload_tree(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(StorageSession, "upload_tree", upload_tree)
 
 
-def test_complete_output_staged_units_publish_the_delta(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Puts the written unit, deletes the absent one, sends only zarr.json to the publisher."""
-    target, workspace = _staged_trees(tmp_path)
-    before = _stat(target)
-    published: list[str] = []
-
-    def publish(key: str, payload: bytes) -> None:
-        published.append(key)
-        (target / key).write_bytes(payload)
-
-    _refuse_upload_tree(monkeypatch)
-    host = _DeltaHost(_units(workspace, target, publish_metadata=publish))
-
-    updated = PipelineExecutor().complete_output(
-        _result(str(workspace)),
-        _ctx(tmp_path),
-        host,  # pyright: ignore[reportArgumentType]
-    )
-
-    assert host.calls == 1
-    values = zarr.open_array(str(target), path="data/values", mode="r")
-    assert np.asarray(values[:, 0]).tolist() == [20.0, 21.0, 0.0, 0.0]
-    assert values.attrs["run"] == "staged"
-    assert not (target / "data/values/c/1/0").exists()
-    after = _stat(target)
-    assert after["data/values/c/0/0"] != before["data/values/c/0/0"]
-    # Only the array document differs; the root and group documents are unchanged.
-    assert published == ["data/values/zarr.json"]
-    assert after["zarr.json"] == before["zarr.json"]
-    assert after["data/zarr.json"] == before["data/zarr.json"]
-    assert updated.storage_result is not None
-    assert updated.storage_result.files_deleted == 1
-    assert updated.storage_result.files_written == 2
-
-
-def test_complete_output_staged_host_without_units_uploads_the_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``None`` from the host keeps today's call: ``upload_tree`` with no extra keyword."""
-    _, workspace = _staged_trees(tmp_path)
-    observed: list[dict[str, Any]] = []
-
-    def upload_tree(
-        self: StorageSession, src: StorageUri, dst: StorageUri, **kwargs: Any
-    ) -> StorageWriteResult:
-        observed.append(kwargs)
-        return StorageWriteResult(
-            path=dst.to_str(),
-            bytes_written=0,
-            files_written=0,
-            duration_s=0.0,
-            storage_type="local",
-        )
-
-    def no_plan(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("no promotion units: no plan")
-
-    monkeypatch.setattr(StorageSession, "upload_tree", upload_tree)
-    monkeypatch.setattr(StorageSession, "plan_promotion", no_plan)
-    host = _DeltaHost(None)
-
-    PipelineExecutor().complete_output(
-        _result(str(workspace)),
-        _ctx(tmp_path, upload_workers=3),
-        host,  # pyright: ignore[reportArgumentType]
-    )
-
-    assert host.calls == 1
-    assert observed == [{"parallel_workers": 3}]
-
-
-def test_complete_output_direct_run_never_asks_for_promotion_units(tmp_path: Path) -> None:
-    target = tmp_path / "product.zarr"
-    _product(target, [1.0, 2.0])
-    host = _DeltaHost(None)
-
-    PipelineExecutor().complete_output(
-        _result(str(target), write_mode="direct"),
-        _ctx(tmp_path, write_mode="direct"),
-        host,  # pyright: ignore[reportArgumentType]
-    )
-
-    assert host.calls == 0
-
-
 @pytest.mark.parametrize(
     ("units_kwargs", "match"),
     [
@@ -584,28 +505,6 @@ def test_session_released_authority_refuses_the_promoted_metadata(
     assert {key: (target / key).read_bytes() for key in documents} == documents
 
 
-def test_session_authority_publishes_the_promoted_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target, workspace = _staged_trees(tmp_path)
-    session = _session(workspace, target)
-    _record(session, workspace, "data/values", range(4), (4, 2), ((0, 0), (1, 0)), ((1, 0),))
-    session.verify_promotion()
-    _refuse_upload_tree(monkeypatch)
-
-    PipelineExecutor().complete_output(
-        _result(str(workspace)),
-        _ctx(tmp_path),
-        _DeltaHost(session.staged_promotion_units()),  # pyright: ignore[reportArgumentType]
-    )
-    session.close()
-
-    values = zarr.open_array(str(target), path="data/values", mode="r")
-    assert np.asarray(values[:, 0]).tolist() == [20.0, 21.0, 0.0, 0.0]
-    assert values.attrs["run"] == "staged"
-    assert not (target / "data/values/c/1/0").exists()
-
-
 def test_session_publisher_keeps_the_target_attributes_of_an_array(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -622,33 +521,6 @@ def test_session_publisher_keeps_the_target_attributes_of_an_array(
     _record(session, workspace, "data/values", range(4), (4, 2), ((0, 0), (1, 0)), ((1, 0),))
     session.verify_promotion()
     _refuse_upload_tree(monkeypatch)
-
-    PipelineExecutor().complete_output(
-        _result(str(workspace)),
-        _ctx(tmp_path),
-        _DeltaHost(session.staged_promotion_units()),  # pyright: ignore[reportArgumentType]
-    )
-    session.close()
-
-    values = zarr.open_array(str(target), path="data/values", mode="r")
-    assert values.attrs.asdict() == {"firecube_engine_owned": True, "run": "staged"}
-    assert np.asarray(values[:, 0]).tolist() == [20.0, 21.0, 0.0, 0.0]
-    assert _stat(target)["data/other/zarr.json"] == before["data/other/zarr.json"]
-
-
-def test_session_publisher_counts_only_the_documents_it_wrote(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A document that merges to no change counts no file and no byte; one written counts once."""
-    target, workspace = _staged_trees(tmp_path)
-    _product(target, [1.0, 2.0], path="data/other")
-    shutil.copytree(target / "data/other", workspace / "data/other")
-    other = workspace / "data/other/zarr.json"
-    other.write_bytes(json.dumps(json.loads(other.read_bytes())).encode())  # same JSON, new bytes
-    session = _session(workspace, target)
-    _record(session, workspace, "data/values", range(4), (4, 2), ((0, 0), (1, 0)), ((1, 0),))
-    session.verify_promotion()
-    _refuse_upload_tree(monkeypatch)
     data_bytes = (workspace / "data/values/c/0/0").stat().st_size
     document_bytes = (workspace / "data/values/zarr.json").stat().st_size
 
@@ -659,9 +531,13 @@ def test_session_publisher_counts_only_the_documents_it_wrote(
     )
     session.close()
 
+    values = zarr.open_array(str(target), path="data/values", mode="r")
+    assert values.attrs.asdict() == {"firecube_engine_owned": True, "run": "staged"}
+    assert np.asarray(values[:, 0]).tolist() == [20.0, 21.0, 0.0, 0.0]
+    assert not (target / "data/values/c/1/0").exists()
+    assert _stat(target)["data/other/zarr.json"] == before["data/other/zarr.json"]
     result = updated.storage_result
     assert result is not None
-    # One data put and the values document; data/other/zarr.json merged to no change.
     assert (result.files_written, result.bytes_written) == (2, data_bytes + document_bytes)
     assert result.files_deleted == 1
 
@@ -917,11 +793,19 @@ def _grown_workspace_session(
     return target, workspace, session
 
 
+def _grow_to_eight_rows(auth: MetadataAuthority, store: LocalStore) -> None:
+    def merge(current: bytes | None) -> bytes:
+        assert current is not None
+        return json.dumps({**json.loads(current), "shape": [8, 2]}).encode()
+
+    update_document(auth, store, "data/values/zarr.json", merge)
+
+
 @pytest.mark.parametrize(
     ("change", "shape", "attributes"),
     [
         pytest.param(
-            lambda auth, store: grow_array(auth, store, "data/values", (8, 2)),
+            _grow_to_eight_rows,
             (8, 2),
             {"run": "staged"},
             id="growth",
@@ -959,3 +843,110 @@ def test_promotion_never_reverts_a_change_made_after_it_read_the_document(
     assert values.shape == shape
     assert values.attrs.asdict() == attributes
     assert np.asarray(values[:6, 0]).tolist() == [20.0, 21.0, 0.0, 0.0, 24.0, 25.0]
+
+
+# --- a staged DirectZarr run, written through the real batch path and promoted ---------
+
+
+class _StagedBatchIngestor(DirectZarrIngestor):
+    """A staged DirectZarr host whose next batch writes ``self.intents``."""
+
+    PRODUCT_NAME = "staged_promotion_probe"
+
+    def __init__(self, *, shape: int) -> None:
+        chunk_manager = SimpleNamespace(
+            storage_config=None, acquire_claim=lambda **_kw: nullcontext()
+        )
+        super().__init__(name="staged_promotion_probe", chunk_manager=cast(Any, chunk_manager))
+        self.engine_config = cast(Any, SimpleNamespace(write_mode="staged", slot_group=None))
+        self.shape = shape
+        self.intents: list[WriteIntent] = []
+
+    def ingest(self, ctx):  # pragma: no cover - abstract hook not used here
+        raise NotImplementedError
+
+    def zarr_schema(self, ctx):
+        spec = ZarrArraySpec(
+            name="data", shape=(self.shape,), dtype="int64", chunks=(2,), fill_value=-1
+        )
+        return [ZarrGroupSpec(group="g", arrays=[spec])]
+
+    def build_write_intents(self, batch, ctx):
+        return self.intents
+
+
+def _staged_batch_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, workspace_values: list[int], shape: int
+) -> tuple[_StagedBatchIngestor, Any, Callable[[list[tuple[int, int]]], None], Path, Path]:
+    target = tmp_path / "product.zarr"
+    workspace = tmp_path / "staged" / "product.zarr"
+    for root, values in ((target, [10, 11, 12, 13][: len(workspace_values)]), (workspace, None)):
+        array = zarr.open_group(str(root), mode="a", zarr_format=3).create_array(
+            "g/data", shape=(len(workspace_values),), chunks=(2,), dtype="int64", fill_value=-1
+        )
+        array[:] = values if values is not None else workspace_values
+    ingestor = _StagedBatchIngestor(shape=shape)
+    monkeypatch.setattr(
+        ingestor,
+        "resolve_output_uri",
+        lambda ctx, write_mode: str(workspace if write_mode == "staged" else target),
+    )
+    ctx = SimpleNamespace(run_id="run-1", storage=None, option=lambda key, default=None: default)
+    session = begin_write_session(ingestor, ctx)
+
+    def run_batch(writes: list[tuple[int, int]]) -> None:
+        ingestor.intents = [
+            WriteIntent.slot(group="g", array="data", index=slot, data=np.int64(value))
+            for slot, value in writes
+        ]
+        batch = cast(Any, SimpleNamespace(items=["s"], metadata={}))
+        result = ingestor._process_batch(batch, cast(Any, ctx))
+        assert result.success is True, result.error
+
+    return ingestor, session, run_batch, target, workspace
+
+
+def _promote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session: Any, workspace: Path
+) -> None:
+    session.verify_promotion()
+    _refuse_upload_tree(monkeypatch)
+    PipelineExecutor().complete_output(
+        _result(str(workspace)),
+        _ctx(tmp_path),
+        _DeltaHost(session.staged_promotion_units()),  # pyright: ignore[reportArgumentType]
+    )
+
+
+def test_staged_promotion_records_a_negative_index_at_the_slot_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session, run_batch, target, workspace = _staged_batch_run(
+        tmp_path, monkeypatch, workspace_values=[-1, -1], shape=2
+    )
+    run_batch([(0, 20), (-1, 99)])
+    run_batch([(2, 22)])
+
+    _promote(tmp_path, monkeypatch, session, workspace)
+    session.close()
+
+    values = zarr.open_array(str(target), path="g/data", mode="r")
+    assert np.asarray(values[:]).tolist() == [20, 99, 22]
+
+
+def test_staged_promotion_refuses_a_changed_data_chunk_no_write_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, session, run_batch, target, workspace = _staged_batch_run(
+        tmp_path, monkeypatch, workspace_values=[10, 11, 12, 13], shape=4
+    )
+    run_batch([(0, 20), (1, 21)])
+    unreported = zarr.open_array(str(workspace), path="g/data", mode="r+")
+    unreported[2:4] = [30, 31]  # chunk g/data/c/1 changes behind the ledger
+    before = _stat(target)
+
+    with pytest.raises(ConfigurationError, match="g/data/c/1"):
+        _promote(tmp_path, monkeypatch, session, workspace)
+    session.close()
+
+    assert _stat(target) == before

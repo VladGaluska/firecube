@@ -30,8 +30,8 @@ This module is the one place a firecube writer changes a node document:
   ever written. A handle an operation returns is for payload I/O and for
   reading back what the operation wrote;
 * the editing operations create, grow, and add or replace attributes; none
-  deletes a node, and only `grow_array` (and the growth step of
-  `create_or_open_array`) is guaranteed never to make an array smaller.
+  deletes a node, and only the growth step of `create_or_open_array` is
+  guaranteed never to make an array smaller.
   `update_document` puts whatever its caller's merge returns, and that
   result is not restricted to growth. A missing parent group is created
   empty, only when absent and only inside the scope: an authority over a
@@ -50,9 +50,8 @@ is atomic on some stores and not on others (fsspec checks, then writes), so it
 relies on that exclusion too. Releasing an authority waits for the operations
 already admitted under it, so no write lands after the claim it names was
 released; a release from inside one of its own operations is refused and
-happens when that operation ends. Claims are acquired through the narrow
-`ClaimProvider` Protocol, which ``ChunkManager`` satisfies; this module writes
-nothing under ``.firecube/``.
+happens when that operation ends. This module writes nothing under
+``.firecube/``.
 
 Lock order: node locks are leaves. A stored-unit lock may be held while a node
 lock is taken, never a node lock while a stored-unit lock is taken. Between
@@ -69,7 +68,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 import zarr
 from zarr.abc.store import Store
@@ -83,7 +82,6 @@ from firecube.core.zarr._zarr_compat import sync
 
 __all__ = [
     "AuthorityBasis",
-    "ClaimProvider",
     "HeldClaim",
     "MetadataAuthority",
     "MetadataAuthorityError",
@@ -91,13 +89,10 @@ __all__ = [
     "adopt_held_claim",
     "create_or_open_array",
     "ensure_group",
-    "grow_array",
     "hold_authority",
     "publish_document",
     "publish_document_if_absent",
-    "reopen",
     "set_attributes",
-    "set_attributes_if_absent",
     "update_document",
 ]
 
@@ -126,14 +121,6 @@ class AuthorityBasis(enum.Enum):
 
     CLAIM = "claim"
     PROCESS_LOCAL = "process_local"
-
-
-class ClaimProvider(Protocol):
-    """The part of ``ChunkManager`` that takes a claim to build an authority from."""
-
-    def acquire_claim(
-        self, *, product: str, domain: Any, owner_id: str
-    ) -> AbstractContextManager[Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,22 +553,6 @@ def _require_group(authority: MetadataAuthority, store: Store, node: str) -> zar
 # --- operations -------------------------------------------------------------------------
 
 
-def reopen(
-    authority: MetadataAuthority | None, root: zarr.Group | Store, path: str
-) -> zarr.Array | zarr.Group:
-    """Read the node at *path* below *root* from the store (array, else group).
-
-    Raises:
-        MetadataAuthorityError: The authority is missing, released, out of
-            scope, or names another store.
-        zarr.errors.GroupNotFoundError: No node at *path*.
-    """
-    store, base = _location(root)
-    node = _node_path(base, path)
-    with _authorized(authority, store, node) as auth, _node_lock(auth, node):
-        return _open_node_fresh(store, node)
-
-
 def ensure_group(
     authority: MetadataAuthority | None, root: zarr.Group | Store, path: str
 ) -> zarr.Group:
@@ -678,34 +649,6 @@ def create_or_open_array(
         return arr, False
 
 
-def grow_array(
-    authority: MetadataAuthority | None,
-    root: zarr.Group | Store,
-    path: str,
-    shape: tuple[int, ...],
-) -> zarr.Array:
-    """Grow the array at *path* to at least *shape*: elementwise maximum, never smaller.
-
-    Raises:
-        MetadataAuthorityError: The authority is missing, released, out of
-            scope, or names another store.
-        ValueError: No array at *path*, or *shape* has another rank.
-    """
-    store, base = _location(root)
-    node = _node_path(base, path)
-    with _authorized(authority, store, node) as auth, _node_lock(auth, node):
-        arr = _open_array_fresh(store, node)
-        if arr is None:
-            raise ValueError(f"cannot grow {node!r}: no array there")
-        if len(arr.shape) != len(shape):
-            raise ValueError(
-                f"cannot grow {node!r}: rank {len(arr.shape)} stored, {len(shape)} requested"
-            )
-        if any(cur < req for cur, req in zip(arr.shape, shape, strict=True)):
-            arr.resize(tuple(max(cur, req) for cur, req in zip(arr.shape, shape, strict=True)))
-        return arr
-
-
 def set_attributes(
     authority: MetadataAuthority | None,
     root: zarr.Group | Store,
@@ -727,32 +670,6 @@ def set_attributes(
     with _authorized(authority, store, node) as auth, _node_lock(auth, node):
         current = _open_node_fresh(store, node)
         return current.update_attributes(dict(attrs)) if attrs else current
-
-
-def set_attributes_if_absent(
-    authority: MetadataAuthority | None,
-    root: zarr.Group | Store,
-    path: str,
-    attrs: Mapping[str, Any],
-) -> bool:
-    """Add the keys of *attrs* the node at *path* lacks, one write.
-
-    Returns:
-        ``True`` when anything was written.
-
-    Raises:
-        MetadataAuthorityError: The authority is missing, released, out of
-            scope, or names another store.
-        zarr.errors.GroupNotFoundError: No node at *path*.
-    """
-    store, base = _location(root)
-    node = _node_path(base, path)
-    with _authorized(authority, store, node) as auth, _node_lock(auth, node):
-        current = _open_node_fresh(store, node)
-        missing = {k: v for k, v in attrs.items() if k not in current.attrs}
-        if missing:
-            current.update_attributes(missing)
-        return bool(missing)
 
 
 def _document_node(key: str) -> tuple[str, str]:

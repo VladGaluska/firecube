@@ -50,6 +50,7 @@ def budget_plugin(monkeypatch):
         static=False,
         missing=False,
         emit_owned=True,
+        owned_only=False,
     )
     epoch = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -117,6 +118,7 @@ def budget_plugin(monkeypatch):
                 slot(name, i, np.full(shape, i + 1.0 + state.bias, dtype="float32"))
                 for i in batch.items
                 for name, shape in [("vec", ()), ("img", (2, 2))]
+                if not state.owned_only
             ]
             if state.owned and state.emit_owned:
                 intents += [
@@ -224,6 +226,23 @@ def test_engine_owned_refusals_leave_payload_untouched(tmp_path, budget_plugin, 
     result = cli_run(target)
     assert result.exit_code != 0
     assert message in result.output
+    assert payload_snapshot(target) == before
+
+
+def test_batch_for_a_slot_preallocate_did_not_materialize_is_refused(tmp_path, budget_plugin):
+    budget_plugin.owned = True
+    budget_plugin.items = [0, 1, 3]
+    target = tmp_path / "cube.zarr"
+    result = cli_run(target, "zarr preallocate", "direct", "--input-data", str(tmp_path))
+    assert result.exit_code == 0, result.output
+    # Slot 2 holds NaN and the pod sends NaN: only the slot check can refuse.
+    budget_plugin.items = [2]
+    budget_plugin.owned_only = True
+    budget_plugin.pod_offset = float("nan")
+    before = payload_snapshot(target)
+    result = cli_run(target)
+    assert result.exit_code != 0
+    assert "preallocate" in result.output + str(result.exception)
     assert payload_snapshot(target) == before
 
 
