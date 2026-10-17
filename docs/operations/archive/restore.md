@@ -59,7 +59,7 @@ archive-restore-3e67c307-...         complete  active  4     4
 direct_zarr_capable_test_plugin-...  complete  active  1     7
 ```
 
-Inspect restored control-plane records:
+Inspect restored ChunkManager records:
 
 ```bash
 firecube chunks list --product-name "$RESTORED_URI"
