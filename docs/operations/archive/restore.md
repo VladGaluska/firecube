@@ -1,7 +1,7 @@
 # Restore Archives
 
-Use `firecube archive restore` to decode a `.tgm` archive back into a Zarr
-store.
+Use `firecube archive restore` to restore a `.tgm` or `.zip` archive back into
+a Zarr store.
 
 ```bash
 ARCHIVE_URI="file:///data/archives/MY_PRODUCT.tgm"
@@ -27,6 +27,17 @@ Zarr restored: file:///data/restored/MY_PRODUCT.zarr
   Control-plane: restored
 ```
 
+## Restore A Zip Archive
+
+```bash
+firecube archive restore \
+  --archive "file:///data/archives/MY_PRODUCT.zarr.zip" \
+  --target "$RESTORED_URI"
+```
+
+The target must be local. The output is the same as for `.tgm`, without the
+`restored group:` lines.
+
 ## Verify The Restored Product
 
 Inspect the restored product's run history:
@@ -51,6 +62,9 @@ firecube chunks list --product-name "$RESTORED_URI"
 ```
 
 ## Overwrite An Existing Restore Target
+
+`--overwrite` replaces the whole target. Data and run history written to the
+target after the archive was created are lost.
 
 Preview:
 
@@ -78,6 +92,7 @@ firecube archive restore \
 |---|---|---|
 | Restore target exists | Firecube will not replace it by default. | Use `--overwrite` with `--yes-i-really-mean-it`. |
 | `requires the tensogram extras` | Archive support is not installed. | Install `firecube[tensogram]` in the active environment. |
+| `Restoring a .zip archive to a remote target is not yet supported` | Zip restores write locally only. | Restore to a local target, then copy it to S3. |
 | Restored product has no expected variables | The archive is missing expected content. | Run `archive info` and `archive list`. |
 
 ## Next Steps

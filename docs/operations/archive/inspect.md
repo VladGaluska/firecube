@@ -1,7 +1,7 @@
 # Inspect And Validate Archives
 
 Use archive inspection commands before transferring, publishing, or restoring a
-`.tgm` file.
+`.tgm` or `.zip` file.
 
 ```bash
 ARCHIVE_URI="file:///data/archives/MY_PRODUCT.tgm"
@@ -92,12 +92,39 @@ Expected output:
 VALID: /data/archives/MY_PRODUCT.tgm (2 message(s), no issues)
 ```
 
+## Zip Archives
+
+`info`, `list`, and `validate` accept `.zip` archives with the same flags:
+
+```bash
+firecube archive info --archive "file:///data/archives/MY_PRODUCT.zarr.zip"
+```
+
+Expected output resembles:
+
+```text
+Path:           /data/archives/MY_PRODUCT.zarr.zip
+Format:         zip
+Size:           0.01 MB
+Entries:        18
+Groups:         (root), data
+Control-plane:  present
+
+Group: data
+  Variables:
+    temperature: shape=[4, 2, 3] dtype=float64 chunks=[4, 2, 3] codec=zstd
+```
+
+`archive list` prints each group as an xarray dataset. `archive validate`
+checks the CRC of every entry and that the archive opens as Zarr; `--quick`
+skips the CRC check.
+
 ## Failure Recovery
 
 | Symptom | Meaning | Recovery |
 |---|---|---|
 | `Path ... does not exist` | The archive path is wrong or create failed. | Check `ARCHIVE_PATH` and rerun `archive create`. |
-| `requires the tensogram extras` | Archive support is not installed. | Install `firecube[tensogram]` in the active environment. |
+| `requires the tensogram extras` | `.tgm` support is not installed. | Install `firecube[tensogram]` in the active environment. |
 | Validation fails | The archive is incomplete or corrupt. | Recreate the archive from the source product. |
 
 ## Next Steps
