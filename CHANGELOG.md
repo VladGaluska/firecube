@@ -46,7 +46,26 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   `--end-date`, and `--variables` are rejected.
 - `firecube archive info`, `list`, `validate`, and `restore` accept local
   `.zip` archives.
-- `firecube archive create` records each run in the source product's control plane.
+- `firecube archive restore` writes a zip archive through the configured
+  storage driver. Before it deletes the target or restores any entry, it
+  refuses an archive that holds an entry outside the target. Such an entry has an absolute name,
+  a backslash, or an empty, `.` or `..` segment. The error reads `Unsafe entry
+  '<name>' in archive <path>`.
+- `firecube archive create` records each run in the source product's control
+  plane. The record holds the start time, group, date window, variables and
+  size of the archive.
+  - If the source has a `.firecube/schema.json` file, the command takes the
+    maintenance claim of the product. Use credentials with write access to the
+    source.
+  - The command refuses anonymous storage (`--storage-anonymous`) and exits
+    with code 2. Use credentials that can write to the source.
+  - If the command cannot write the record, it exits with code 1. The archive
+    file stays in place. The message names the archive path and the record
+    error. The run of the failed create can stay `started`. Abandon it with
+    `firecube chunks runs abandon` before you retry with `--overwrite
+    --yes-i-really-mean-it`.
+  - If the source has no `.firecube/schema.json` file, the command writes no claim and no
+    record, and does not modify the source.
 
 ### Changed
 - `firecube zarr slots` refuses a plan of more than 1,000,000 ranges. The

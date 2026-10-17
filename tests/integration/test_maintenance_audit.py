@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -309,6 +310,52 @@ def test_archive_restore_emits_maintenance_lifecycle_events(tmp_path):
     assert started["record"]["meta"]["kind"] == "maintenance"
     assert started["record"]["meta"]["source_archive"] == archive_uri
     assert started["record"]["meta"]["target_product"] == restored_uri
+
+
+def _zip_create_args(tmp_path: Path) -> list[str]:
+    product = tmp_path / "product.zarr"
+    _make_dataset().to_zarr(product, group="F024")
+    manager = ChunkManager(binding=make_test_binding(tmp_path), workspace=tmp_path)
+    try:
+        manager.record_run_started(
+            product="product.zarr", run_id="seed", output_path=str(product),
+            output_format="zarr", size=0, meta={},
+        )  # fmt: skip
+    finally:
+        manager.close()
+    out = (tmp_path / "out.zip").as_uri()
+    flags = "--archive-format zip --storage-type local --storage-driver fsspec"
+    return f"archive create --source {product.as_uri()} --archive {out} {flags}".split()
+
+
+def test_archive_create_fails_when_record_cannot_be_written(tmp_path, monkeypatch):
+    denied = Mock(side_effect=PermissionError("record denied"))
+    monkeypatch.setattr(ChunkManager, "record_maintenance_completed", denied)
+    res = CliRunner().invoke(cli, _zip_create_args(tmp_path), env=_local_env(tmp_path))
+    assert res.exit_code == 1 and "record denied" in res.output and (tmp_path / "out.zip").exists()
+
+
+def test_archive_create_keeps_archive_error_when_record_setup_fails(tmp_path, monkeypatch):
+    from firecube.core.storage.session import StorageSession
+
+    failed = []
+    original = StorageSession.control_plane
+
+    def _zarr_to_zip(*a, **k):
+        failed.append(True)
+        raise ValueError("archive boom")
+
+    def _control_plane(self):
+        if failed:
+            raise RuntimeError("record boom")
+        return original(self)
+
+    monkeypatch.setattr("firecube.core.zarr.zip_archive.zarr_to_zip", _zarr_to_zip)
+    monkeypatch.setattr(StorageSession, "control_plane", _control_plane)
+    result = CliRunner().invoke(cli, _zip_create_args(tmp_path), env=_local_env(tmp_path))
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert "Error: archive boom" in result.output.splitlines()
 
 
 def test_archive_restore_failure_emits_maintenance_failed(tmp_path):

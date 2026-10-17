@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import json
 import sys
+import zipfile
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
@@ -179,6 +182,37 @@ def test_restore_overwrite_non_tty_without_yes_exits_nonzero(tmp_path):
         "yes-i-really-mean-it" in r.output.lower()
         or "overwritewithoutconfirmation" in r.output.lower()
     )
+
+
+def test_zip_restore_refuses_entry_outside_target(tmp_path):
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("zarr.json", json.dumps({"zarr_format": 3, "node_type": "group"}))
+        zf.writestr("../escape.txt", "evil")
+    args = ["archive", "restore", "--archive", archive.as_uri()]
+    args += ["--target", f"file://{tmp_path}/r.zarr", *_LOCAL_STORAGE_FLAGS]
+    r = CliRunner().invoke(cli, args)
+    assert r.exit_code != 0, r.output
+    assert "../escape.txt" in r.output + str(r.exception)
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_create_refuses_anonymous_storage(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECUBE_S3_ANONYMOUS", "false")  # the CLI exports it; teardown unsets
+    u = tmp_path.as_uri()
+    cmd = f"archive create --source {u}/s --archive {u}/o.zip --storage-anonymous"
+    r = CliRunner().invoke(cli, cmd.split())
+    assert r.exit_code == 2, r.output
+    assert not (tmp_path / "o.zip").exists()
+
+
+def test_zip_restore_cli_preserves_array_values(tmp_path):
+    u = tmp_path.as_uri()
+    zarr.open_group(str(tmp_path / "s"), mode="w").create_array("a", data=np.arange(6.0))
+    for cmd in (f"create --source {u}/s --archive-format zip", f"restore --target {u}/r"):
+        r = CliRunner().invoke(cli, ["archive", *cmd.split(), "--archive", f"{u}/a.zip"])
+        assert r.exit_code == 0, r.output
+    assert zarr.open_group(str(tmp_path / "r"))["a"][:].tolist() == np.arange(6.0).tolist()
 
 
 def test_create_without_overwrite_requires_no_confirmation(tmp_path, monkeypatch):

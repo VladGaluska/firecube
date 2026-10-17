@@ -466,6 +466,45 @@ def test_bt2_poison_archive_restore(tmp_path: Path, driver: Literal["fsspec", "o
 
 
 @pytest.mark.parametrize("driver", _DRIVERS)
+def test_zip_restore_writes_through_the_session(tmp_path: Path, monkeypatch, driver) -> None:
+    import zarr
+    from tests.integration._bt_helpers import bt2_poison
+
+    from firecube.core.zarr.zip_archive import zarr_to_zip, zip_to_zarr
+
+    root = tmp_path / "products"
+    root.mkdir()
+    source, target = root / "product.zarr", tmp_path / "restored.zarr"
+    _write_counts_zarr(source)
+    xr.Dataset({"inner": (("x",), np.arange(4.0))}, coords={"x": np.arange(4)}).to_zarr(
+        str(source), group="nest/deep", mode="a"
+    )
+    archive = tmp_path / "archive.zip"
+    zarr_to_zip(_build_local_archive_session(str(source), root, driver)[1], str(archive))
+    session = _build_local_archive_session(str(target), tmp_path, driver)[1]
+
+    def _raw_local_store(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("zip restore opened a raw LocalStore, not the session driver")
+
+    monkeypatch.setattr(
+        "firecube.core.zarr.zip_archive.LocalStore", _raw_local_store, raising=False
+    )
+    with bt2_poison():
+        zip_to_zarr(str(archive), str(target), session=session)  # type: ignore[call-arg]
+
+    def keys(p: Path) -> set[str]:
+        return {f.relative_to(p).as_posix() for f in p.rglob("*") if f.is_file()}
+
+    assert keys(target) == {k for k in keys(source) if not k.startswith(".firecube/claims/")}
+    restored = zarr.open_group(str(target), mode="r")
+    arrays = dict(zarr.open_group(str(source), mode="r").members(max_depth=None))
+    assert len(arrays) >= 4  # counts, t, nest/deep/inner, nest/deep/x
+    for name, node in arrays.items():
+        if isinstance(node, zarr.Array):
+            np.testing.assert_array_equal(restored[name][...], node[...])  # type: ignore[index]
+
+
+@pytest.mark.parametrize("driver", _DRIVERS)
 def test_bt2_poison_delete_flow(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     """Abandoning a non-terminal run via the ChunkManager facade must not
     trip BT2 poison: control-plane I/O routes through the approved

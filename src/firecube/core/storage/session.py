@@ -215,6 +215,13 @@ class StorageSession:
         _publish_object(fs, dst, _write)
         return file_size
 
+    def put_bytes(self, uri: StorageUri, payload: bytes) -> None:
+        """Publish one whole object at ``uri`` and create its parents.
+
+        Not for payload writes into a live DirectZarr store; those go through ``guarded_write``.
+        """
+        _put_bytes(self.fs(), uri, payload)
+
     def upload_tree(
         self,
         src: StorageUri,

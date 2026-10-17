@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -31,6 +32,7 @@ from firecube.core.controlplane.types import DeletionPlan, WriteDomain
 from firecube.core.errors import ManifestError
 from firecube.core.storage.uri import StorageUri
 from firecube.core.tensogram.converter import zarr_to_tgm
+from firecube.core.zarr import zip_archive
 from firecube.core.zarr.scrub import run_scrub
 from tests.helpers.storage import make_test_binding, make_test_session
 
@@ -217,3 +219,31 @@ def test_archive_restore_aborts_when_product_has_active_writer_claim(tmp_path: P
     finally:
         claim.release()
         manager.close()
+
+
+def _zip_create_with_control_plane(tmp_path: Path):
+    src = tmp_path / "s.zarr"
+    (src / ".firecube").mkdir(parents=True, exist_ok=True)
+    (src / ".firecube" / "schema.json").write_text("{}")
+    cmd = f"archive create --source {src.as_uri()} --archive {tmp_path.as_uri()}/out.zip"
+    cmd += " --archive-format zip"
+    return CliRunner().invoke(cli, cmd.split(), env=_local_env(tmp_path))
+
+
+def test_archive_create_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
+    manager = _claiming_manager(tmp_path, product="s.zarr")
+    claim = manager.acquire_claim(product="s.zarr", domain=_claim_domain("s.zarr"), owner_id="w")
+    result = _zip_create_with_control_plane(tmp_path)
+    claim.release()
+    assert result.exit_code != 0
+    assert "firecube chunks runs abandon" in result.output
+    assert not (tmp_path / "out.zip").exists()
+
+
+def test_archive_create_keeps_archive_error_and_releases_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(zip_archive, "zarr_to_zip", Mock(side_effect=ValueError("archive boom")))
+    monkeypatch.setattr(ChunkManager, "record_maintenance_failed", Mock(side_effect=OSError("rec")))
+    result = _zip_create_with_control_plane(tmp_path)
+    assert result.exit_code != 0
+    assert "archive boom" in result.output
+    assert list((tmp_path / "s.zarr" / ".firecube" / "claims").glob("*")) == []

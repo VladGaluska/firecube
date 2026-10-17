@@ -32,7 +32,6 @@ from typing import Any, cast
 import xarray as xr
 import zarr
 from zarr.buffer import default_buffer_prototype
-from zarr.storage import LocalStore
 
 from firecube.core.controlplane.types import CLAIMS_DIRNAME, CONTROL_DIRNAME
 from firecube.core.filesystem.store_factory import create_zip_store
@@ -148,36 +147,72 @@ def _prepare_target(target_path: Path, *, overwrite: bool) -> None:
         target_path.unlink()
 
 
-def zip_to_zarr(archive: str, target: str, *, overwrite: bool = False) -> dict:
-    """Restore a zarr zip archive into a local Zarr store by copying every key."""
-    archive_path = Path(archive.removeprefix("file://"))
-    target_path = Path(target.removeprefix("file://"))
+def _refuse_unsafe_entries(names: list[str], archive: str) -> None:
+    """Raise ValueError for the first entry name that is not a canonical relative key."""
+    for name in names:
+        # A directory entry ends in one "/"; its segments are checked like a file's.
+        segments = name.removesuffix("/").split("/")
+        if (
+            name.startswith("/")
+            or "\\" in name
+            or any(segment in ("", ".", "..") for segment in segments)
+        ):
+            raise ValueError(
+                f"Unsafe entry {name!r} in archive {archive}: it is absolute, holds a "
+                "backslash, or has an empty, '.' or '..' segment"
+            )
+
+
+def zip_to_zarr(
+    archive: str, target: str, *, session: StorageSession, overwrite: bool = False
+) -> dict:
+    """Restore a zarr zip archive into the session's product by copying every key.
+
+    The session's driver writes every entry. Before it touches the target, the
+    restore refuses a corrupt entry, a missing root ``zarr.json``, and an entry
+    name that is absolute, holds a backslash, or has an empty, ``.`` or ``..``
+    segment.
+
+    Args:
+        archive: Local path or ``file://`` URI of the zip archive.
+        target: Local path or ``file://`` URI of the product to restore; it
+            must name the session's product.
+        session: Storage session bound to the target product.
+        overwrite: Replace an existing Zarr store at ``target``.
+
+    Returns:
+        A summary of the restored groups, variables, coordinates and key count.
+
+    Raises:
+        FileNotFoundError: If ``archive`` is not a file.
+        ValueError: If the archive is corrupt, has no root metadata, or holds
+            an entry name outside the target.
+        FileExistsError: If ``target`` holds a Zarr store and ``overwrite`` is False.
+    """
+    archive_path = local_path_from_target(archive)
+    target_path = local_path_from_target(target)
     if not archive_path.is_file():
         raise FileNotFoundError(f"Archive not found: {archive}")
 
     with zipfile.ZipFile(archive_path) as zf:
+        names = zf.namelist()
+        _refuse_unsafe_entries(names, archive)
         if (corrupt := zf.testzip()) is not None:
             raise ValueError(f"Corrupt entry {corrupt!r} in archive: {archive}")
-        # claims are never archived, but never restore a stale claim either
-        keys = sorted(
-            k for k in zf.namelist() if not k.endswith("/") and not k.startswith(_CLAIMS_PREFIX)
-        )
+    # claims are never archived, but never restore a stale claim either
+    keys = sorted(k for k in names if not k.endswith("/") and not k.startswith(_CLAIMS_PREFIX))
     if "zarr.json" not in keys:
         raise ValueError(f"No Zarr v3 root metadata found in archive: {archive}")
 
     _prepare_target(target_path, overwrite=overwrite)
 
-    dest = LocalStore(target_path)
-    make_buffer = default_buffer_prototype().buffer.from_bytes
-    try:
-        with zipfile.ZipFile(archive_path) as zf:
-            for key in keys:
-                sync(dest.set(key, make_buffer(zf.read(key))))
-    finally:
-        dest.close()
+    product_uri = session.product.product_uri
+    with zipfile.ZipFile(archive_path) as zf:
+        for key in keys:
+            session.put_bytes(product_uri.join(key), zf.read(key))
 
     # verify: the restored store opens and lists the same groups and arrays
-    root = zarr.open_group(store=str(target_path), mode="r", zarr_format=3)
+    root = session.zarr.open_group(product_uri, mode="r")
     with warnings.catch_warnings():
         # the control plane (.firecube/) is not part of the zarr hierarchy
         warnings.filterwarnings("ignore", message="Object at .* is not recognized")

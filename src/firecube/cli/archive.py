@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -168,7 +169,8 @@ def _maintenance_claim_message(*, product: str, operation: str, detail: str) -> 
 
 def _acquire_maintenance_claim(
     *, manager, product: str, operation: str, owner_id: str
-) -> WriteDomain:
+) -> tuple[WriteDomain, Any]:
+    """Acquire the maintenance claim; return its domain and the handle whose release stops the heartbeat."""
     active_claims = manager.list_claims(product=product)
     if active_claims:
         details = ", ".join(f"{claim.domain} (owner={claim.owner_id})" for claim in active_claims)
@@ -182,7 +184,7 @@ def _acquire_maintenance_claim(
 
     domain = WriteDomain(product=product, category="maintenance", name=operation)
     try:
-        manager.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        handle = manager.acquire_claim(product=product, domain=domain, owner_id=owner_id)
     except ClaimConflictError as exc:
         raise click.ClickException(
             _maintenance_claim_message(
@@ -191,57 +193,49 @@ def _acquire_maintenance_claim(
                 detail=str(exc) or "write claim acquisition failed",
             )
         ) from exc
-    return domain
+    return domain, handle
 
 
 def _record_archive_create(
     *,
-    session: StorageSession,
+    manager,
+    product: str,
     run_id: str,
-    archive: str,
-    archive_format: str,
+    scope_meta: dict[str, Any],
     error: str | None = None,
 ) -> None:
     """Record a finished archive create as a maintenance run of the source product.
 
-    Called after the archive is written, so the archive never contains an
-    unfinished run. Best effort: a source without a control plane is skipped,
-    and a failure to record prints a warning instead of failing the create.
+    Call it after the archive work, so the archive never contains an unfinished
+    run. Record failures propagate to the caller.
     """
-    product_uri = session.product.product_uri
-    if not session.exists(product_uri.join(CONTROL_DIRNAME, SCHEMA_FILENAME)):
-        return
-    product = session.product.product_name
-    scope_meta: dict[str, Any] = {
-        "run_kind": "archive_create",
-        "source_product": product_uri.to_str(),
-        "target_archive": archive,
-        "archive_format": archive_format,
-    }
-    manager = session.control_plane()
-    try:
-        manager.record_maintenance_started(
+    manager.record_maintenance_started(
+        product=product, run_id=run_id, op=MAINTENANCE_OP_ARCHIVE_CREATE, scope_meta=scope_meta
+    )
+    if error is None:
+        manager.record_maintenance_completed(
             product=product, run_id=run_id, op=MAINTENANCE_OP_ARCHIVE_CREATE, scope_meta=scope_meta
         )
-        if error is None:
-            manager.record_maintenance_completed(
-                product=product,
-                run_id=run_id,
-                op=MAINTENANCE_OP_ARCHIVE_CREATE,
-                scope_meta=scope_meta,
-            )
-        else:
-            manager.record_maintenance_failed(
-                product=product,
-                run_id=run_id,
-                op=MAINTENANCE_OP_ARCHIVE_CREATE,
-                scope_meta=scope_meta,
-                error=error,
-            )
+    else:
+        manager.record_maintenance_failed(
+            product=product,
+            run_id=run_id,
+            op=MAINTENANCE_OP_ARCHIVE_CREATE,
+            scope_meta=scope_meta,
+            error=error,
+        )
+
+
+def _record_archive_create_failure(
+    *, manager, product: str, run_id: str, scope_meta: dict[str, Any], error: str
+) -> None:
+    """Record a failed archive create, warning on a record failure so the archive error survives."""
+    try:
+        _record_archive_create(
+            manager=manager, product=product, run_id=run_id, scope_meta=scope_meta, error=error
+        )
     except Exception as exc:
-        click.echo(f"Warning: archive create not recorded in the control plane: {exc}", err=True)
-    finally:
-        manager.close()
+        click.echo(f"Warning: archive create failure not recorded: {exc}", err=True)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -382,6 +376,11 @@ def create(
         },
         cache=False,
     )
+    if storage_config.anonymous:
+        raise click.UsageError(
+            "archive create writes a record into the source's control plane and needs "
+            "write access; anonymous storage access is not supported."
+        )
 
     cfg = get_config(ctx)
     archive_defaults = get_archive_defaults(cfg)
@@ -436,71 +435,138 @@ def create(
         )
         create_target = temp_archive_path
 
-    record_kwargs: dict[str, Any] = {
-        "session": session,
-        "run_id": f"archive-create-{uuid.uuid4()}",
-        "archive": archive,
+    if archive_format == "zip" and (group or start_date or end_date or variable_list):
+        raise click.ClickException(
+            "Zip archive does not support --group, --start-date, --end-date, or --variables"
+        )
+
+    run_id = f"archive-create-{uuid.uuid4()}"
+    product_name = source_identity.product_name
+    source_uri = source_identity.product_uri
+    scope_meta: dict[str, Any] = {
+        "run_kind": "archive_create",
+        "source_product": source_uri.to_str(),
+        "target_archive": archive,
         "archive_format": archive_format,
+        "group": group,
+        "start_date": start_date,
+        "end_date": end_date,
+        "variables": variable_list,
     }
+    # A plain Zarr store stays a pure read: no claim, no record, nothing written to it.
+    manager = (
+        session.control_plane()
+        if session.exists(source_uri.join(CONTROL_DIRNAME, SCHEMA_FILENAME))
+        else None
+    )
+    claim_handle: Any = None
     tgm_result: dict[str, Any] | None = None
     try:
-        if archive_format == "zip":
-            from firecube.core.zarr.zip_archive import zarr_to_zip
+        if manager is not None:
+            _claim_domain, claim_handle = _acquire_maintenance_claim(
+                manager=manager,
+                product=product_name,
+                operation="archive_create",
+                owner_id=run_id,
+            )
+        scope_meta["archive_started_at"] = datetime.now(UTC).isoformat()
+        try:
+            if archive_format == "zip":
+                from firecube.core.zarr.zip_archive import zarr_to_zip
 
-            if group or start_date or end_date or variable_list:
-                raise click.ClickException(
-                    "Zip archive does not support --group, --start-date, --end-date, or --variables"
+                zip_result = zarr_to_zip(
+                    session,
+                    create_target,
+                    overwrite=overwrite,
                 )
-            zip_result = zarr_to_zip(
-                session,
-                create_target,
-                overwrite=overwrite,
-            )
-            result_target = zip_result.target
-            result_file_size_bytes = zip_result.file_size_bytes
-        else:
-            tgm_result = zarr_to_tgm(
-                source_identity.product_uri.to_str(),
-                create_target,
-                group=group,
-                variables=variable_list,
-                start_date=start_date,
-                end_date=end_date,
-                compression=compression,
-                overwrite=overwrite,
-                session=session,
-                allow_nan=allow_nan,
-                allow_inf=allow_inf,
-            )
-            result_target = tgm_result["target"]
-            result_file_size_bytes = tgm_result["file_size_bytes"]
+                result_target = zip_result.target
+                result_file_size_bytes = zip_result.file_size_bytes
+            else:
+                tgm_result = zarr_to_tgm(
+                    source_uri.to_str(),
+                    create_target,
+                    group=group,
+                    variables=variable_list,
+                    start_date=start_date,
+                    end_date=end_date,
+                    compression=compression,
+                    overwrite=overwrite,
+                    session=session,
+                    allow_nan=allow_nan,
+                    allow_inf=allow_inf,
+                )
+                result_target = tgm_result["target"]
+                result_file_size_bytes = tgm_result["file_size_bytes"]
 
-        if temp_archive_path is not None:
-            if session.exists(archive_uri) and overwrite:
-                session.delete(archive_uri)
-            # Cross-endpoint: product session is bound to source zarr, not archive_uri.
-            target_session = (
-                session_for_uri(archive_uri, session.driver) if archive_uri.is_remote() else None
-            )
-            transfer_copy_file(
-                StorageUri.from_local_path(temp_archive_path),
-                archive_uri,
-                target_session=target_session,
-            )
-            result_target = archive_uri.to_str()
-    except click.ClickException:
-        raise
-    except (FileExistsError, ValueError, ImportError) as exc:
-        _record_archive_create(**record_kwargs, error=str(exc))
-        raise click.ClickException(str(exc)) from exc
-    except Exception as exc:
-        _record_archive_create(**record_kwargs, error=str(exc))
-        raise
+            if temp_archive_path is not None:
+                if session.exists(archive_uri) and overwrite:
+                    session.delete(archive_uri)
+                # Cross-endpoint: product session is bound to source zarr, not archive_uri.
+                target_session = (
+                    session_for_uri(archive_uri, session.driver)
+                    if archive_uri.is_remote()
+                    else None
+                )
+                transfer_copy_file(
+                    StorageUri.from_local_path(temp_archive_path),
+                    archive_uri,
+                    target_session=target_session,
+                )
+                result_target = archive_uri.to_str()
+        except click.ClickException:
+            raise
+        except (FileExistsError, ValueError, ImportError) as exc:
+            if manager is not None:
+                _record_archive_create_failure(
+                    manager=manager,
+                    product=product_name,
+                    run_id=run_id,
+                    scope_meta=scope_meta,
+                    error=str(exc),
+                )
+            raise click.ClickException(str(exc)) from exc
+        except Exception as exc:
+            if manager is not None:
+                _record_archive_create_failure(
+                    manager=manager,
+                    product=product_name,
+                    run_id=run_id,
+                    scope_meta=scope_meta,
+                    error=str(exc),
+                )
+            raise
+        finally:
+            if temp_archive_path is not None and os.path.exists(temp_archive_path):
+                os.unlink(temp_archive_path)
+
+        scope_meta["file_size_bytes"] = result_file_size_bytes
+        if manager is not None:
+            try:
+                _record_archive_create(
+                    manager=manager, product=product_name, run_id=run_id, scope_meta=scope_meta
+                )
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Archive written to {result_target}, but recording it in the control plane "
+                    f"of {source_uri.to_str()} failed: {exc}"
+                ) from exc
     finally:
-        if temp_archive_path is not None and os.path.exists(temp_archive_path):
-            os.unlink(temp_archive_path)
+        if manager is not None:
+            try:
+                # Release stops the heartbeat; deleting the file alone lets it come back.
+                if claim_handle is not None:
+                    try:
+                        claim_handle.release()
+                    except Exception as exc:
+                        # Warn, never raise: a raise here replaces the archive or record error.
+                        click.echo(
+                            f"Warning: claim {claim_handle.info.domain} at "
+                            f"{claim_handle.claim_path.to_str()} not released: {exc}",
+                            err=True,
+                        )
+            finally:
+                manager.close()
 
-    _record_archive_create(**record_kwargs)
     click.echo(f"Archive created: {result_target}")
     if tgm_result is not None:
         if tgm_result.get("groups"):
@@ -708,7 +774,7 @@ def restore(
     claim_manager = session.control_plane()
     claim_domain: WriteDomain | None = None
     try:
-        claim_domain = _acquire_maintenance_claim(
+        claim_domain, _claim_handle = _acquire_maintenance_claim(
             manager=claim_manager,
             product=product_name,
             operation="archive_restore",
@@ -716,7 +782,9 @@ def restore(
         )
         try:
             if is_zip:
-                result = zip_to_zarr(restore_source, target_uri_str, overwrite=overwrite)
+                result = zip_to_zarr(
+                    restore_source, target_uri_str, session=session, overwrite=overwrite
+                )
             else:
                 result = tgm_to_zarr(
                     restore_source,
