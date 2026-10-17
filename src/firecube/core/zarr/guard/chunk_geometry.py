@@ -269,6 +269,10 @@ def window_straddling_units(
         ``(first_slot, end_slot)`` of every unit that overlaps the window but
         also holds slots outside it, in slot order.
 
+    Only the unit holding the window's first slot and the unit holding its
+    last slot can hold slots outside the window, so only those two are
+    inspected and the cost does not depend on the window's length.
+
     Examples:
         >>> window_straddling_units(time_unit=12, time_len=12, window=(3, 4))
         [(0, 12)]
@@ -278,8 +282,11 @@ def window_straddling_units(
     start, stop = max(window[0], 0), min(window[1], time_len)
     if start >= stop:
         return []
+    first_index = start // time_unit
+    last_index = (stop - 1) // time_unit
+    indices = (first_index,) if first_index == last_index else (first_index, last_index)
     straddled = []
-    for index in chunk_axis_range(start, stop, time_unit):
+    for index in indices:
         first, end = index * time_unit, min((index + 1) * time_unit, time_len)
         if first < window[0] or end > window[1]:
             straddled.append((first, end))

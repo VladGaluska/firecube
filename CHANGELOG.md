@@ -162,6 +162,12 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 - `firecube chunks delete-span` now refuses a CF-encoded time array whose
   dtype cannot represent NaT, unless the array declares a `_FillValue`. This
   covers every integer dtype other than `int64`.
+- The dimension check of an existing cube now lists only the top level of each
+  group. It runs before every batch of an ingest into an existing cube. Before,
+  it listed every object under the group. Its cost no longer grows with the
+  number of chunk objects in the store. On a store of 173,283 objects, the
+  check fell from about 1.8 s per batch to under 0.01 s. No action is
+  required.
 
 ### Fixed
 
@@ -275,6 +281,11 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   records its footprint. A negative `ts_index` into an array that the
   workspace does not hold yet is now refused with `ConfigurationError`. Emit an
   absolute slot instead.
+- On S3 with the fsspec storage driver, the dimension check no longer fails
+  with `FileNotFoundError`. It failed when another process created an array
+  after this process had listed the store. The check now lists each group
+  again and reads the `zarr.json` file of each array directly. No action is
+  required.
 
 ## [0.1.7] - 2026-09-19
 

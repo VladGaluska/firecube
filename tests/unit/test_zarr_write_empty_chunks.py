@@ -227,26 +227,25 @@ def test_two_threads_with_different_settings_each_get_their_own() -> None:
 
 @pytest.mark.parametrize("store_kind", ["memory", "local"])
 @pytest.mark.parametrize(
-    ("layout", "ones", "cells", "absent", "deleted"),
+    ("layout", "ones", "cells", "absent"),
     [
-        pytest.param(CHUNKED, slice(0, 8), slice(0, 2), ((0,),), ((0,),), id="chunk-whole-to-fill"),
-        pytest.param(CHUNKED, slice(0, 8), slice(0, 1), (), (), id="chunk-part-to-fill"),
-        pytest.param(CHUNKED, None, slice(0, 2), ((0,),), (), id="chunk-never-stored"),
-        pytest.param(SHARDED, slice(0, 8), slice(0, 4), ((0,),), ((0,),), id="shard-whole-to-fill"),
-        pytest.param(SHARDED, slice(0, 8), slice(0, 2), (), (), id="shard-one-inner-of-two"),
-        pytest.param(SHARDED, slice(0, 2), slice(0, 2), ((0,),), ((0,),), id="shard-last-inner"),
-        pytest.param(SHARDED, slice(0, 2), slice(0, 1), (), (), id="shard-part-of-last-inner"),
-        pytest.param(SHARDED, None, slice(0, 4), ((0,),), (), id="shard-never-stored"),
+        pytest.param(CHUNKED, slice(0, 8), slice(0, 2), ((0,),), id="chunk-whole-to-fill"),
+        pytest.param(CHUNKED, slice(0, 8), slice(0, 1), (), id="chunk-part-to-fill"),
+        pytest.param(CHUNKED, None, slice(0, 2), ((0,),), id="chunk-never-stored"),
+        pytest.param(SHARDED, slice(0, 8), slice(0, 4), ((0,),), id="shard-whole-to-fill"),
+        pytest.param(SHARDED, slice(0, 8), slice(0, 2), (), id="shard-one-inner-of-two"),
+        pytest.param(SHARDED, slice(0, 2), slice(0, 2), ((0,),), id="shard-last-inner"),
+        pytest.param(SHARDED, slice(0, 2), slice(0, 1), (), id="shard-part-of-last-inner"),
+        pytest.param(SHARDED, None, slice(0, 4), ((0,),), id="shard-never-stored"),
     ],
 )
-def test_guarded_write_reports_absent_and_deleted_units(
+def test_guarded_write_reports_absent_units(
     tmp_path: Path,
     store_kind: str,
     layout: dict[str, Any],
     ones: slice | None,
     cells: slice,
     absent: tuple[tuple[int, ...], ...],
-    deleted: tuple[tuple[int, ...], ...],
 ) -> None:
     store = MemoryStore() if store_kind == "memory" else LocalStore(tmp_path)
     arr = _vector(store, layout, ones=ones)
@@ -256,7 +255,6 @@ def test_guarded_write_reports_absent_and_deleted_units(
     assert result.tracked is True
     assert result.units == ((0,),)
     assert result.absent == absent
-    assert result.deleted == deleted
     assert _stored(arr, (0,)) is (absent == ())
     expected = np.zeros(8, dtype="f4")
     if ones is not None:
@@ -273,8 +271,43 @@ def test_guarded_write_keeping_empty_chunks_stores_every_touched_unit(
 
     result = _fill(arr, slice(0, 4), write_empty_chunks=True)
 
-    assert (result.tracked, result.absent, result.deleted) == (False, (), ())
+    assert (result.tracked, result.absent) == (False, ())
     assert all(_stored(arr, unit) for unit in result.units)
+
+
+class _ExistsCountingStore(MemoryStore):
+    """A MemoryStore that counts its `exists` calls."""
+
+    exists_calls = 0
+
+    async def exists(self, key: str) -> bool:
+        self.exists_calls += 1
+        return await super().exists(key)
+
+
+def test_tracked_write_probes_no_unit_it_set_or_deleted() -> None:
+    """Every touched unit is set or deleted by the write itself, so none needs an `exists` probe."""
+    store = _ExistsCountingStore()
+    arr = _vector(store, CHUNKED, ones=slice(0, 4))
+    payload = np.array([0, 0, 1, 1, 0, 0, 1, 1], dtype="f4")
+    before = store.exists_calls
+
+    result = guarded_write(
+        arr,
+        WriteFootprint("data/v", ((0, 8),)),
+        slice(0, 8),
+        payload,
+        store="test",
+        write_empty_chunks=False,
+        track_units=True,
+    )
+
+    probes = store.exists_calls - before
+    assert (result.tracked, result.absent) == (True, ((0,), (2,)))
+    np.testing.assert_array_equal(arr[...], payload)
+    assert probes == 0, (
+        f"tracked write made {probes} exists calls for {len(result.units)} units it set or deleted"
+    )
 
 
 @pytest.mark.parametrize(
@@ -452,5 +485,4 @@ def test_keeping_empty_chunks_still_reports_units_the_write_did_not_reach(
 
     assert result.tracked is True
     assert result.absent == absent
-    assert result.deleted == ()
     assert result.absent == tuple(unit for unit in result.units if not _stored(arr, unit))

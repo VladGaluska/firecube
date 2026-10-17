@@ -266,8 +266,11 @@ class FsspecFilesystem:
     def exists(self, uri: StorageUri) -> bool:
         return self._fs.exists(self._to_path(uri))
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list:
-        entries = self._fs.ls(self._to_path(uri), detail=detail)
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list:
+        # Only forward the keyword when asked: every fsspec filesystem accepts it
+        # (s3fs answers from a dircache otherwise), but a plain call stays as it was.
+        kwargs = {"refresh": True} if refresh else {}
+        entries = self._fs.ls(self._to_path(uri), detail=detail, **kwargs)
         return [entry for entry in entries if not _is_listed_publication_temp(entry)]
 
     def isdir(self, uri: StorageUri) -> bool:

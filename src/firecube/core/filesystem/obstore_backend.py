@@ -186,7 +186,9 @@ class ObstoreFilesystem:
         except Exception:
             return self.isdir(uri)
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list:
+        # ``refresh`` is accepted for the Protocol and ignored: obstore lists the
+        # store on every call.
         rel_path = self._resolve_path(uri).rstrip("/")
         prefix = rel_path + "/" if rel_path else ""
         result = self._store.list_with_delimiter(prefix=prefix)

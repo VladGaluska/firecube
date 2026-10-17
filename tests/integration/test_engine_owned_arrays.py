@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
+import sys
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 from typing import Any, ClassVar
 
 import numpy as np
@@ -24,6 +25,11 @@ from click.testing import CliRunner
 
 from firecube.cli.main import cli
 from firecube.core.api import IndexSpec, IntegerAxis, ItemInfo, RegularTimeAxis
+from firecube.core.zarr.guard.engine_owned import (
+    materialize_engine_owned_array,
+    require_engine_owned_slots,
+)
+from firecube.core.zarr.guard.metadata_authority import MetadataAuthority, MetadataScope
 from firecube.ingestor.api import (
     DirectZarrIngestor,
     IndexedWrite,
@@ -279,3 +285,72 @@ def test_staged_promotion_requires_every_cell_of_touched_unit(tmp_path, budget_p
         assert "promot" in result.output + str(result.exception)
         assert payload_snapshot(target) == before
     np.testing.assert_array_equal(root(target)["data/vec"][:], np.arange(1, 5) + 10 * ok)
+
+
+STORED_RANGE = 1_000_000
+
+
+def _owned_target(tmp_path, length):
+    """Return a store whose engine-owned array lists slots [0, STORED_RANGE) as one range."""
+    target = tmp_path / "cube.zarr"
+    attrs = {
+        "firecube_engine_owned": True,
+        "firecube_engine_owned_complete": True,
+        "firecube_engine_owned_slots": [[0, STORED_RANGE]],
+    }
+    group = zarr.open_group(str(target), mode="w", zarr_format=3).create_group("data")
+    group.create_array(
+        "owned", shape=(length,), dtype="float64", fill_value=np.nan, attributes=attrs
+    )
+    return target
+
+
+def _line_events(call):
+    """Return ``(result, number of Python line events during call())``."""
+    lines = 0
+
+    def count_lines(frame: FrameType, event: str, arg: Any) -> Any:
+        nonlocal lines
+        if event == "line":
+            lines += 1
+        return count_lines
+
+    previous = sys.gettrace()
+    sys.settrace(count_lines)
+    try:
+        result = call()
+    finally:
+        sys.settrace(previous)
+    return result, lines
+
+
+def test_require_engine_owned_slots_work_does_not_grow_with_stored_range(tmp_path):
+    target = _owned_target(tmp_path, 8)
+    wanted = [("data/owned", slot) for slot in (0, 5, STORED_RANGE - 1)]
+    refused, lines = _line_events(lambda: require_engine_owned_slots(root(target), wanted))
+    assert refused is None
+    assert lines < 3_000, (
+        f"require_engine_owned_slots executed {lines} lines for a stored range of {STORED_RANGE} slots"
+    )
+
+
+def test_materialize_stamp_work_does_not_grow_with_stored_range(tmp_path):
+    target = _owned_target(tmp_path, STORED_RANGE + 3)
+    group = zarr.open_group(str(target), mode="a", use_consolidated=False)
+    authority = MetadataAuthority.process_local(MetadataScope(str(target.resolve())))
+    values = {STORED_RANGE + i: 1.0 + i for i in range(3)}
+    _, lines = _line_events(
+        lambda: materialize_engine_owned_array(
+            arr=group["data/owned"],
+            root=group,
+            authority=authority,
+            array_path="data/owned",
+            values_by_slot=values,
+            report=lambda message: None,
+        )
+    )
+    slots = root(target)["data/owned"].attrs["firecube_engine_owned_slots"]
+    assert slots == [[0, STORED_RANGE + 3]]
+    assert lines < 15_000, (
+        f"materialize_engine_owned_array executed {lines} lines for a stored range of {STORED_RANGE} slots"
+    )

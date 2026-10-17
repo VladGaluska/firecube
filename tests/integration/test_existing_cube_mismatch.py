@@ -216,3 +216,106 @@ def test_whole_cube_ambiguity_detected(tmp_path):
         verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
     msg = str(exc.value).lower()
     assert any(tok in msg for tok in ["ambiguous", "both", "conflicting"])
+
+
+@pytest.mark.integration
+def test_dim_check_lists_only_the_group_top_level(tmp_path, monkeypatch):
+    """The check reads one level of the group: its listings must not grow with chunk objects."""
+    import numpy as np
+    import xarray as xr
+
+    from firecube.ingestor.runtime.zarr import existing_cube_check
+
+    target = tmp_path / "many_chunks.zarr"
+    ds = xr.Dataset(
+        {name: (("time", "x"), np.zeros((2, 3))) for name in ("a", "b", "c")},
+        coords={"time": [0.0, 1.0]},
+    )
+    ds.to_zarr(str(target), mode="w", zarr_format=3, consolidated=False)
+    for name in ("a", "b", "c"):
+        for i in range(500):  # chunk objects the check has no reason to list
+            chunk = target / name / "c" / str(i) / "0"
+            chunk.parent.mkdir(parents=True, exist_ok=True)
+            chunk.write_bytes(b"x")
+
+    listed = {"entries": 0}
+
+    class _CountingFs:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, attr):
+            member = getattr(self._inner, attr)
+            if attr not in ("find", "ls", "walk", "glob"):
+                return member
+
+            def counted(*args, **kwargs):
+                result = list(member(*args, **kwargs))
+                listed["entries"] += len(result)
+                return result
+
+            return counted
+
+    real_create = existing_cube_check.create_filesystem
+    monkeypatch.setattr(
+        existing_cube_check, "create_filesystem", lambda binding: _CountingFs(real_create(binding))
+    )
+
+    outcome = existing_cube_check.verify_dim_compatibility(
+        str(target), "time", group_paths=["."], storage_config=None
+    )
+
+    assert outcome is None  # a matching cube passes
+    arrays = 4  # a, b, c and the time coordinate
+    assert listed["entries"] < 12, (
+        f"dim check listed {listed['entries']} entries for {arrays} arrays"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.s3
+@pytest.mark.parametrize("change", ["created_after_listing", "deleted_after_listing"])
+def test_dim_check_reads_arrays_changed_after_listing(change, monkeypatch, tmp_path):
+    """An array another writer creates or deletes after this process listed the group counts."""
+    import boto3
+    import s3fs
+    from moto.server import ThreadedMotoServer
+
+    from firecube.core.filesystem import create_filesystem
+    from firecube.core.storage.uri import StorageUri
+    from firecube.ingestor.errors import ConfigurationError
+    from firecube.ingestor.runtime.zarr.existing_cube_check import verify_dim_compatibility
+    from tests.helpers.storage import make_test_binding
+
+    server = ThreadedMotoServer(port=0)
+    server.start()
+    try:
+        host, port = server.get_host_and_port()
+        for name, value in {
+            "AWS_ENDPOINT_URL": f"http://{host}:{port}",
+            "AWS_ACCESS_KEY_ID": "t",
+            "AWS_SECRET_ACCESS_KEY": "t",
+            "AWS_DEFAULT_REGION": "us-east-1",
+        }.items():
+            monkeypatch.setenv(name, value)
+        s3 = boto3.client("s3")
+        s3.create_bucket(Bucket="bkt")
+        s3.put_object(Bucket="bkt", Key="cube.zarr/g/zarr.json", Body=b'{"node_type": "group"}')
+        s3.put_object(Bucket="bkt", Key="cube.zarr/g/a/c/0/0", Body=b"x")
+        array = b'{"node_type": "array", "dimension_names": ["timestamp", "x"]}'
+        if change == "deleted_after_listing":
+            s3.put_object(Bucket="bkt", Key="cube.zarr/g/a/zarr.json", Body=array)
+        s3fs.S3FileSystem.clear_instance_cache()
+        binding = make_test_binding(tmp_path, product="cube.zarr", protocol="s3", authority="bkt")
+        create_filesystem(binding).find(
+            StorageUri(protocol="s3", authority="bkt", path="/cube.zarr/g")
+        )
+        if change == "created_after_listing":
+            s3.put_object(Bucket="bkt", Key="cube.zarr/g/a/zarr.json", Body=array)
+            with pytest.raises(ConfigurationError, match="timestamp"):
+                verify_dim_compatibility("s3://bkt/cube.zarr", "time", ["g"], binding)
+        else:
+            s3.delete_object(Bucket="bkt", Key="cube.zarr/g/a/zarr.json")
+            assert verify_dim_compatibility("s3://bkt/cube.zarr", "time", ["g"], binding) is None
+    finally:
+        server.stop()

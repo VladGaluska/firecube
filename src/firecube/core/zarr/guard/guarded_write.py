@@ -21,7 +21,9 @@ off. Two writers doing that to one object lose an update, and Zarr leaves the
 exclusion to the caller. `guarded_write` holds this process's lock on every
 stored unit a footprint touches across that whole read-merge-write, applies
 ``write_empty_chunks`` to the array being written rather than to the process,
-and can report which units hold no object afterwards.
+and can report which units hold no object afterwards. A tracked write goes
+through a recording store that notes every key the write sets or deletes. A
+unit the write did not reach gets one existence check after the write.
 
 Metadata (``zarr.json``: shape, attributes, markers) is a separate resource and
 is not written here. The locks are in-process only.
@@ -37,6 +39,7 @@ from operator import index as operator_index
 from typing import Any
 
 import numpy as np
+from zarr.storage import StorePath, WrapperStore
 
 from firecube.core.zarr._zarr_compat import sync
 from firecube.core.zarr.guard._unit_locks import _UNIT_LOCKS, canonical_array_path
@@ -61,15 +64,13 @@ class WriteResult:
             stepped selection or a box wider than the selection leaves units
             unwritten. Empty without a check only when the handle keeps empty
             chunks and the selection assigns every cell of the box.
-        deleted: The units of ``absent`` that held an object before the write:
-            the write removed them.
-        tracked: Whether object existence was checked before and after.
+        tracked: Whether ``absent`` was determined, from the write's own sets
+            and deletes and one existence check per unit it did not reach.
     """
 
     footprint: WriteFootprint
     units: tuple[Unit, ...]
     absent: tuple[Unit, ...] = ()
-    deleted: tuple[Unit, ...] = ()
     tracked: bool = False
 
 
@@ -307,11 +308,12 @@ def guarded_write(
             ``None`` keeps the setting ``arr`` was opened with.
         hold: The `hold_array` hold of this array; optional, as this thread's
             hold is found without it.
-        track_units: Check object existence of every touched unit before and
-            after, under the lock, to report ``absent`` and ``deleted`` (two
-            ``exists`` calls per unit). Skipped only when the handle keeps
-            empty chunks and ``selection`` assigns every cell of the box:
-            every touched unit is then stored and none is absent.
+        track_units: Report ``absent``, under the lock. A unit the write
+            deletes is absent and one it stores is not. A unit with no
+            recorded set or delete gets one ``exists`` call after the write.
+            Skipped only when the handle keeps empty chunks and ``selection``
+            assigns every cell of the box: every touched unit is then stored
+            and none is absent.
         on_result: Called with the result after the write and its existence
             checks, before the unit locks (or the whole-array hold's lock,
             which this call does not release) are given up: results of
@@ -323,7 +325,7 @@ def guarded_write(
             raises propagates, and nothing is written.
 
     Returns:
-        The touched units and, when tracked, the absent and deleted ones.
+        The touched units and, when tracked, the absent ones.
 
     Raises:
         ValueError: The footprint names another array or does not fit its
@@ -390,16 +392,90 @@ def _write_tracked(
     payload: Any,
     track_units: bool,
 ) -> WriteResult:
-    check = track_units and bool(units)
-    before = {unit: _unit_exists(arr, unit) for unit in units} if check else {}
-    arr[selection] = payload
-    if not check:
+    if not (track_units and units):
+        arr[selection] = payload
         return WriteResult(footprint=footprint, units=units)
-    absent = tuple(unit for unit in units if not _unit_exists(arr, unit))
-    deleted = tuple(unit for unit in absent if before[unit])
-    return WriteResult(
-        footprint=footprint, units=units, absent=absent, deleted=deleted, tracked=True
+    handle, recorder = _recording_handle(arr)
+    handle[selection] = payload
+    absent: list[Unit] = []
+    for unit in units:
+        kind = recorder.kinds.get(unit_store_key(arr, unit), _UNKNOWN)
+        if kind == _REMOVED or (kind == _UNKNOWN and not _unit_exists(arr, unit)):
+            absent.append(unit)
+    return WriteResult(footprint=footprint, units=units, absent=tuple(absent), tracked=True)
+
+
+_STORED, _REMOVED, _UNKNOWN = "stored", "removed", "unknown"
+
+
+class _RecordingStore(WrapperStore[Any]):
+    """A store wrapper that keeps, per key, the kind of the last call that returned.
+
+    A set records ``stored`` and a delete records ``removed``. `set_if_not_exists`
+    records ``unknown``, and so does `delete_dir` for each recorded key under its
+    prefix. A key never touched has no entry. One instance serves one guarded write.
+    """
+
+    def __init__(self, store: Any) -> None:
+        super().__init__(store)
+        self.kinds: dict[str, str] = {}
+        self._kinds_lock = threading.Lock()
+
+    def _record(self, key: str, kind: str) -> None:
+        with self._kinds_lock:
+            self.kinds[key] = kind
+
+    async def set(self, key: str, value: Any) -> None:
+        await super().set(key, value)
+        self._record(key, _STORED)
+
+    async def _set_many(self, values: Any) -> None:
+        pairs = list(values)
+        await super()._set_many(pairs)
+        for key, _ in pairs:
+            self._record(key, _STORED)
+
+    async def delete(self, key: str) -> None:
+        await super().delete(key)
+        self._record(key, _REMOVED)
+
+    async def set_if_not_exists(self, key: str, value: Any) -> None:
+        await super().set_if_not_exists(key, value)
+        self._record(key, _UNKNOWN)
+
+    async def delete_dir(self, prefix: str) -> None:
+        await super().delete_dir(prefix)
+        stem = prefix.rstrip("/")
+        with self._kinds_lock:
+            for key in self.kinds:
+                if not stem or key.startswith(f"{stem}/"):
+                    self.kinds[key] = _UNKNOWN
+
+    if hasattr(WrapperStore, "set_sync"):
+
+        def set_sync(self, key: str, value: Any) -> None:
+            super().set_sync(key, value)  # pyright: ignore[reportAttributeAccessIssue]
+            self._record(key, _STORED)
+
+        def delete_sync(self, key: str) -> None:
+            super().delete_sync(key)  # pyright: ignore[reportAttributeAccessIssue]
+            self._record(key, _REMOVED)
+
+
+def _recording_handle(arr: Any) -> tuple[Any, _RecordingStore]:
+    """Return a handle over a fresh `_RecordingStore` with ``arr``'s metadata, path and config.
+
+    Built as ``AsyncArray.with_config`` builds one: no I/O, and the write goes
+    through the very metadata the guard validated.
+    """
+    inner = arr.async_array
+    recorder = _RecordingStore(inner.store_path.store)
+    rebuilt = type(inner)(
+        metadata=inner.metadata,
+        store_path=StorePath(recorder, inner.store_path.path),
+        config=inner.config,
     )
+    return type(arr)(rebuilt), recorder
 
 
 __all__ = [

@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import FrameType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -23,6 +25,7 @@ from firecube.core.zarr.guard.chunk_geometry import (
     chunk_axis_range,
     chunk_index_to_region,
     physical_chunk_keys_for_region,
+    window_straddling_units,
 )
 
 pytestmark = pytest.mark.unit
@@ -160,3 +163,43 @@ def test_physical_chunk_keys_out_of_bounds_ts_raises() -> None:
             chunks=(1, 2, 4),
             selection=_selection(ts_index=1),
         )
+
+
+@pytest.mark.parametrize(
+    ("time_unit", "time_len", "window", "expected"),
+    [
+        pytest.param(1, 100_000, (0, 100_000), [], id="unit1"),
+        pytest.param(
+            256,
+            25_600_000,
+            (1, 25_599_999),
+            [(0, 256), (25_599_744, 25_600_000)],
+            id="unit256",
+        ),
+    ],
+)
+def test_window_straddling_units_work_does_not_grow_with_window(
+    time_unit: int,
+    time_len: int,
+    window: tuple[int, int],
+    expected: list[tuple[int, int]],
+) -> None:
+    lines = 0
+
+    def count_lines(frame: FrameType, event: str, arg: Any) -> Any:
+        nonlocal lines
+        if event == "line":
+            lines += 1
+        return count_lines
+
+    previous = sys.gettrace()
+    sys.settrace(count_lines)
+    try:
+        result = window_straddling_units(time_unit=time_unit, time_len=time_len, window=window)
+    finally:
+        sys.settrace(previous)
+
+    assert result == expected
+    assert lines < 200, (
+        f"window_straddling_units executed {lines} lines for a window of {window[1] - window[0]} slots"
+    )

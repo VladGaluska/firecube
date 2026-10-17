@@ -35,6 +35,7 @@ different value than the sources.
 
 from __future__ import annotations
 
+import bisect
 import decimal
 import fractions
 import numbers
@@ -325,22 +326,48 @@ def collect_engine_owned_values(
     return collected
 
 
-def _written_slots(arr: Any) -> set[int]:
+class _SlotRanges:
+    """Sorted, merged ``[start, end)`` slot ranges with binary-search membership."""
+
+    __slots__ = ("_ends", "_starts")
+
+    def __init__(self, pairs: Iterable[Sequence[int]]) -> None:
+        spans = sorted((int(start), int(end)) for start, end in pairs)
+        merged: list[list[int]] = []
+        for start, end in spans:
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        self._starts = [start for start, _ in merged]
+        self._ends = [end for _, end in merged]
+
+    def __contains__(self, slot: object) -> bool:
+        index = bisect.bisect_right(self._starts, slot) - 1  # type: ignore[arg-type]
+        return index >= 0 and slot < self._ends[index]  # type: ignore[operator]
+
+    def with_slots(self, slots: Iterable[int]) -> list[list[int]]:
+        """Return the ranges covering these ranges and *slots*, sorted and merged."""
+        runs: list[list[int]] = []
+        for slot in sorted(slots):
+            if runs and runs[-1][1] == slot:
+                runs[-1][1] = slot + 1
+            else:
+                runs.append([slot, slot + 1])
+        return _SlotRanges([*zip(self._starts, self._ends, strict=True), *runs]).as_lists()
+
+    def as_lists(self) -> list[list[int]]:
+        return [[start, end] for start, end in zip(self._starts, self._ends, strict=True)]
+
+
+def _written_slots(arr: Any) -> _SlotRanges:
     """Slots listed in ``ATTR_ENGINE_OWNED_SLOTS``; every slot when the list is absent."""
     ranges = arr.attrs.get(ATTR_ENGINE_OWNED_SLOTS)
     if ranges is None:
-        return set(range(int(arr.shape[0])))
-    return {slot for start, end in ranges for slot in range(int(start), int(end))}
-
-
-def _slot_ranges(slots: Iterable[int]) -> list[list[int]]:
-    ranges: list[list[int]] = []
-    for slot in sorted(slots):
-        if ranges and ranges[-1][1] == slot:
-            ranges[-1][1] = slot + 1
-        else:
-            ranges.append([slot, slot + 1])
-    return ranges
+        return _SlotRanges([(0, int(arr.shape[0]))])
+    return _SlotRanges(ranges)
 
 
 def materialize_engine_owned_array(
@@ -429,14 +456,14 @@ def materialize_engine_owned_array(
         # metadata, so an array preallocate created is never marked without a list
         # (which counts as every slot written); only the list grows here.
         if settled:
-            stamp({ATTR_ENGINE_OWNED_SLOTS: _slot_ranges(written_slots | settled)})
+            stamp({ATTR_ENGINE_OWNED_SLOTS: written_slots.with_slots(settled)})
         if changed:
             whole = WriteFootprint(hold.array_path, tuple((0, int(n)) for n in arr.shape))
             guarded_write(
                 arr, whole, ..., merged, store=hold.store, write_empty_chunks=None, hold=hold
             )
         if added - settled:
-            stamp({ATTR_ENGINE_OWNED_SLOTS: _slot_ranges(written_slots | added)})
+            stamp({ATTR_ENGINE_OWNED_SLOTS: written_slots.with_slots(added)})
         if not complete:
             stamp({ATTR_ENGINE_OWNED_COMPLETE: True})
     report(
