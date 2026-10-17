@@ -13,8 +13,10 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   `--archive-format zip` packs a Zarr product into a single local
   `.zip` file that opens as a Zarr zip store. The default stays `tensogram`.
   Zip archives contain the whole product, so `--group`, `--start-date`,
-  `--end-date`, and `--variables` are rejected, and `firecube archive info`,
-  `list`, `validate`, and `restore` do not accept `.zip` archives yet.
+  `--end-date`, and `--variables` are rejected.
+- `firecube archive info`, `list`, `validate`, and `restore` accept local
+  `.zip` archives.
+- `firecube archive create` records each run in the source product's control plane.
 
 ### Changed
 

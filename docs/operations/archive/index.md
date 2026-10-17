@@ -1,16 +1,17 @@
 # Archive Operations
 
 Use archive operations to turn a finished Zarr product into a portable
-Tensogram `.tgm` or `.zip` file. A `.tgm` archive can also be inspected,
-validated, and restored back to Zarr.
+Tensogram `.tgm` or `.zip` file. Both formats can be inspected, validated,
+and restored back to Zarr.
 
-Archive operations are separate from normal product ingestion. A `.tgm` archive
+Archive operations are separate from normal product ingestion. An archive
 is a portable artifact; the restored Zarr product gets its own ChunkManager
 state.
 
 ## Prerequisites
 
-Install Firecube with the tensogram extra:
+For `.tgm` archives, install Firecube with the tensogram extra. `.zip`
+archives need no extra:
 
 ```bash
 uv pip install 'firecube[tensogram]'
@@ -34,13 +35,13 @@ described in [Configuration Reference](../../reference/config.md).
 | `firecube archive info` | Show archive metadata. |
 | `firecube archive list` | List archived groups and variables. |
 | `firecube archive validate` | Check archive integrity. |
-| `firecube archive restore` | Restore `.tgm` back to Zarr. |
+| `firecube archive restore` | Restore `.tgm` or `.zip` back to Zarr. |
 
-`.zip` archives are currently supported by `firecube archive create` only.
+`.zip` archives must be local files and restore to local targets only.
 
 ## Next Steps
 
 - **[Create Archives](create.md)** — create a `.tgm` or `.zip` archive
 - **[Inspect And Validate Archives](inspect.md)** — inspect metadata or verify archive integrity
-- **[Restore Archives](restore.md)** — restore a `.tgm` file to Zarr
+- **[Restore Archives](restore.md)** — restore a `.tgm` or `.zip` file to Zarr
 - **[Tensogram Output Format](../../concepts/output-formats/archive.md)** — format overview

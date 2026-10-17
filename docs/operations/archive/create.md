@@ -107,6 +107,16 @@ Expected output:
 VALID: /data/archives/MY_PRODUCT.tgm (2 message(s), no issues)
 ```
 
+Each create is recorded as an `archive-create-…` run in the source product,
+with status `complete` or `failed`:
+
+```bash
+firecube chunks runs list --target "$PRODUCT_URI" --product-name MY_PRODUCT.zarr
+```
+
+Products without a `.firecube/` control plane are archived without a record
+and are not modified.
+
 ## Next Steps
 
 - **[Inspect And Validate Archives](inspect.md)** — inspect metadata or contents

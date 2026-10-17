@@ -29,6 +29,7 @@ Archive subcommands distinguish two URI categories:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -53,7 +54,13 @@ from firecube.cli._uri_policy import (
 )
 from firecube.core import observability
 from firecube.core.config import get_archive_defaults
-from firecube.core.controlplane.types import MAINTENANCE_OP_ARCHIVE_RESTORE, WriteDomain
+from firecube.core.controlplane.types import (
+    CONTROL_DIRNAME,
+    MAINTENANCE_OP_ARCHIVE_CREATE,
+    MAINTENANCE_OP_ARCHIVE_RESTORE,
+    SCHEMA_FILENAME,
+    WriteDomain,
+)
 from firecube.core.errors import ClaimConflictError
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
@@ -97,12 +104,59 @@ def _temporary_zip_path() -> str:
     return path
 
 
-def _reject_zip_archive(archive: str, *, command: str) -> None:
-    """Fail early when a .zip archive is passed to a Tensogram-only command."""
-    if archive.rstrip("/").lower().endswith(".zip"):
-        raise click.ClickException(
-            f"archive {command} does not support .zip archives at the moment: {archive}"
-        )
+def _is_zip_archive(archive: str) -> bool:
+    """Return True when the archive URI names a zip archive rather than a .tgm."""
+    return archive.rstrip("/").lower().endswith(".zip")
+
+
+def _local_zip_archive(archive: str) -> str:
+    """Resolve a zip archive URI to an existing local path, or fail with a CLI error."""
+    if is_remote_target(archive):
+        raise click.ClickException("Remote .zip artifacts not yet supported")
+    local_path = str(local_path_from_target(archive))
+    if not Path(local_path).is_file():
+        raise click.ClickException(f"Archive not found: {archive}")
+    return local_path
+
+
+def _echo_archive_info(info_dict: dict[str, Any], *, as_json: bool, format_label: str) -> None:
+    """Print the metadata of a .tgm or .zip archive as JSON or as a table.
+
+    Fields only one format provides are printed when present: entry count and
+    per-variable codec for zip, source, archive time and group codec for .tgm.
+    Groups without variables and without source metadata are skipped.
+    """
+    if as_json:
+        click.echo(json.dumps(info_dict, indent=2))
+        return
+    click.echo(f"Path:           {info_dict['path']}")
+    click.echo(f"Format:         {format_label}")
+    click.echo(f"Size:           {info_dict['size_bytes'] / (1024 * 1024):.2f} MB")
+    if "entries" in info_dict:
+        click.echo(f"Entries:        {info_dict['entries']}")
+    click.echo(
+        "Groups:         " + (", ".join(g or "(root)" for g in info_dict["groups"]) or "(none)")
+    )
+    click.echo("Control-plane:  " + ("present" if info_dict["has_controlplane"] else "not present"))
+    for g in info_dict["group_details"]:
+        if not g["variables"] and "source_uri" not in g:
+            continue
+        click.echo(f"\nGroup: {g['group'] or '(root)'}")
+        if "source_uri" in g:
+            click.echo(f"  Source:    {g['source_uri']}")
+            click.echo(f"  Archived:  {g['archived_at']}")
+            click.echo(f"  Codec:     {g['compression']}")
+        click.echo("  Variables:")
+        for vname, vmeta in g["variables"].items():
+            chunks_str = f" chunks={vmeta['zarr_chunks']}" if vmeta.get("zarr_chunks") else ""
+            codec_str = (
+                f" codec={','.join(vmeta['compressors']) or 'none'}"
+                if "compressors" in vmeta
+                else ""
+            )
+            click.echo(
+                f"    {vname}: shape={vmeta['shape']} dtype={vmeta['dtype']}{chunks_str}{codec_str}"
+            )
 
 
 def _maintenance_claim_message(*, product: str, operation: str, detail: str) -> str:
@@ -138,6 +192,56 @@ def _acquire_maintenance_claim(
             )
         ) from exc
     return domain
+
+
+def _record_archive_create(
+    *,
+    session: StorageSession,
+    run_id: str,
+    archive: str,
+    archive_format: str,
+    error: str | None = None,
+) -> None:
+    """Record a finished archive create as a maintenance run of the source product.
+
+    Called after the archive is written, so the archive never contains an
+    unfinished run. Best effort: a source without a control plane is skipped,
+    and a failure to record prints a warning instead of failing the create.
+    """
+    product_uri = session.product.product_uri
+    if not session.exists(product_uri.join(CONTROL_DIRNAME, SCHEMA_FILENAME)):
+        return
+    product = session.product.product_name
+    scope_meta: dict[str, Any] = {
+        "run_kind": "archive_create",
+        "source_product": product_uri.to_str(),
+        "target_archive": archive,
+        "archive_format": archive_format,
+    }
+    manager = session.control_plane()
+    try:
+        manager.record_maintenance_started(
+            product=product, run_id=run_id, op=MAINTENANCE_OP_ARCHIVE_CREATE, scope_meta=scope_meta
+        )
+        if error is None:
+            manager.record_maintenance_completed(
+                product=product,
+                run_id=run_id,
+                op=MAINTENANCE_OP_ARCHIVE_CREATE,
+                scope_meta=scope_meta,
+            )
+        else:
+            manager.record_maintenance_failed(
+                product=product,
+                run_id=run_id,
+                op=MAINTENANCE_OP_ARCHIVE_CREATE,
+                scope_meta=scope_meta,
+                error=error,
+            )
+    except Exception as exc:
+        click.echo(f"Warning: archive create not recorded in the control plane: {exc}", err=True)
+    finally:
+        manager.close()
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -332,6 +436,12 @@ def create(
         )
         create_target = temp_archive_path
 
+    record_kwargs: dict[str, Any] = {
+        "session": session,
+        "run_id": f"archive-create-{uuid.uuid4()}",
+        "archive": archive,
+        "archive_format": archive_format,
+    }
     tgm_result: dict[str, Any] | None = None
     try:
         if archive_format == "zip":
@@ -378,12 +488,19 @@ def create(
                 target_session=target_session,
             )
             result_target = archive_uri.to_str()
+    except click.ClickException:
+        raise
     except (FileExistsError, ValueError, ImportError) as exc:
+        _record_archive_create(**record_kwargs, error=str(exc))
         raise click.ClickException(str(exc)) from exc
+    except Exception as exc:
+        _record_archive_create(**record_kwargs, error=str(exc))
+        raise
     finally:
         if temp_archive_path is not None and os.path.exists(temp_archive_path):
             os.unlink(temp_archive_path)
 
+    _record_archive_create(**record_kwargs)
     click.echo(f"Archive created: {result_target}")
     if tgm_result is not None:
         if tgm_result.get("groups"):
@@ -416,6 +533,10 @@ Examples:
     --archive file:///tmp/archive.tgm \\
     --target file:///path/to/product.zarr \\
     --overwrite
+  # restore a zip archive to a local Zarr store
+  firecube archive restore \\
+    --archive file:///tmp/archive.zip \\
+    --target file:///path/to/restored.zarr
 See also: firecube archive create, firecube archive info
 """,
 )
@@ -458,18 +579,26 @@ def restore(
     dry_run: bool,
     yes_i_really_mean_it: bool,
 ) -> None:
-    """restore a  archive to a Zarr store
+    """restore a .tgm or .zip archive to a Zarr store
 
-    decodes all encoded array groups from the archive file and writes them back
-    to the target Zarr store. archive groups restore to their original paths.
+    decodes all encoded array groups from a .tgm archive, or copies every entry
+    of a .zip archive, and writes them back to the target Zarr store. archive
+    groups restore to their original paths. zip archives restore to local
+    targets only.
     """
-    _reject_zip_archive(archive, command="restore")
+    is_zip = _is_zip_archive(archive)
 
     parsed_target = parse_product_uri(target)
     storage_type = apply_smart_default(parsed_target, storage_type)
     if is_remote_target(archive):
-        raise click.ClickException("Remote .tgm artifacts not yet supported")
-    archive_abs = str(local_path_from_target(archive))
+        raise click.ClickException(
+            f"Remote {'.zip' if is_zip else '.tgm'} artifacts not yet supported"
+        )
+    if is_zip and is_remote_target(target):
+        raise click.ClickException(
+            "Restoring a .zip archive to a remote target is not yet supported"
+        )
+    archive_abs = _local_zip_archive(archive) if is_zip else str(local_path_from_target(archive))
 
     _require_overwrite_confirmation(overwrite=overwrite, yes_i_really_mean_it=yes_i_really_mean_it)
 
@@ -480,6 +609,7 @@ def restore(
         return
 
     from firecube.core.tensogram.restore import tgm_to_zarr
+    from firecube.core.zarr.zip_archive import zip_to_zarr
 
     storage_config = get_storage_config(
         ctx,
@@ -585,19 +715,22 @@ def restore(
             owner_id=restore_run_id,
         )
         try:
-            result = tgm_to_zarr(
-                restore_source,
-                target_uri_str,
-                overwrite=overwrite,
-                session=session,
-                on_group_restored=lambda restored_group: click.echo(
-                    f"restored group: {restored_group or '/'}"
-                ),
-            )
+            if is_zip:
+                result = zip_to_zarr(restore_source, target_uri_str, overwrite=overwrite)
+            else:
+                result = tgm_to_zarr(
+                    restore_source,
+                    target_uri_str,
+                    overwrite=overwrite,
+                    session=session,
+                    on_group_restored=lambda restored_group: click.echo(
+                        f"restored group: {restored_group or '/'}"
+                    ),
+                )
             if not result.get("variables") and not result.get("groups"):
                 raise ValueError(
                     f"Archive restore produced no output: {restore_source!r} "
-                    "may be empty or not a valid tensogram archive."
+                    f"may be empty or not a valid {'zip' if is_zip else 'tensogram'} archive."
                 )
         finally:
             if temp_archive_path is not None and os.path.exists(temp_archive_path):
@@ -687,6 +820,10 @@ Examples:
   # output metadata as JSON
   firecube archive info --archive file:///tmp/archive.tgm -f json
 
+\b
+  # show metadata for a zip archive
+  firecube archive info --archive file:///tmp/archive.zip
+
 See also: firecube archive list, firecube archive validate
 """,
 )
@@ -694,20 +831,27 @@ See also: firecube archive list, firecube archive validate
 @display_format_option(default="table")
 @click.pass_context
 def info(ctx: click.Context, archive: str, output_format: str) -> None:
-    """show metadata for a .tgm archive
+    """show metadata for a .tgm or .zip archive
 
     reads the archive header to display variable names, dimension sizes, codec,
     and time coverage. no data is decoded or written; suitable for quick
     inspection.
     """
+    if _is_zip_archive(archive):
+        from firecube.core.zarr.zip_archive import zip_info
+
+        info_dict = zip_info(_local_zip_archive(archive))
+        _echo_archive_info(
+            info_dict, as_json=output_format == "json", format_label=info_dict["format"]
+        )
+        return
+
     from firecube.core.tensogram._compat import require_tensogram
     from firecube.core.tensogram.schema import (
         ARCHIVE_VERSION,
         KEY_ARCHIVE_VERSION,
         ROLE_CONTROLPLANE,
     )
-
-    _reject_zip_archive(archive, command="info")
 
     parsed = parse_product_uri(archive)
     if parsed.scheme == "s3":
@@ -717,8 +861,6 @@ def info(ctx: click.Context, archive: str, output_format: str) -> None:
         raise click.ClickException(f"Archive not found: {archive}")
 
     require_tensogram("firecube archive info")
-
-    import json as _json
 
     import tensogram as _tensogram
 
@@ -790,30 +932,9 @@ def info(ctx: click.Context, archive: str, output_format: str) -> None:
             "group_details": groups_info,
         }
 
-        if as_json:
-            click.echo(_json.dumps(info_dict, indent=2))
-        else:
-            click.echo(f"Path:           {local_path}")
-            click.echo(f"Format:         {archive_version} (multi-group)")
-            size_mb = os.path.getsize(local_path) / (1024 * 1024)
-            click.echo(f"Size:           {size_mb:.2f} MB")
-            click.echo(
-                "Groups:         " + (", ".join(g["group"] for g in groups_info) or "(none)")
-            )
-            click.echo("Control-plane:  " + ("present" if has_controlplane else "not present"))
-            for g in groups_info:
-                click.echo(f"\nGroup: {g['group'] or '(root)'}")
-                click.echo(f"  Source:    {g['source_uri']}")
-                click.echo(f"  Archived:  {g['archived_at']}")
-                click.echo(f"  Codec:     {g['compression']}")
-                click.echo("  Variables:")
-                for vname, vmeta in g["variables"].items():
-                    chunks_str = (
-                        f" chunks={vmeta['zarr_chunks']}" if vmeta.get("zarr_chunks") else ""
-                    )
-                    click.echo(
-                        f"    {vname}: shape={vmeta['shape']} dtype={vmeta['dtype']}{chunks_str}"
-                    )
+        _echo_archive_info(
+            info_dict, as_json=as_json, format_label=f"{archive_version} (multi-group)"
+        )
 
 
 @archive.command(
@@ -827,6 +948,10 @@ Examples:
   # quick structure-only validation
   firecube archive validate --archive file:///tmp/archive.tgm --quick
 
+\b
+  # validate a zip archive
+  firecube archive validate --archive file:///tmp/archive.zip
+
 See also: firecube archive info, firecube archive create
 """,
 )
@@ -836,15 +961,27 @@ See also: firecube archive info, firecube archive create
 )
 @click.pass_context
 def validate(ctx: click.Context, archive: str, quick: bool) -> None:
-    """check integrity of a .tgm archive
+    """check integrity of a .tgm or .zip archive
 
     reads the archive header and validates internal structure without fully
-    decoding data. exits with code 0 if the archive is valid, code 1 if it is
+    decoding data. for a .zip archive, --quick skips the CRC check of every
+    entry. exits with code 0 if the archive is valid, code 1 if it is
     corrupted or incomplete.
     """
-    from firecube.core.tensogram._compat import require_tensogram
+    if _is_zip_archive(archive):
+        from firecube.core.zarr.zip_archive import validate_zip
 
-    _reject_zip_archive(archive, command="validate")
+        zip_path = _local_zip_archive(archive)
+        zip_issues = validate_zip(zip_path, quick=quick)
+        if not zip_issues:
+            click.echo(f"VALID: {zip_path} (no issues)")
+            return
+        click.echo(f"INVALID: {zip_path} ({len(zip_issues)} issue(s))")
+        for zip_issue in zip_issues:
+            click.echo(f"  {zip_issue}")
+        raise SystemExit(1)
+
+    from firecube.core.tensogram._compat import require_tensogram
 
     parsed = parse_product_uri(archive)
     if parsed.scheme == "s3":
@@ -893,22 +1030,34 @@ Examples:
   # list archive contents
   firecube archive list --archive file:///tmp/archive.tgm
 
+\b
+  # list zip archive contents
+  firecube archive list --archive file:///tmp/archive.zip
+
 See also: firecube archive info, firecube archive restore
 """,
 )
 @archive_uri_option(tier="inspect")
 @click.pass_context
 def list_cmd(ctx: click.Context, archive: str) -> None:
-    """list contents of a .tgm archive
+    """list contents of a .tgm or .zip archive
 
     displays per-variable group entries including name, dimensions, and time
-    range. no data is decoded; useful for reviewing archive contents before
-    restoring.
+    range. a .zip archive is shown as one xarray dataset per group. no data is
+    decoded; useful for reviewing archive contents before restoring.
     """
+    if _is_zip_archive(archive):
+        from firecube.core.zarr.zip_archive import list_zip
+
+        listing = list_zip(_local_zip_archive(archive))
+        click.echo(f"Groups: {len(listing)}")
+        for group_name, dataset in listing:
+            click.echo(f"\nGroup: {group_name or '(root)'}")
+            click.echo(dataset)
+        return
+
     from firecube.core.tensogram._compat import require_tensogram
     from firecube.core.tensogram.schema import ROLE_CONTROLPLANE
-
-    _reject_zip_archive(archive, command="list")
 
     parsed = parse_product_uri(archive)
     if parsed.scheme == "s3":
