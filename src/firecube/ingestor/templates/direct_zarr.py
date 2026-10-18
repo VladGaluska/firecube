@@ -37,7 +37,7 @@ import logging
 import random
 import time
 from abc import abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -1557,6 +1557,14 @@ class DirectZarrIngestor(BaseIngestor):
         """
         return self._write_session().staged_seeding_authority()
 
+    def _note_seeded_coordinates(self, workspace: str, paths: Collection[str]) -> None:
+        """Record the coordinate arrays whose chunks seeding left in *workspace*.
+
+        Called by the engine after each batch's seeding. Promotion classifies
+        these coordinates by the target's lifecycle marker.
+        """
+        self._write_session().note_seeded_coordinates(workspace, paths)
+
     def _refuse_incomplete_staged_units(self) -> None:
         """Refuse promotion of a workspace unit this run did not write in every cell.
 
@@ -1574,9 +1582,12 @@ class DirectZarrIngestor(BaseIngestor):
         for staged runs only. Promotion then puts the units the run wrote,
         deletes from the target the ones it left all fill (zarr stores no
         object for them) and publishes the ``zarr.json`` documents under the
-        session's authority over the target.
+        session's authority over the target. It leaves alone the seeded chunks
+        of a time coordinate the target marks managed.
         """
-        return self._write_session().staged_promotion_units()
+        return self._write_session().staged_promotion_units(
+            time_coord_name=self._resolve_time_dim_name()
+        )
 
     def _aggregate_metrics(
         self, ctx: RuntimeIngestContext, state: PipelineRunState

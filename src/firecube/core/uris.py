@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 
 from fsspec.utils import infer_storage_options
 
+from firecube.core.errors import ConfigurationError
+
 if TYPE_CHECKING:
     from firecube.core.storage.uri import StorageUri
 
@@ -147,6 +149,20 @@ def storage_uri_from_target(target: str) -> StorageUri:
     if is_remote_target(target) or str(target).startswith("file://"):
         return StorageUri.parse(target)
     return StorageUri.from_local_path(local_path_from_target(target))
+
+
+def require_target_is_product(target: str, product_uri: StorageUri) -> None:
+    """Refuse a ``target`` that does not name ``product_uri``.
+
+    Raises:
+        ConfigurationError: If ``target`` and ``product_uri`` are different locations.
+    """
+    target_uri = storage_uri_from_target(target)
+    if target_uri != product_uri:
+        raise ConfigurationError(
+            f"Restore target {target_uri.to_str()!r} is not the session product "
+            f"{product_uri.to_str()!r}; pass the product URI as the target"
+        )
 
 
 def is_windows_absolute_path(target: str) -> bool:

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import time
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,13 +26,17 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import xarray as xr
+import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkInfo, ChunkManager
+from firecube.core.controlplane.claims import FilesystemClaimService
 from firecube.core.controlplane.types import DeletionPlan, WriteDomain
 from firecube.core.errors import ManifestError
+from firecube.core.storage.session import StorageSession
 from firecube.core.storage.uri import StorageUri
+from firecube.core.tensogram import restore as tgm_restore
 from firecube.core.tensogram.converter import zarr_to_tgm
 from firecube.core.zarr import zip_archive
 from firecube.core.zarr.scrub import run_scrub
@@ -86,7 +91,7 @@ def _sample_span(product: str) -> ChunkInfo:
     )
 
 
-def _make_archive(source_zarr: Path, archive_path: Path) -> None:
+def _make_archive(source_zarr: Path, archive_path: Path, group: str | None = "F024") -> None:
     dataset = xr.Dataset(
         {
             "FWI": (
@@ -100,8 +105,8 @@ def _make_archive(source_zarr: Path, archive_path: Path) -> None:
             "lon": np.linspace(0.0, 1.0, 2, dtype="float32"),
         },
     )
-    dataset.to_zarr(source_zarr, group="F024")
-    zarr_to_tgm(str(source_zarr), str(archive_path), group="F024")
+    dataset.to_zarr(source_zarr, group=group)
+    zarr_to_tgm(str(source_zarr), str(archive_path), group=group)
 
 
 def _assert_clear_hint_runs_without_abandon(message: str) -> None:
@@ -317,3 +322,94 @@ def test_archive_create_keeps_archive_error_and_releases_claim(tmp_path, monkeyp
     assert result.exit_code != 0
     assert "archive boom" in result.output
     assert list((tmp_path / "s.zarr" / ".firecube" / "claims").glob("*")) == []
+
+
+def _restore_state(tmp_path: Path) -> tuple[list[str], list[str]]:
+    manager = _claiming_manager(tmp_path, product="restored.zarr")
+    try:
+        runs = manager.list_runs(product="restored.zarr")
+        return (
+            [c.domain for c in manager.list_claims(product="restored.zarr")],
+            [r.status for r in runs if r.run_id.startswith("archive-restore-")],
+        )
+    finally:
+        manager.close()
+
+
+def _overwrite_restore(tmp_path: Path, kind: str, monkeypatch, on_write: Callable[[], None]):
+    """Run `archive restore --overwrite` over a product; `on_write` runs after each archive write
+    and after the restore function returns."""
+    src, target, archive = (
+        tmp_path / "source.zarr",
+        tmp_path / "restored.zarr",
+        tmp_path / f"a.{kind}",
+    )
+    if kind == "tgm":
+        _make_archive(src, archive, group=None)
+    else:
+        zarr.open_group(str(src), mode="w").create_array("a", data=np.arange(6.0))
+        with zipfile.ZipFile(archive, "w") as zf:
+            for p in filter(Path.is_file, src.rglob("*")):
+                zf.write(p, p.relative_to(src).as_posix())
+    zarr.open_group(str(target), mode="w").create_array("old", data=np.arange(3.0))
+    writer = (
+        (StorageSession, "put_bytes") if kind == "zip" else (tgm_restore, "_restore_data_message")
+    )
+    entry = (zip_archive, "zip_to_zarr") if kind == "zip" else (tgm_restore, "tgm_to_zarr")
+
+    def spy_on(original):
+        def spy(*a, **k):
+            result = original(*a, **k)
+            on_write()
+            return result
+
+        return spy
+
+    for owner, name in (writer, entry):
+        monkeypatch.setattr(owner, name, spy_on(getattr(owner, name)))
+    args = ["archive", "restore", "--archive", archive.as_uri(), "--target", target.as_uri()]
+    args += ["--overwrite", "--yes-i-really-mean-it", "--storage-type", "local"]
+    return CliRunner().invoke(cli, [*args, "--storage-driver", "fsspec"], env=_local_env(tmp_path))
+
+
+@pytest.mark.parametrize("kind", ["zip", "tgm"])
+def test_overwrite_restore_holds_its_claim_and_run_while_writing(tmp_path, monkeypatch, kind):
+    states = []
+    _overwrite_restore(tmp_path, kind, monkeypatch, lambda: states.append(_restore_state(tmp_path)))
+    domain = WriteDomain(product="restored.zarr", category="maintenance", name="archive_restore")
+    assert len(states) >= 2, states
+    assert all(state == ([domain.identifier], ["started"]) for state in states), states
+
+
+@pytest.mark.parametrize("kind", ["zip", "tgm"])
+def test_interrupted_overwrite_restore_leaves_a_started_run(tmp_path, monkeypatch, kind):
+    def interrupt() -> None:
+        raise SystemExit(3)
+
+    _overwrite_restore(tmp_path, kind, monkeypatch, interrupt)
+    assert _restore_state(tmp_path)[1] == ["started"]
+
+
+def test_restore_stops_its_claim_heartbeat(tmp_path, monkeypatch):
+    kwdefaults = FilesystemClaimService.__init__.__kwdefaults__
+    monkeypatch.setitem(kwdefaults, "heartbeat_interval_s", 1)
+    handles, acquire = [], ChunkManager.acquire_claim
+
+    def spy(self, *a, **k):
+        handles.append(acquire(self, *a, **k))
+        return handles[-1]
+
+    monkeypatch.setattr(ChunkManager, "acquire_claim", spy)
+    _make_archive(tmp_path / "source.zarr", tmp_path / "a.tgm")
+    args = ["archive", "restore", "--archive", (tmp_path / "a.tgm").as_uri()]
+    args += ["--target", (tmp_path / "r.zarr").as_uri(), "--storage-type", "local"]
+    try:
+        result = CliRunner().invoke(
+            cli, [*args, "--storage-driver", "fsspec"], env=_local_env(tmp_path)
+        )
+        assert result.exit_code == 0, result.output
+        time.sleep(2.5)
+        assert list((tmp_path / "r.zarr" / ".firecube" / "claims").glob("*")) == []
+    finally:
+        for handle in handles:
+            handle.release()

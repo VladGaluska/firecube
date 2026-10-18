@@ -75,6 +75,10 @@ class StagedPromotionUnits:
         ledger_arrays: ``group/array`` paths whose writes the run records.
             Promotion refuses a changed data object of these arrays that
             ``written`` does not hold.
+        managed_coordinates: ``group/array`` paths of the time coordinates
+            the target marks as preallocated or coordinate-managed.
+            Promotion neither puts nor compares their data objects; it
+            publishes their ``zarr.json`` as any other.
     """
 
     workspace: str
@@ -83,6 +87,7 @@ class StagedPromotionUnits:
     absent: frozenset[str]
     publish_metadata: Callable[[str, bytes], bool | None]
     ledger_arrays: frozenset[str] = frozenset()
+    managed_coordinates: frozenset[str] = frozenset()
 
 
 def _same_root(left: str, right: StorageUri) -> bool:
@@ -124,7 +129,11 @@ def _promote(
         )
     try:
         plan = session.plan_promotion(
-            src, dst, written_units=staged_units.written, absent_units=staged_units.absent
+            src,
+            dst,
+            written_units=staged_units.written,
+            absent_units=staged_units.absent,
+            managed_coordinates=staged_units.managed_coordinates,
         )
     except ValueError as exc:
         raise StorageError(f"staged promotion refused, target untouched: {exc}") from exc

@@ -714,10 +714,9 @@ def restore(
     # W3.4: Archive restore is recorded as a first-class WAL run so the audit
     # trail (`firecube chunks runs list`) shows when a product was restored
     # from an archive, what the source archive was, and whether the restore
-    # succeeded or failed.  We construct the SpanRecorder lazily per phase
-    # because tgm_to_zarr's `_prepare_target` may rmtree the entire target
-    # directory (including any `.firecube/` we created), which would
-    # invalidate a cached WAL writer.
+    # succeeded or failed.  One manager and recorder serve the whole restore:
+    # an overwrite keeps the claim and this run's records (`keep_run_id`), so
+    # the cached WAL writer stays valid.
     restore_run_id = f"archive-restore-{uuid.uuid4()}"
     product_name = restore_identity.product_name
     target_uri_str = restore_identity.product_uri.to_str()
@@ -726,24 +725,32 @@ def restore(
         "source_archive": archive,
         "target_product": target_uri_str,
     }
+    manager = session.control_plane()
+    recorder = SpanRecorder(manager)
+    run_started = False
+
+    def _record_started() -> None:
+        nonlocal run_started
+        recorder.register_run_started(
+            run_id=restore_run_id,
+            product=product_name,
+            output_path=target_uri_str,
+            output_format="zarr",
+            slice_meta=slice_meta,
+        )
+        run_started = True
+        manager.record_maintenance_started(
+            product=product_name,
+            run_id=restore_run_id,
+            op=MAINTENANCE_OP_ARCHIVE_RESTORE,
+            scope_meta=slice_meta,
+        )
 
     def _record_failure(error: str) -> None:
-        manager = session.control_plane()
+        # Warn, never raise: a raise here replaces the restore error.
         try:
-            recorder = SpanRecorder(manager)
-            recorder.register_run_started(
-                run_id=restore_run_id,
-                product=product_name,
-                output_path=target_uri_str,
-                output_format="zarr",
-                slice_meta=slice_meta,
-            )
-            manager.record_maintenance_started(
-                product=product_name,
-                run_id=restore_run_id,
-                op=MAINTENANCE_OP_ARCHIVE_RESTORE,
-                scope_meta=slice_meta,
-            )
+            if not run_started:
+                _record_started()
             recorder.register_run_failure(
                 run_id=restore_run_id,
                 product=product_name,
@@ -759,41 +766,54 @@ def restore(
                 scope_meta=slice_meta,
                 error=error,
             )
-        finally:
-            manager.close()
+        except Exception as exc:
+            click.echo(f"Warning: archive restore failure not recorded: {exc}", err=True)
 
     archive_uri = StorageUri.from_local_path(archive_abs)
     restore_source = archive_abs
     temp_archive_path: str | None = None
+    claim_handle: Any = None
+    try:
+        if archive_uri.is_remote():
+            temp_archive_path = _temporary_tgm_path()
+            try:
+                # Cross-endpoint: product session is bound to restore target, not archive_uri.
+                source_archive_session = session_for_uri(archive_uri, session.driver)
+                transfer_copy_file(
+                    archive_uri,
+                    StorageUri.from_local_path(temp_archive_path),
+                    source_session=source_archive_session,
+                )
+            except Exception as exc:
+                _record_failure(str(exc))
+                raise
+            restore_source = temp_archive_path
 
-    if archive_uri.is_remote():
-        temp_archive_path = _temporary_tgm_path()
         try:
-            # Cross-endpoint: product session is bound to restore target, not archive_uri.
-            source_archive_session = session_for_uri(archive_uri, session.driver)
-            transfer_copy_file(
-                archive_uri,
-                StorageUri.from_local_path(temp_archive_path),
-                source_session=source_archive_session,
+            _claim_domain, claim_handle = _acquire_maintenance_claim(
+                manager=manager,
+                product=product_name,
+                operation="archive_restore",
+                owner_id=restore_run_id,
             )
         except Exception as exc:
             _record_failure(str(exc))
             raise
-        restore_source = temp_archive_path
+        # The run is recorded before the restore touches the target; if that fails, nothing runs.
+        try:
+            _record_started()
+        except Exception as exc:
+            _record_failure(str(exc))
+            raise
 
-    claim_manager = session.control_plane()
-    claim_domain: WriteDomain | None = None
-    try:
-        claim_domain, _claim_handle = _acquire_maintenance_claim(
-            manager=claim_manager,
-            product=product_name,
-            operation="archive_restore",
-            owner_id=restore_run_id,
-        )
         try:
             if is_zip:
                 result = zip_to_zarr(
-                    restore_source, target_uri_str, session=session, overwrite=overwrite
+                    restore_source,
+                    target_uri_str,
+                    session=session,
+                    overwrite=overwrite,
+                    keep_run_id=restore_run_id,
                 )
             else:
                 result = tgm_to_zarr(
@@ -804,38 +824,21 @@ def restore(
                     on_group_restored=lambda restored_group: click.echo(
                         f"restored group: {restored_group or '/'}"
                     ),
+                    keep_run_id=restore_run_id,
                 )
             if not result.get("variables") and not result.get("groups"):
                 raise ValueError(
                     f"Archive restore produced no output: {restore_source!r} "
                     f"may be empty or not a valid {'zip' if is_zip else 'tensogram'} archive."
                 )
-        finally:
-            if temp_archive_path is not None and os.path.exists(temp_archive_path):
-                os.unlink(temp_archive_path)
-    except (FileExistsError, ImportError, ValueError) as exc:
-        _record_failure(str(exc))
-        raise click.ClickException(str(exc)) from exc
-    except Exception as exc:
-        _record_failure(str(exc))
-        raise
-    else:
-        success_manager = session.control_plane()
+        except (FileExistsError, ImportError, ValueError) as exc:
+            _record_failure(str(exc))
+            raise click.ClickException(str(exc)) from exc
+        except Exception as exc:
+            _record_failure(str(exc))
+            raise
+
         try:
-            success_recorder = SpanRecorder(success_manager)
-            success_recorder.register_run_started(
-                run_id=restore_run_id,
-                product=product_name,
-                output_path=target_uri_str,
-                output_format="zarr",
-                slice_meta=slice_meta,
-            )
-            success_manager.record_maintenance_started(
-                product=product_name,
-                run_id=restore_run_id,
-                op=MAINTENANCE_OP_ARCHIVE_RESTORE,
-                scope_meta=slice_meta,
-            )
             synthetic_ctx = RuntimeIngestContext(
                 source=archive,
                 target=target_uri_str,
@@ -849,31 +852,40 @@ def restore(
                 output_format="zarr",
                 metrics={},
             )
-            success_recorder.register_run(
+            recorder.register_run(
                 ctx=synthetic_ctx,
                 result=synthetic_result,
                 run_id=restore_run_id,
                 product=product_name,
                 slice_meta=slice_meta,
             )
-            success_manager.record_maintenance_completed(
+            manager.record_maintenance_completed(
                 product=product_name,
                 run_id=restore_run_id,
                 op=MAINTENANCE_OP_ARCHIVE_RESTORE,
                 scope_meta=slice_meta,
             )
-        finally:
-            success_manager.close()
+        except Exception as exc:
+            _record_failure(str(exc))
+            raise
     finally:
-        try:
-            if claim_domain is not None:
-                claim_manager.clear_claim(
-                    product=product_name,
-                    domain_id=claim_domain.identifier,
-                    force=True,
+        # Release stops the heartbeat; deleting the file alone lets it come back.
+        if claim_handle is not None:
+            try:
+                claim_handle.release()
+            except Exception as exc:
+                # Warn, never raise: a raise here replaces the restore or record error.
+                click.echo(
+                    f"Warning: claim {claim_handle.info.domain} at "
+                    f"{claim_handle.claim_path.to_str()} not released: {exc}",
+                    err=True,
                 )
-        finally:
-            claim_manager.close()
+        try:
+            manager.close()
+        except Exception as exc:
+            click.echo(f"Warning: control plane of {target_uri_str} not closed: {exc}", err=True)
+        if temp_archive_path is not None and os.path.exists(temp_archive_path):
+            os.unlink(temp_archive_path)
 
     click.echo(f"Zarr restored: {result['target']}")
     if result.get("groups"):

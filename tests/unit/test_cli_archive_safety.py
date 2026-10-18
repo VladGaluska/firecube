@@ -197,6 +197,40 @@ def test_zip_restore_refuses_entry_outside_target(tmp_path):
     assert not (tmp_path / "escape.txt").exists()
 
 
+@pytest.mark.parametrize("kind", ["tgm", "zip-root", "zip-consolidated-child"])
+def test_overwrite_restore_of_an_invalid_archive_keeps_the_target(tmp_path, kind):
+    src = tmp_path / "src"
+    zarr.open_group(str(src), mode="w").create_array("a", data=np.arange(6.0))
+    zarr.consolidate_metadata(str(src))
+    entries = {p.relative_to(src).as_posix(): p.read_bytes() for p in src.rglob("*") if p.is_file()}
+    bad = b'{"zarr_format": 3, "node_type": "banana"}'
+    archive = tmp_path / ("a.tgm" if kind == "tgm" else "a.zip")
+    if kind == "tgm":
+        archive.write_bytes(b"not a tensogram archive")
+    else:
+        entries["zarr.json" if kind == "zip-root" else "a/zarr.json"] = bad
+        with zipfile.ZipFile(archive, "w") as zf:
+            for key, data in entries.items():
+                zf.writestr(key, data)
+    target = tmp_path / "t.zarr"
+    zarr.open_group(str(target), mode="w").create_array("keep", data=np.arange(3.0))
+    (target / ".firecube").mkdir()
+    (target / ".firecube" / "schema.json").write_text('{"kept": true}')
+
+    def tree() -> dict[str, bytes]:
+        files = (p for p in target.rglob("*") if p.is_file())
+        return {p.relative_to(target).as_posix(): p.read_bytes() for p in files}
+
+    before = tree()
+    args = ["archive", "restore", "--archive", archive.as_uri(), "--target", target.as_uri()]
+    r = CliRunner().invoke(
+        cli, [*args, "--overwrite", "--yes-i-really-mean-it", *_LOCAL_STORAGE_FLAGS]
+    )
+    after = {k: v for k, v in tree().items() if not k.startswith(".firecube/runs/archive-restore-")}
+    assert after == before
+    assert r.exit_code != 0, r.output
+
+
 def test_create_refuses_anonymous_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("FIRECUBE_S3_ANONYMOUS", "false")  # the CLI exports it; teardown unsets
     u = tmp_path.as_uri()
@@ -212,7 +246,9 @@ def test_zip_restore_cli_preserves_array_values(tmp_path):
     for cmd in (f"create --source {u}/s --archive-format zip", f"restore --target {u}/r"):
         r = CliRunner().invoke(cli, ["archive", *cmd.split(), "--archive", f"{u}/a.zip"])
         assert r.exit_code == 0, r.output
-    assert zarr.open_group(str(tmp_path / "r"))["a"][:].tolist() == np.arange(6.0).tolist()
+    restored = zarr.open_group(str(tmp_path / "r"))["a"]
+    assert isinstance(restored, zarr.Array)
+    assert np.asarray(restored[:]).tolist() == np.arange(6.0).tolist()
 
 
 def test_create_without_overwrite_requires_no_confirmation(tmp_path, monkeypatch):

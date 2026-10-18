@@ -327,6 +327,7 @@ class StorageSession:
         *,
         written_units: Collection[str],
         absent_units: Collection[str],
+        managed_coordinates: Collection[str] = (),
     ) -> PromotionPlan:
         """Plan the publication of the local staged tree ``src`` onto ``dst``.
 
@@ -337,10 +338,14 @@ class StorageSession:
                 every cell.
             absent_units: The written units zarr left without an object
                 (every cell equals the fill value); they become deletes.
+            managed_coordinates: ``group/array`` paths of the time coordinates
+                the target marks as preallocated or coordinate-managed.
 
         Returns:
             The plan of :func:`~firecube.core.zarr.guard.promotion_plan.build_promotion_plan`.
-            An object the run did not write is unchanged when the target holds
+            A data object of a managed coordinate is unchanged, and the plan
+            never reads its target object. Any other object the run did not write is
+            unchanged when the target holds
             the same bytes (one read of the target object). A ``zarr.json`` is
             also unchanged when the target array is longer on its first axis
             and the two documents are otherwise equal. Any other difference
@@ -378,6 +383,7 @@ class StorageSession:
             written_units=written_units,
             absent_units=absent_units,
             is_unchanged=_is_unchanged,
+            managed_coordinates=managed_coordinates,
         )
 
     def publish_plan(

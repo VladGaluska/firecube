@@ -29,7 +29,8 @@ into the workspace is put under it, serialised per node with the run's other
 metadata changes: a group or array document only where the workspace holds
 none, decided under the node lock (`publish_document_if_absent`), so a
 document a concurrent batch's writer created or changed is never reverted;
-the root document is replaced, as without an authority (`publish_document`).
+the root document is replaced when it differs from the seeded bytes, as without
+an authority (`update_document`).
 A refused authority (`MetadataAuthorityError`) always propagates, in strict
 and best-effort mode alike, and leaves no document or directory behind.
 Without one, the documents are written as plain files. Coordinate chunks are
@@ -54,8 +55,8 @@ from firecube.core.zarr.guard.chunk_geometry import chunk_index_to_region
 from firecube.core.zarr.guard.metadata_authority import (
     MetadataAuthority,
     MetadataAuthorityError,
-    publish_document,
     publish_document_if_absent,
+    update_document,
 )
 from firecube.ingestor.errors import SeedingFailedError, StagedMetadataError
 
@@ -293,7 +294,9 @@ def seed_staged_store_metadata(
     `MetadataAuthorityError` whatever ``strict`` is, and the refused document
     is not written. ``None`` writes the documents as plain files.
 
-    Returns {group: {"seeded": bool, "files": int}} for logging.
+    Returns {group: {"seeded": bool, "files": int, "coordinates": set[str]}}.
+    ``coordinates`` holds the ``group/array`` path of each named coordinate
+    array whose chunk the workspace holds, copied now or found there already.
     """
     if groups is None:
         groups = _discover_zarr_groups(session, final_target_uri)
@@ -309,7 +312,7 @@ def seed_staged_store_metadata(
         )
 
     for group in groups:
-        results[group] = {"seeded": False, "files": 0}
+        results[group] = {"seeded": False, "files": 0, "coordinates": set()}
         try:
             _seed_group_via_session(
                 session=session,
@@ -372,8 +375,8 @@ def _seed_root_metadata(
             with fs.open(src_uri, "rb") as fh:
                 raw = fh.read()
             if name == "zarr.json":
-                # Replaced on every seed, as without an authority: a root the
-                # writer created empty takes the target's root metadata.
+                # Replaced when it differs, as without an authority: a root the
+                # writer created empty differs and takes the target's root metadata.
                 _write_document(
                     dst_path, raw, temp_root=temp_root, key=name, authority=authority, replace=True
                 )
@@ -446,10 +449,22 @@ def _is_coordinate_chunk(path: str, coords: list[str] | None) -> bool:
         _is_coordinate_chunk("data/timestamp/c/0", []) -> False
         _is_coordinate_chunk("data/timestamp/c/0", None) -> False
     """
+    return _chunk_coordinate(path, coords) is not None
+
+
+def _chunk_coordinate(path: str, coords: list[str] | None) -> str | None:
+    """Return the coordinate array path holding the chunk at ``path``, or ``None``.
+
+    Matches as `_is_coordinate_chunk` does: ``"data/timestamp/c/0"`` gives
+    ``"data/timestamp"``.
+    """
     if not coords:
-        return False
+        return None
     parts = path.rstrip("/").split("/")
-    return any(parts[i] in coords and parts[i + 1] == "c" for i in range(len(parts) - 2))
+    for i in range(len(parts) - 2):
+        if parts[i] in coords and parts[i + 1] == "c":
+            return "/".join(parts[: i + 1])
+    return None
 
 
 def _is_in_flight_write(path: str) -> bool:
@@ -515,8 +530,11 @@ def _seed_group_via_session(
             else src_uri.path.lstrip("/")
         )
         dst_path = temp_root / rel
+        coordinate = _chunk_coordinate(rel, coordinate_arrays)
         if dst_path.exists():
             results[group]["files"] += 1
+            if coordinate is not None:
+                results[group]["coordinates"].add(coordinate)
             continue
         try:
             # Under an authority the store creates a document's directory
@@ -552,6 +570,8 @@ def _seed_group_via_session(
             else:
                 dst_path.write_bytes(raw)
             results[group]["files"] += 1
+            if coordinate is not None:
+                results[group]["coordinates"].add(coordinate)
         except MetadataAuthorityError:
             raise
         except Exception as e:
@@ -577,11 +597,14 @@ def _write_document(
     (``dst_path`` is that key's file). Under an authority, ``replace=False``
     puts the document only if the workspace still holds none when the node
     lock is held: the caller's earlier absence check is only a shortcut.
+    ``replace=True`` writes only when the stored bytes differ from *data*.
     """
     if authority is None:
+        if replace and dst_path.is_file() and dst_path.read_bytes() == data:
+            return
         dst_path.write_bytes(data)
         return
     if replace:
-        publish_document(authority, LocalStore(temp_root), key, data)
+        update_document(authority, LocalStore(temp_root), key, lambda _current: data)
     else:
         publish_document_if_absent(authority, LocalStore(temp_root), key, data)

@@ -240,5 +240,5 @@ def test_resolved_index_loser_skips_conflict_detail_lookups(tmp_path: Path) -> N
         _, outcome = cm.ensure_resolved_index(
             product="prod1", record=declared, max_retries=1, initial_backoff_s=0.01
         )
-    assert outcome == "matched_existing"
+        assert outcome == "matched_existing"
     assert [path for path in listed if "/runs/winner" in path] == []

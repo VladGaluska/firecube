@@ -48,6 +48,7 @@ from firecube.ingestor.config.engine import EngineConfig
 from firecube.ingestor.contracts.interfaces import (
     PipelineHost,
     _IncompleteUnitsRefusal,
+    _SeededCoordinates,
     _SparseWindowRefusal,
     _StagedPromotionUnits,
     _StagedSeedingAuthority,
@@ -566,25 +567,32 @@ def _zarr_pre_batch_hook(
     from firecube.ingestor.runtime.zarr.batch_runner import seed_staged_metadata_pre_batch
 
     coordinate_arrays: list[str] = [ingestor._resolve_time_dim_name()]
+    seeding_host = ingestor if isinstance(ingestor, _StagedSeedingAuthority) else None
+    noting_host = ingestor if isinstance(ingestor, _SeededCoordinates) else None
 
-    if not isinstance(ingestor, _StagedSeedingAuthority):
-        return lambda: seed_staged_metadata_pre_batch(
-            host=ingestor,
-            ctx=ctx,
-            logger=ingestor._log,
-            coordinate_arrays=coordinate_arrays,
-        )
+    def _seed() -> None:
+        if seeding_host is None:
+            seeded = seed_staged_metadata_pre_batch(
+                host=ingestor,
+                ctx=ctx,
+                logger=ingestor._log,
+                coordinate_arrays=coordinate_arrays,
+            )
+        else:
+            # The host names the authority its workspace metadata is seeded
+            # under, asked afresh before each batch.
+            seeded = seed_staged_metadata_pre_batch(
+                host=ingestor,
+                ctx=ctx,
+                logger=ingestor._log,
+                coordinate_arrays=coordinate_arrays,
+                authority=seeding_host._staged_seeding_authority(),
+            )
+        # Promotion leaves alone the seeded chunks of a managed coordinate.
+        if noting_host is not None and seeded is not None:
+            noting_host._note_seeded_coordinates(*seeded)
 
-    # The host names the authority its workspace metadata is seeded under,
-    # asked afresh before each batch.
-    seeding_host = ingestor
-    return lambda: seed_staged_metadata_pre_batch(
-        host=ingestor,
-        ctx=ctx,
-        logger=ingestor._log,
-        coordinate_arrays=coordinate_arrays,
-        authority=seeding_host._staged_seeding_authority(),
-    )
+    return _seed
 
 
 def _create_batches_with_parallel_filter(

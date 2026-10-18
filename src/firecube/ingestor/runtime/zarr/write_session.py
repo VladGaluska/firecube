@@ -56,8 +56,9 @@ promotion until `close`, a ``PROCESS_LOCAL`` authority over the whole target
 store: a staged run holds no cross-process claim at promotion, so only this
 process's threads are excluded. `staged_promotion_units` hands promotion the
 units the run proved written and the absent ones, as object keys, with a
-``zarr.json`` publisher bound to that authority, and the arrays whose
-uncovered data objects promotion refuses. The publisher never drops an
+``zarr.json`` publisher bound to that authority, the arrays whose
+uncovered data objects promotion refuses, and the managed time coordinates
+whose seeded chunks promotion leaves alone. The publisher never drops an
 attribute the target array already has: markers such as engine ownership live
 only in the target, and the run's workspace copy may be a shell without them.
 """
@@ -69,7 +70,7 @@ import enum
 import functools
 import json
 import threading
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from typing import Any
 
 from zarr.buffer import default_buffer_prototype
@@ -77,6 +78,12 @@ from zarr.buffer import default_buffer_prototype
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.errors import ConfigurationError, StorageError
 from firecube.core.storage.completion import StagedPromotionUnits
+from firecube.core.uris import is_remote_target, local_path_from_target
+from firecube.core.zarr._coord_lifecycle import (
+    CoordLifecycleState,
+    raise_if_invalid,
+    resolve_coord_lifecycle,
+)
 from firecube.core.zarr._zarr_compat import sync
 from firecube.core.zarr.guard._unit_locks import canonical_array_path
 from firecube.core.zarr.guard.guarded_write import Unit, WriteResult, unit_store_key
@@ -94,15 +101,33 @@ from firecube.core.zarr.guard.unit_ownership import (
 from firecube.core.zarr.region_writer import RegionZarrWriter
 
 
-def _target_array_shape(store: Any, path: str) -> tuple[int, ...] | None:
-    """Shape in the target's ``<path>/zarr.json``; ``None`` when it holds no array document."""
+def _target_array_document(store: Any, path: str) -> dict[str, Any] | None:
+    """The target's ``<path>/zarr.json`` as a dict; ``None`` when it holds no array document."""
     stored = sync(store.get(f"{path}/zarr.json", prototype=default_buffer_prototype()))
     if stored is None:
         return None
     document = json.loads(stored.to_bytes())
     if document.get("node_type") != "array":
         return None
+    return document
+
+
+def _target_array_shape(store: Any, path: str) -> tuple[int, ...] | None:
+    """Shape in the target's ``<path>/zarr.json``; ``None`` when it holds no array document."""
+    document = _target_array_document(store, path)
+    if document is None:
+        return None
     return tuple(int(n) for n in document["shape"])
+
+
+def _workspace_holds(workspace: str, path: str) -> bool:
+    """Whether the local workspace holds a node at *path*; a stat, no listing or read.
+
+    A remote workspace answers ``True``, so the session still classifies its coordinate.
+    """
+    if is_remote_target(workspace):
+        return True
+    return (local_path_from_target(workspace) / path).is_dir()
 
 
 class SessionState(enum.Enum):
@@ -308,6 +333,7 @@ class ZarrWriteSession:
         self._results_lock = threading.Lock()
         self._written_units: dict[str, dict[str, set[Unit]]] = {}
         self._absent_units: dict[str, dict[str, set[Unit]]] = {}
+        self._seeded_coordinates: dict[str, set[str]] = {}
         # Store-wide, so seeding may write the workspace root document too.
         self._seeding_authority = (
             MetadataAuthority.process_local(RegionZarrWriter(workspace_uri).metadata_scope())
@@ -476,7 +502,9 @@ class ZarrWriteSession:
         with self._operation():
             return self._seeding_authority
 
-    def staged_promotion_units(self) -> StagedPromotionUnits | None:
+    def staged_promotion_units(
+        self, *, time_coord_name: str = "timestamp"
+    ) -> StagedPromotionUnits | None:
         """What promotion publishes: the run's proved units as object keys, and its publisher.
 
         ``written`` holds the object key of every unit the staged ledger
@@ -492,6 +520,13 @@ class ZarrWriteSession:
         ``zarr.json`` under the session's authority over the target, keeping
         the target's attributes of an array it already holds; it is refused
         once the session closed.
+
+        ``managed_coordinates`` names the time coordinates, called
+        *time_coord_name*, that the target marks as preallocated or
+        coordinate-managed. The session checks each coordinate seeding
+        reported in the workspace, and the coordinate of each group holding
+        an array this run wrote when the workspace holds it. It reads each
+        such coordinate document from the target once.
 
         Returns:
             ``None`` when the session is not staged or knows no final target
@@ -510,6 +545,8 @@ class ZarrWriteSession:
                 array documents here, before promotion: a target that grows
                 between this check and the put is not detected; closing it
                 needs a cross-process claim.
+            SchemaDriftError: A checked coordinate carries an invalid marker
+                state (`raise_if_invalid`); the target is untouched.
         """
         with self._operation():
             if not self.staged or self._open_final_store is None:
@@ -539,7 +576,43 @@ class ZarrWriteSession:
                 absent=absent,
                 publish_metadata=functools.partial(_publish_promoted_document, authority, store),
                 ledger_arrays=frozenset(ledger.arrays),
+                managed_coordinates=self._managed_coordinates(workspace, time_coord_name, store),
             )
+
+    def _managed_coordinates(
+        self, workspace: str, time_coord_name: str, target_store: Any
+    ) -> frozenset[str]:
+        """Paths of the coordinates the target marks managed; see `staged_promotion_units`.
+
+        Candidates are the coordinates seeding reported in *workspace*, and
+        the coordinate of each group holding an array the ledger or a guarded
+        write recorded there. Seeding copies a coordinate's chunks into the
+        workspace; for a managed coordinate that copy goes stale.
+        """
+        with self._results_lock:
+            recorded = set(self._written_units.get(workspace, {}))
+            seeded = {
+                path
+                for path in self._seeded_coordinates.get(workspace, ())
+                if path.rpartition("/")[2] == time_coord_name
+            }
+        recorded.update(write.array_path for write in self._ledger.touched)
+        groups = {canonical_array_path(path).rpartition("/")[0] for path in recorded}
+        # Only a written group's coordinate that seeding did not report costs a stat.
+        written = {canonical_array_path(f"{group}/{time_coord_name}") for group in groups}
+        candidates = seeded | {
+            coord for coord in written - seeded if _workspace_holds(workspace, coord)
+        }
+        managed: set[str] = set()
+        for coord in sorted(candidates):
+            document = _target_array_document(target_store, coord)
+            if document is None:
+                continue
+            state = resolve_coord_lifecycle(document.get("attributes") or {})
+            raise_if_invalid(state, coord)
+            if state in (CoordLifecycleState.PREALLOCATED, CoordLifecycleState.COORD_MANAGED):
+                managed.add(coord)
+        return frozenset(managed)
 
     def _promotion_keys(
         self, store_uri: str, touched: list[StagedSlotWrite], target_store: Any
@@ -666,6 +739,17 @@ class ZarrWriteSession:
                 absent = self._absent_units.setdefault(store_uri, {}).setdefault(path, set())
                 absent.difference_update(units)
                 absent.update(result.absent)
+
+    def note_seeded_coordinates(self, store_uri: str, paths: Collection[str]) -> None:
+        """Record coordinate arrays whose chunks seeding left in the workspace *store_uri*.
+
+        `staged_promotion_units` checks each against the target's lifecycle
+        marker. No I/O.
+        """
+        with self._operation(), self._results_lock:
+            self._seeded_coordinates.setdefault(store_uri, set()).update(
+                canonical_array_path(path) for path in paths
+            )
 
     def written_units(self, store_uri: str) -> dict[str, frozenset[Unit]]:
         """Units recorded as written in *store_uri*, per array path."""

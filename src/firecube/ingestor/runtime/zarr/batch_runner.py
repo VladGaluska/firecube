@@ -47,14 +47,18 @@ def seed_staged_metadata_for_batch(
     logger: logging.Logger,
     coordinate_arrays: list[str] | None = None,
     authority: MetadataAuthority | None = None,
-) -> None:
+) -> frozenset[str]:
     """Seed staged temp-store metadata from the final target when applicable.
 
     With ``authority``, the workspace ``zarr.json`` documents are written
     under it, and its refusal propagates like ``StagedMetadataError``.
+
+    Returns:
+        The ``group/array`` paths of the coordinate arrays whose chunks the
+        workspace holds after seeding; empty when seeding was skipped.
     """
     if not write_mode_policy(write_mode).seeds_staged_metadata or final_target_uri is None:
-        return
+        return frozenset()
 
     from firecube.core.zarr.guard.metadata_authority import MetadataAuthorityError
     from firecube.ingestor.runtime.zarr.staged_metadata import (
@@ -67,10 +71,10 @@ def seed_staged_metadata_for_batch(
     output_session = storage.output if storage is not None else None
     if output_session is None:
         logger.debug("Staged metadata seeding skipped: no output session")
-        return
+        return frozenset()
 
     try:
-        seed_staged_store_metadata(
+        results = seed_staged_store_metadata(
             temp_store_uri=store_uri,
             final_target_uri=final_target_uri,
             groups=groups,
@@ -83,6 +87,8 @@ def seed_staged_metadata_for_batch(
         raise
     except Exception as seed_exc:
         logger.debug("Staged metadata seeding skipped: %s", seed_exc)
+        return frozenset()
+    return frozenset(path for entry in results.values() for path in entry["coordinates"])
 
 
 def seed_staged_metadata_pre_batch(
@@ -92,25 +98,29 @@ def seed_staged_metadata_pre_batch(
     logger: logging.Logger,
     coordinate_arrays: list[str] | None = None,
     authority: MetadataAuthority | None = None,
-) -> None:
+) -> tuple[str, frozenset[str]] | None:
     """Runtime-level staged metadata seeding hook for Zarr batch execution.
 
     ``authority`` is the host's seeding authority (DirectZarr: its session's
     ``PROCESS_LOCAL`` authority over the workspace); ``None`` seeds as before.
+
+    Returns:
+        The workspace URI and the coordinate paths `seed_staged_metadata_for_batch`
+        returns; ``None`` when the write mode does not seed or the target is unresolved.
     """
     engine_config = getattr(host, "engine_config", None)
     write_mode = str(getattr(engine_config, "write_mode", ""))
     if not write_mode_policy(write_mode).seeds_staged_metadata:
-        return
+        return None
 
     store_uri = host.resolve_output_uri(ctx, write_mode=write_mode)
     try:
         final_target_uri = host.resolve_output_uri(ctx, write_mode="direct")
     except Exception as uri_exc:
         logger.debug("Could not resolve direct URI for staged metadata seeding: %s", uri_exc)
-        return
+        return None
 
-    seed_staged_metadata_for_batch(
+    coordinates = seed_staged_metadata_for_batch(
         ctx=ctx,
         store_uri=store_uri,
         final_target_uri=final_target_uri,
@@ -123,6 +133,7 @@ def seed_staged_metadata_pre_batch(
         coordinate_arrays=coordinate_arrays,
         authority=authority,
     )
+    return store_uri, coordinates
 
 
 def prepare_staged_append_metadata(

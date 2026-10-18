@@ -508,14 +508,15 @@ def test_seed_with_authority_writes_every_document_through_it(
 
         return record
 
-    for name in ("publish_document", "publish_document_if_absent"):
+    for name in ("update_document", "publish_document_if_absent"):
         monkeypatch.setattr(staged_metadata, name, recording(name))
     result = _seed(temp, final, authority=authority)
 
     assert result["G"]["seeded"] is True
-    # The root is replaced as before; every other document only where absent.
+    # The root goes through update_document (written only when it differs); every
+    # other document only where absent.
     assert sorted((name, key) for name, _, key in published) == sorted(
-        [("publish_document", "zarr.json")]
+        [("update_document", "zarr.json")]
         + [("publish_document_if_absent", key) for key in _SEEDED_DOCUMENTS - {"zarr.json"}]
     )
     assert all(auth is authority for _, auth, _ in published)

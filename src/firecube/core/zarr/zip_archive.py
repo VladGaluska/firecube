@@ -20,6 +20,7 @@ once: built under a temporary name, closed, verified, then renamed into place.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import uuid
@@ -32,11 +33,18 @@ from typing import Any, cast
 import xarray as xr
 import zarr
 from zarr.buffer import default_buffer_prototype
+from zarr.storage import MemoryStore
 
-from firecube.core.controlplane.types import CLAIMS_DIRNAME, CONTROL_DIRNAME
+from firecube.core.controlplane.types import (
+    CLAIMS_DIRNAME,
+    CONTROL_DIRNAME,
+    RUNS_DIRNAME,
+    SCHEMA_FILENAME,
+)
+from firecube.core.errors import ConfigurationError
 from firecube.core.filesystem.store_factory import create_zip_store
 from firecube.core.storage.session import StorageSession
-from firecube.core.uris import is_remote_target, local_path_from_target
+from firecube.core.uris import is_remote_target, local_path_from_target, require_target_is_product
 from firecube.core.zarr._zarr_compat import sync
 
 _CLAIMS_PREFIX = f"{CONTROL_DIRNAME}/{CLAIMS_DIRNAME}/"
@@ -131,7 +139,7 @@ def zarr_to_zip(
     )
 
 
-def _prepare_target(target_path: Path, *, overwrite: bool) -> None:
+def _prepare_target(target_path: Path, *, overwrite: bool, keep_run_id: str | None) -> None:
     """Same rules as the .tgm restore: a directory holding only .firecube/ is not a store yet."""
     if not target_path.exists():
         return
@@ -142,9 +150,60 @@ def _prepare_target(target_path: Path, *, overwrite: bool) -> None:
             f"Target Zarr already exists: {target_path}. Use overwrite=True to replace it."
         )
     if target_path.is_dir():
-        shutil.rmtree(target_path)
+        _clear_target(target_path, keep_run_id=keep_run_id)
     else:
         target_path.unlink()
+
+
+def _clear_target(target_path: Path, *, keep_run_id: str | None) -> None:
+    """Empty a restore target directory but keep the restore's own control-plane state.
+
+    The kept entries are ``.firecube/claims/``, ``.firecube/schema.json`` and, when
+    ``keep_run_id`` is given, ``.firecube/runs/<keep_run_id>/``.
+
+    Raises:
+        ConfigurationError: If the target, a kept entry or a directory holding one
+            is a symlink; nothing is removed.
+    """
+    control = target_path / CONTROL_DIRNAME
+    kept = {control / CLAIMS_DIRNAME, control / SCHEMA_FILENAME}
+    if keep_run_id is not None:
+        kept.add(control / RUNS_DIRNAME / keep_run_id)
+    _refuse_symlinked_kept_paths(target_path, kept)
+    _remove_all_except(target_path, kept)
+
+
+def _refuse_symlinked_kept_paths(target_path: Path, kept: set[Path]) -> None:
+    """Raise ConfigurationError when a kept path or a directory above it is a symlink.
+
+    The check stops at the target. Clearing walks into those directories, so a symlink would
+    lead it outside the target.
+    """
+    for path in sorted(kept):
+        for node in (path, *path.parents):
+            if node.is_symlink():
+                raise ConfigurationError(
+                    f"Restore target {target_path} holds a symlink at {node}; refusing to "
+                    "clear it, because the restore would follow it outside the target"
+                )
+            if node == target_path:
+                break
+
+
+def _remove_all_except(directory: Path, kept: set[Path]) -> None:
+    """Remove every entry under ``directory`` except the paths in ``kept`` and their ancestors.
+
+    A symlink is unlinked, never followed.
+    """
+    for entry in directory.iterdir():
+        if entry in kept:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        elif any(entry in path.parents for path in kept):
+            _remove_all_except(entry, kept)
+        else:
+            shutil.rmtree(entry)
 
 
 def _refuse_unsafe_entries(names: list[str], archive: str) -> None:
@@ -163,15 +222,50 @@ def _refuse_unsafe_entries(names: list[str], archive: str) -> None:
             )
 
 
+def _refuse_invalid_metadata(zf: zipfile.ZipFile, keys: list[str], archive: str) -> None:
+    """Raise ValueError for the first ``zarr.json`` entry that is not a valid Zarr v3 document.
+
+    Each document is parsed alone, so a parent's consolidated copy never stands in for a child.
+    """
+    make_buffer = default_buffer_prototype().buffer.from_bytes
+    for key in keys:
+        if key.rpartition("/")[2] != "zarr.json":
+            continue
+        data = zf.read(key)
+        try:
+            document = json.loads(data)
+            if not isinstance(document, dict) or document.get("zarr_format") != 3:
+                raise ValueError("not a Zarr v3 metadata document")
+            store = MemoryStore({"zarr.json": make_buffer(data)})
+            node_type = document.get("node_type")
+            if node_type == "array":
+                zarr.open_array(store=store, mode="r", zarr_format=3)
+            elif node_type == "group":
+                zarr.open_group(store=store, mode="r", zarr_format=3)
+            else:
+                raise ValueError(f"node_type is {node_type!r}, expected 'array' or 'group'")
+        except Exception as exc:
+            raise ValueError(f"Invalid Zarr metadata {key!r} in archive {archive}: {exc}") from exc
+
+
 def zip_to_zarr(
-    archive: str, target: str, *, session: StorageSession, overwrite: bool = False
+    archive: str,
+    target: str,
+    *,
+    session: StorageSession,
+    overwrite: bool = False,
+    keep_run_id: str | None = None,
 ) -> dict:
     """Restore a zarr zip archive into the session's product by copying every key.
 
-    The session's driver writes every entry. Before it touches the target, the
-    restore refuses a corrupt entry, a missing root ``zarr.json``, and an entry
-    name that is absolute, holds a backslash, or has an empty, ``.`` or ``..``
-    segment.
+    The session's driver writes every entry. The restore validates the whole
+    archive before it touches the target. It refuses an entry name that is
+    absolute, holds a backslash, or has an empty, ``.`` or ``..`` segment.
+    It then refuses a corrupt entry and a missing root ``zarr.json``. Last, it
+    parses every ``zarr.json`` entry on its own as Zarr v3 metadata.
+
+    An overwrite then removes the existing store. It keeps ``.firecube/claims/``,
+    ``.firecube/schema.json`` and ``.firecube/runs/<keep_run_id>/``.
 
     Args:
         archive: Local path or ``file://`` URI of the zip archive.
@@ -179,16 +273,21 @@ def zip_to_zarr(
             must name the session's product.
         session: Storage session bound to the target product.
         overwrite: Replace an existing Zarr store at ``target``.
+        keep_run_id: Run whose records an overwrite keeps; pass the restore's
+            own run so its records survive.
 
     Returns:
         A summary of the restored groups, variables, coordinates and key count.
 
     Raises:
+        ConfigurationError: If ``target`` is not the session's product, or an
+            overwrite finds a symlink at the target or on a kept path.
         FileNotFoundError: If ``archive`` is not a file.
-        ValueError: If the archive is corrupt, has no root metadata, or holds
-            an entry name outside the target.
+        ValueError: If the archive is corrupt, has no root metadata, holds
+            invalid Zarr metadata, or holds an entry name outside the target.
         FileExistsError: If ``target`` holds a Zarr store and ``overwrite`` is False.
     """
+    require_target_is_product(target, session.product.product_uri)
     archive_path = local_path_from_target(archive)
     target_path = local_path_from_target(target)
     if not archive_path.is_file():
@@ -199,12 +298,13 @@ def zip_to_zarr(
         _refuse_unsafe_entries(names, archive)
         if (corrupt := zf.testzip()) is not None:
             raise ValueError(f"Corrupt entry {corrupt!r} in archive: {archive}")
-    # claims are never archived, but never restore a stale claim either
-    keys = sorted(k for k in names if not k.endswith("/") and not k.startswith(_CLAIMS_PREFIX))
-    if "zarr.json" not in keys:
-        raise ValueError(f"No Zarr v3 root metadata found in archive: {archive}")
+        # claims are never archived, but never restore a stale claim either
+        keys = sorted(k for k in names if not k.endswith("/") and not k.startswith(_CLAIMS_PREFIX))
+        if "zarr.json" not in keys:
+            raise ValueError(f"No Zarr v3 root metadata found in archive: {archive}")
+        _refuse_invalid_metadata(zf, keys, archive)
 
-    _prepare_target(target_path, overwrite=overwrite)
+    _prepare_target(target_path, overwrite=overwrite, keep_run_id=keep_run_id)
 
     product_uri = session.product.product_uri
     with zipfile.ZipFile(archive_path) as zf:

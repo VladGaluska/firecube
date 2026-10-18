@@ -51,6 +51,13 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   refuses an archive that holds an entry outside the target. Such an entry has an absolute name,
   a backslash, or an empty, `.` or `..` segment. The error reads `Unsafe entry
   '<name>' in archive <path>`.
+  - The restore also refuses a corrupt entry, an archive without a root
+    `zarr.json`, and a `zarr.json` entry that is not valid Zarr v3 metadata.
+  - With `--overwrite`, the restore deletes the old store but keeps
+    `.firecube/claims/`, `.firecube/schema.json` and the records of its own
+    run.
+  - If the target, or a kept path inside it, is a symlink, the restore refuses
+    the overwrite and deletes nothing.
 - `firecube archive create` records each run in the source product's control
   plane. The record holds the start time, group, date window, variables and
   size of the archive.
@@ -100,7 +107,8 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 - A staged `DirectZarrIngestor` promotion now refuses a changed data chunk
   that no recorded write of the run covers. The target stays untouched, and the
   error names the chunks. An example is a reused `--workspace` that holds stale
-  chunks that differ from the target. Rerun with a fresh workspace.
+  chunks that differ from the target. Rerun with a fresh workspace. The
+  refusal does not apply to the seeded chunks of a managed time coordinate.
 - A time-indexed array that ingest workers write, and that declares neither
   `chunks=` nor `shards=`, is now created with one slot per chunk. If Zarr's
   own chunks for the whole array already hold one slot each, Firecube keeps
@@ -131,7 +139,9 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   development environment.
 - A staged `DirectZarrIngestor` promotion now publishes a delta instead of the
   workspace tree. It uploads the units the run rewrote and the changed
-  auxiliary objects.
+  auxiliary objects. It neither uploads nor compares the seeded chunks of a
+  time coordinate that Firecube manages. The promotion plan marks them
+  `engine-managed`.
 - A staged `DirectZarrIngestor` promotion never shrinks an array.
 - A staged `DirectZarrIngestor` promotion keeps the existing attributes of
   the target when it publishes array metadata.
@@ -194,6 +204,30 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Fixed
 
+- `firecube archive restore --overwrite` of a `.tgm` archive now checks the
+  archive before it deletes anything. It reads the archive version and runs the
+  quick structural check of every message. If the archive fails a check, the
+  command exits with an error. It deletes and replaces no existing data. It
+  can already have written the control-plane records of the restore: its claim,
+  its run under `.firecube/runs/archive-restore-*/`, and
+  `.firecube/schema.json` if that file was absent. Before, it deleted the
+  target first and then failed on a bad archive.
+  - On a local target, the overwrite keeps `.firecube/claims/`,
+    `.firecube/schema.json` and the records of its own run. It deletes the rest
+    of the old target. The restore releases its claim when it ends.
+  - If the command cannot record a failure or release the claim, it prints a
+    `Warning:` line. Before, such an error replaced the restore error. The
+    warning does not replace it now. A failure to record the start of the run
+    still surfaces as the error itself.
+  - If a symlink is the target, or lies on a kept path under `.firecube/`, the
+    command refuses the overwrite and deletes nothing.
+  - On a local target, a restore that stops during the replacement leaves its
+    run in the `started` state. Check the status with `firecube chunks runs
+    list`. Abandon the run with `firecube chunks runs abandon` only if it is
+    still `started`. Then run the restore again with `--overwrite
+    --yes-i-really-mean-it`.
+  - The command treats a remote target as before. A remote `.tgm` root restore
+    replaces the whole store.
 - `firecube chunks runs abandon` now releases the write claims that the run
   alone owns. Before, the claims stayed and a resume after a killed writer
   failed with a claim conflict (#86). The command prints `Released claim

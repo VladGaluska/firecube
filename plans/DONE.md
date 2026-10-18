@@ -1,5 +1,56 @@
 # Done
 
+## 2026-10-18 — The branch's data-loss paths are closed (fix/parallel-chunk-ownership)
+
+**Decision.** Before the branch merges, three reproduced data-loss paths close and one avoidable perf delta is cut. The staged `unclaimed` PUT, the ledger exclusion and the zip restore are new on this branch, so no release carries them. The `.tgm` delete-first, its late start record and its clear-by-domain are in v0.1.7. There is one commit per symptom. Step `rv` of the plan tests that each reverts alone, and it has not run yet. Nothing is pushed. Five commits sit on top of 111fbaf:
+
+- `1479cf6` `test: fix the pyright errors in two unit test modules`. `uv run pyright` exited 1 on 111fbaf with 11 errors in `tests/unit/test_chunk_manager_resolved_index.py` and `tests/unit/test_cli_archive_safety.py`.
+- `2a9f42c` `perf(zarr): seed the workspace root metadata only when it changed`.
+- `3f5f336` `fix(archive): refuse a target that is not the session product`.
+- `b3edafd` `fix(zarr): publish no seeded chunk of a managed coordinate`.
+- `dc3526f` `fix(archive): validate before overwrite and keep the restore claim`.
+
+**Decision.** Symptom 1: a staged promotion reverted a concurrent `zarr preallocate` fill. A slot of the time coordinate went back to NaT, and every exit code was 0. Seeding copies the coordinate's chunks into the workspace as a snapshot. Promotion PUT that copy as `unclaimed`. `b3edafd` closed it. A data object of a managed time coordinate is planned UNCHANGED with reason `engine-managed`. Promotion never compares it and never PUTs it. The rule covers only the configured time coordinate (`time_dim_name`), and only when its final-target `zarr.json` marks it preallocated or coordinate-managed. No other array is classified, marked or not. An unmarked time coordinate's staged PUT is how a run's timestamps reach the target. A mutant that skipped every coordinate chunk failed four existing staged tests. The write session classifies two sets. One is the coordinates that seeding reported, through a new one-method Protocol, `_SeededCoordinates`. The other is the coordinate of each group the run wrote. It reads one target `zarr.json` per candidate. An invalid marker state raises `SchemaDriftError` before the target is touched.
+
+**Decision.** Symptom 2: `firecube archive restore --overwrite` deleted the target before it validated the archive. The delete took `.firecube/` and the restore's own claim with it. An invalid archive deleted the original. A second restore without `--overwrite` saw no claim and wrote beside the first. `dc3526f` closed it. The zip restore parses every `zarr.json` entry before any delete. The `.tgm` restore reads the message count, the version of message 0 and the structure. An overwrite on a local target keeps `.firecube/claims/`, `.firecube/schema.json` and `.firecube/runs/<keep_run_id>/`. It deletes the rest of the old control plane. A symlink at the target or on a kept path raises `ConfigurationError` before any delete. For library callers of `tgm_to_zarr`, `parse_target` refuses a relative target before any delete. A remote `.tgm` target is unchanged, and its root group still uses mode `"w"`. The CLI keeps one manager, one recorder and the claim handle for the whole restore. It records `started` after the claim and releases the claim by handle in `finally`. A failure to record the failure, to release the claim or to close the manager prints a `Warning:` line. It never replaces the restore error. A failure to record the start, or to record the success, surfaces as the error itself. The CLI still attempts to record the failure and releases the claim. Neo chose to replace in place and not to stage and swap (2026-10-18). The residual is in `plans/TODO.md`.
+
+**Decision.** Symptom 3: `zip_to_zarr` deleted `target` and wrote to `session.product.product_uri`. Nothing compared the two. `3f5f336` closed it. `require_target_is_product` in `src/firecube/core/uris.py` raises `ConfigurationError` when the two differ. `zip_to_zarr` calls it first. `tgm_to_zarr` calls it after `require_tensogram` when a session is passed. It is a refusal and not a single identity, because dropping `target` would change the CLI calls.
+
+**Decision.** Perf (`2a9f42c`). `_seed_root_metadata` replaced the workspace root `zarr.json` before every batch, 20 batches in W3. The root document now goes through `update_document(..., lambda _current: data)`. It is written only when its bytes differ. The plain-file path compares the bytes itself. W3 `os.rename` fell from 253 to 234 (measured with `measure.py`).
+
+**Results.** Per node, from the orchestrator's reruns (ran):
+
+- t1: `uv run pyright` reported 0 errors, and 22 tests passed. Vision approved.
+- r1, r1b, c1, c1b: the r1b test failed on c1's tree with one slot reverted (1 failed). The union lane of c1b passed 145 tests. The merged tree passed 74. Vision approved r1 with notes and approved c1 with c1b. Its real-host probe showed the DirectZarr host forwarding `time_coord_name` `"t"` and classifying `g/t` and `h/nested/t`.
+- r3, c3: red on 111fbaf (two `DID NOT RAISE ConfigurationError` at `tests/architecture/test_storage_flows.py:532`). After the fix, 73 tests passed. Vision approved. It probed normalization variants and the CLI binding, and both were equal.
+- p1: `measure` printed 234 against a limit of 240. One test patched `publish_document` and now patches `update_document`. Vision approved with notes.
+- r2, c2: r2's tests showed 10 failed on 1479cf6. After the fix, 102 tests passed on the node's lane and 68 on the merged tree. Vision rejected twice. The first blocker was a symlinked `.firecube` or `.firecube/runs` that the delete followed. The second was a remote `.tgm` root-group restore that kept stale arrays. Round 3 approved with notes and found a relative local target that deleted before `parse_target` refused it. The same commit fixed that. A narrow review in round 4 approved with notes.
+- Test budget: `ultron tdd budget --base 111fbaf` counts +275 physical test lines against 250. The plan neither trimmed nor loosened it. Neo rules.
+
+**Decision.** Perf delta against v0.1.7 (D-pf-1, Neo, 2026-10-18). `pf` ran `PERF_RUNS=5` on a `git archive` export of the tip and of 111fbaf in the same job. After the allowance, every counted event of the tip is at most the control's. The allowance is one more `open` and one more `open@root` in W3. It is the price of the one target `zarr.json` read per staged promotion. The wall term did not pass at this fixture size of 200 slots. The W3 median of the tip was 1.269 s against an original control at 1.070 s. An interleaved rerun gave control 1.269 s and 1.218 s, and tip 1.218 s and 1.469 s, with one 3.2 s outlier. Rerun control-1 is 1.186 times the original control. Tip-1 is below control-1. The two rerun control medians differ by 1.042 times. Neo accepted the counted events as the gate (D-pf-1). That acceptance rests on the event counts and does not claim a wall result. The medians below are measured over five runs on Python 3.13.15.
+
+| Event | v0.1.7 | 111fbaf control | Tip |
+|-------|--------|-----------------|-----|
+| W3 `os.rename` | 230 | 253 | 234 |
+| W3 `os.mkdir` | 524 | 542 | 523 |
+| W3 `open` | 3192 | 3232 | 3233 |
+| W3 `open@root` | 268 | 285 | 285 |
+| W3 `os.scandir` | 157 | 157 | 157 |
+| W2 `open@root` | 1092 | 1176 | 1176 |
+| W2 `os.scandir` | 154 | 45 | 45 |
+
+The plan records the causes of the remaining deltas against v0.1.7 and does not change them.
+
+- W3 `os.rename` +4: atomic chunk publication and promoted `zarr.json` through `update_document`, less offsets. The control's +23 over v0.1.7 was +20 from the root re-seed, +3 chunk publications, +3 promoted `zarr.json` and -3 offsets (ran, audit-hook trace). `2a9f42c` replaced the 20 per-batch publications with one, which is 19 fewer renames (253 to 234).
+- W3 `open@root` +17: promotion's publish temporaries, `.partial` writes and comparison reads (per-site rows inferred).
+- W3 `open` +41: the same promotion costs plus the one allowed `zarr.json` read. Nobody traced this delta site by site (not checked).
+- W2 `open@root` +84 comes from three sources. They are per-batch `zarr.json` reads of the window ownership check, the read-only root open in the indexed region writer and the engine-owned checks. The per-site rows are inferred.
+- W2 `os.scandir` fell.
+- W1 on the tip equals the control: `open` 3154, `os.rename` 227, `open@root` 1043. Against v0.1.7 it differs by +24 `open`, -3 `os.rename` and -12 `open@root` (calculated from the three `raw.json` files).
+- Walls do not compare with the saved v0.1.7 baselines. The earlier survey (F25) exported trees without bytecode. The `pf` recipe compiled both of its trees, and no compile log was kept.
+
+**Coverage.** `tests/unit/test_storage_completion.py` (managed-coordinate promotion, including a group the run never wrote), `tests/architecture/test_storage_flows.py` (identity refusal), `tests/integration/test_maintenance_claims.py` and `tests/integration/test_maintenance_audit.py` (restore claim, ordering, recorded failure), `tests/unit/test_cli_archive_safety.py` and `tests/unit/test_zarr_staged_metadata.py` lock the behavior. `plans/TODO.md` lists the open and untested residuals under "Open after the branch data-loss fixes (2026-10-18)".
+
 ## 2026-10-11 — Parallel writers never share a Zarr chunk or shard
 
 **Decision.** Slot-window pods, in-pod `pipeline_workers` threads and staged promotion silently lost slots when they shared a chunk or shard along time (measured on c160535: 12 single-slot pods on one 12-slot chunk lost slots in 10/10 barrier reps in direct and in staged mode, about 11 of 12 slots per rep). Fix shape: engine-owned routine plus safety net. `ZarrArraySpec(engine_owned=True)` with `ItemInfo(values=...)` makes preallocate write a rank-1 per-slot array once and pods verify it. One layout resolution (`core/zarr/guard/_layout.py`) applied at creation gives undeclared pod-written time-indexed arrays (no chunks, no shards) time chunk 1 with one warning, unless zarr's own whole-array chunks already have time chunk 1: those are kept and nothing is logged; shards-only declarations keep their shards. An ownership check on the stored layout (`core/zarr/guard/chunk_geometry.py`) refuses windows that split a stored unit, so existing unsafe stores are refused rather than repaired. Threads serialise per (store, array, unit); a run's batches share its schema claim.

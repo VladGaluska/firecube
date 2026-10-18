@@ -29,7 +29,8 @@ import zarr
 from zarr.core.buffer import cpu
 from zarr.storage import LocalStore
 
-from firecube.core.errors import ConfigurationError
+from firecube.core.errors import ConfigurationError, SchemaDriftError
+from firecube.core.filesystem.fsspec_backend import FsspecFilesystem
 from firecube.core.storage import StorageWriteResult
 from firecube.core.storage.completion import StagedPromotionUnits
 from firecube.core.storage.session import StorageSession
@@ -44,7 +45,7 @@ from firecube.core.zarr.guard.metadata_authority import (
 )
 from firecube.core.zarr.guard.unit_ownership import StagedSlotWrite, WriteFootprint
 from firecube.ingestor.api import IngestResult, OutputPaths, PipelineMetrics, ResultMetrics
-from firecube.ingestor.runtime.engine import PipelineExecutor
+from firecube.ingestor.runtime.engine import PipelineExecutor, _zarr_pre_batch_hook
 from firecube.ingestor.runtime.zarr.write_session import WriteSessionStateError, ZarrWriteSession
 from firecube.ingestor.templates.direct_zarr import (
     DirectZarrIngestor,
@@ -946,6 +947,80 @@ def test_staged_promotion_refuses_a_changed_data_chunk_no_write_recorded(
     before = _stat(target)
 
     with pytest.raises(ConfigurationError, match="g/data/c/1"):
+        _promote(tmp_path, monkeypatch, session, workspace)
+    session.close()
+
+    assert _stat(target) == before
+
+
+def _seeded_managed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str, coord_path: str = "g/timestamp"
+):
+    """A staged run that seeded the target's marked coordinate (slots 0-2 set, 3 NaT)."""
+    ingestor, session, run_batch, target, workspace = _staged_batch_run(
+        tmp_path, monkeypatch, workspace_values=[-1, -1, -1, -1], shape=4
+    )
+    ctx = _ctx(tmp_path)
+    coord = zarr.open_group(str(target), mode="r+").create_array(
+        coord_path, shape=(4,), chunks=(2,), dtype="int64", fill_value=-1
+    )
+    coord[:3] = [100, 101, 102]
+    coord.attrs[marker] = True
+    cast(Any, _zarr_pre_batch_hook(ingestor, cast(Any, ctx)))()  # the engine's seeding
+    run_batch([(0, 20), (1, 21)])
+    return session, target, workspace, coord
+
+
+@pytest.mark.parametrize("marker", ["firecube_preallocated", "firecube_coord_managed"])
+def test_staged_promotion_keeps_a_managed_coordinate_filled_after_seeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    session, target, workspace, coord = _seeded_managed_run(tmp_path, monkeypatch, marker)
+    coord[3] = 103  # a windowed preallocate fills slot 3 after seeding
+    before = _stat(target)
+
+    reads: list[Any] = []
+    read_bytes = FsspecFilesystem.read_bytes
+    monkeypatch.setattr(
+        FsspecFilesystem,
+        "read_bytes",
+        lambda self, uri, *a, **kw: (reads.append(str(uri)), read_bytes(self, uri, *a, **kw))[1],
+    )
+
+    _promote(tmp_path, monkeypatch, session, workspace)
+    session.close()
+
+    assert np.asarray(coord[:]).tolist() == [100, 101, 102, 103]
+    assert _stat(target)["g/timestamp/c/1"] == before["g/timestamp/c/1"]
+    assert not [uri for uri in reads if "g/timestamp/c/" in uri]
+
+
+def test_staged_promotion_keeps_a_managed_coordinate_of_a_group_the_run_never_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session, target, workspace, coord = _seeded_managed_run(
+        tmp_path, monkeypatch, "firecube_coord_managed", "h/timestamp"
+    )  # the run writes group g only; seeding copied the coordinate of group h
+    coord[3] = 103  # a windowed preallocate fills slot 3 of h after seeding
+    before = _stat(target)
+
+    _promote(tmp_path, monkeypatch, session, workspace)
+    session.close()
+
+    assert np.asarray(coord[:]).tolist() == [100, 101, 102, 103]
+    assert _stat(target)["h/timestamp/c/1"] == before["h/timestamp/c/1"]
+
+
+def test_staged_promotion_refuses_a_coordinate_with_both_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session, target, workspace, coord = _seeded_managed_run(
+        tmp_path, monkeypatch, "firecube_preallocated"
+    )
+    coord.attrs["firecube_coord_managed"] = True  # an invalid lifecycle state
+    before = _stat(target)
+
+    with pytest.raises(SchemaDriftError, match="both"):
         _promote(tmp_path, monkeypatch, session, workspace)
     session.close()
 

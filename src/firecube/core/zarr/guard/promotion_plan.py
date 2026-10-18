@@ -63,7 +63,9 @@ class PlannedObject:
         action: What promotion does.
         size: Workspace size in bytes for a put; ``0`` otherwise.
         reason: Short machine-readable cause (``written-unit``, ``deleted-unit``,
-            ``metadata``, ``same-bytes``, ``unclaimed``).
+            ``metadata``, ``same-bytes``, ``unclaimed``, ``engine-managed``).
+            ``engine-managed`` marks a data object of a managed time
+            coordinate, left alone without comparing it with the target.
     """
 
     key: str
@@ -98,6 +100,7 @@ def build_promotion_plan(
     written_units: Collection[str],
     absent_units: Collection[str],
     is_unchanged: Callable[[str], bool],
+    managed_coordinates: Collection[str] = (),
 ) -> PromotionPlan:
     """Build the delta that publishes a staged run.
 
@@ -114,23 +117,30 @@ def build_promotion_plan(
         is_unchanged: ``key -> bool``; whether publishing the workspace object
             would leave the target as it is (``zarr.json`` the target already
             supersedes, or byte-identical content). Asked only for objects
-            that are not written units.
+            that are not written units and not data objects of
+            ``managed_coordinates``.
+        managed_coordinates: ``group/array`` paths of the time coordinates
+            the target marks as preallocated or coordinate-managed. The
+            engine writes their values in the target, so the workspace copy
+            is a stale seed.
 
     Raises:
-        ValueError: ``absent_units`` is not a subset of ``written_units``, or a
+        ValueError: ``absent_units`` is not a subset of ``written_units``, a
             written unit is neither in the workspace nor in ``absent_units``
-            (no evidence either way, so the target's bytes cannot be judged).
+            (no evidence either way, so the target's bytes cannot be judged),
+            or a written unit lies under a managed coordinate.
 
     Returns:
         A plan. A written unit with a workspace object is a put. A written unit
         reported absent is a delete: zarr omits an all-fill unit, and the target
         must become fill. Nothing else is ever deleted: a missing object that no
         write of the run covers was never touched, and the target is never
-        listed. Every other workspace
-        object (metadata, time coordinate, engine-owned, static, anything the
-        run did not claim) is a put unless ``is_unchanged``. Data and delete
-        entries come before metadata, so an interrupted publication never
-        leaves a grown shape without its data.
+        listed. A data object of a managed coordinate is unchanged, reason
+        ``engine-managed``; the plan never asks ``is_unchanged`` about it. Every
+        other workspace object (metadata, an unmanaged time coordinate,
+        engine-owned, static, anything the run did not claim) is a put unless
+        ``is_unchanged``. Data and delete entries come before metadata, so an
+        interrupted publication never leaves a grown shape without its data.
     """
     written = set(written_units)
     absent = set(absent_units)
@@ -142,6 +152,15 @@ def build_promotion_plan(
         raise ValueError(
             f"written units with no workspace object and not reported absent: {sorted(unproved)[:5]}"
         )
+    managed = tuple(f"{path}/" for path in managed_coordinates)
+    managed_documents = {f"{prefix}{_METADATA_NAME}" for prefix in managed}
+
+    def _is_managed_data(key: str) -> bool:
+        return bool(managed) and key.startswith(managed) and key not in managed_documents
+
+    overlap = sorted(key for key in written if _is_managed_data(key))
+    if overlap:
+        raise ValueError(f"written units under an engine-managed coordinate: {overlap[:5]}")
     planned: list[PlannedObject] = []
     for key in sorted(written):
         if key in workspace_objects:
@@ -152,6 +171,9 @@ def build_promotion_plan(
             planned.append(PlannedObject(key, PromotionAction.DELETE, 0, "deleted-unit"))
     for key, size in sorted(workspace_objects.items()):
         if key in written:
+            continue
+        if _is_managed_data(key):
+            planned.append(PlannedObject(key, PromotionAction.UNCHANGED, 0, "engine-managed"))
             continue
         is_metadata = key.rsplit("/", 1)[-1] == _METADATA_NAME
         if is_unchanged(key):

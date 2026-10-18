@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -41,6 +42,7 @@ from firecube.core.controlplane.types import (
     DeletionPlan,
     SpanCoverage,
 )
+from firecube.core.filesystem.fsspec_backend import FsspecFilesystem
 from firecube.core.storage.uri import StorageUri
 from firecube.core.tensogram.converter import zarr_to_tgm
 from tests.helpers.storage import make_test_binding
@@ -404,3 +406,28 @@ def test_archive_restore_failure_emits_maintenance_failed(tmp_path):
     failed_event = next(e for e in events if e["event_type"] == EVENT_MAINTENANCE_FAILED)
     assert failed_event["record"]["maintenance"]["error"]
     assert failed_event["record"]["meta"]["op"] == "archive_restore"
+
+
+@pytest.mark.parametrize("failing", ["record", "release"])
+def test_restore_error_survives_failing_bookkeeping(tmp_path, monkeypatch, failing):
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("notes.txt", "no zarr here")
+    if failing == "record":
+        boom = Mock(side_effect=OSError("bookkeeping boom"))
+        monkeypatch.setattr(ChunkManager, "record_maintenance_failed", boom)
+    else:
+        real_rm = FsspecFilesystem.rm
+
+        def rm(self, uri, recursive=False):
+            if "/claims/" in uri.to_str():
+                raise PermissionError("bookkeeping boom")
+            return real_rm(self, uri, recursive)
+
+        monkeypatch.setattr(FsspecFilesystem, "rm", rm)
+    args = ["archive", "restore", "--archive", archive.as_uri(), "--storage-type", "local"]
+    args += ["--target", (tmp_path / "r.zarr").as_uri(), "--storage-driver", "fsspec"]
+    result = CliRunner().invoke(cli, args, env=_local_env(tmp_path))
+    assert result.exit_code != 0
+    assert "No Zarr v3 root metadata found" in result.output
+    assert "bookkeeping boom" in result.output

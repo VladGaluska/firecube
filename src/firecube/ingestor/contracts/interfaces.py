@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Protocol, runtime_checkable
 
@@ -307,6 +307,13 @@ class _StagedSeedingAuthority(Protocol):
     """Internal: a host that seeds its staged workspace metadata under its own authority."""
 
     def _staged_seeding_authority(self) -> MetadataAuthority | None: ...
+
+
+@runtime_checkable
+class _SeededCoordinates(Protocol):
+    """Internal: a host told which coordinate arrays seeding left in its staged workspace."""
+
+    def _note_seeded_coordinates(self, workspace: str, paths: Collection[str]) -> None: ...
 
 
 @runtime_checkable

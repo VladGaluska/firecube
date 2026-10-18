@@ -504,6 +504,36 @@ def test_zip_restore_writes_through_the_session(tmp_path: Path, monkeypatch, dri
             np.testing.assert_array_equal(restored[name][...], node[...])  # type: ignore[index]
 
 
+@pytest.mark.parametrize("entry", ["zip_to_zarr", "tgm_to_zarr"])
+def test_restore_refuses_a_target_that_is_not_the_session_product(tmp_path: Path, entry) -> None:
+    from firecube.core.errors import ConfigurationError
+    from firecube.core.tensogram.converter import zarr_to_tgm
+    from firecube.core.tensogram.restore import tgm_to_zarr
+    from firecube.core.zarr.zip_archive import zarr_to_zip, zip_to_zarr
+
+    stores = {n: tmp_path / n / "product.zarr" for n in ("a", "b")}
+    for name in stores:
+        _write_counts_zarr(stores[name])
+        (stores[name] / ".firecube").mkdir()
+        (stores[name] / ".firecube" / "marker").write_text(name)
+    cfg, session_a = _build_local_archive_session(str(stores["a"]), stores["a"].parent, "fsspec")
+    session_b = _build_local_archive_session(str(stores["b"]), stores["b"].parent, "fsspec")[1]
+    archive = tmp_path / ("archive.zip" if entry == "zip_to_zarr" else "archive.tgm")
+    if entry == "zip_to_zarr":
+        zarr_to_zip(session_a, str(archive))
+    else:
+        zarr_to_tgm(str(stores["a"]), str(archive), storage_config=cfg, session=session_a)
+
+    def snap() -> dict[Path, bytes]:
+        return {f: f.read_bytes() for s in stores.values() for f in s.rglob("*") if f.is_file()}
+
+    before = snap()
+    restore = zip_to_zarr if entry == "zip_to_zarr" else tgm_to_zarr
+    with pytest.raises(ConfigurationError):
+        restore(str(archive), str(stores["a"]), session=session_b, overwrite=True)
+    assert snap() == before
+
+
 @pytest.mark.parametrize("driver", _DRIVERS)
 def test_bt2_poison_delete_flow(tmp_path: Path, driver: Literal["fsspec", "obstore"]) -> None:
     """Abandoning a non-terminal run via the ChunkManager facade must not
