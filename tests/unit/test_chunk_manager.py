@@ -16,17 +16,24 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from firecube.core.controlplane import ChunkInfo, ChunkManager, SpanCoverage, build_span_entry
+from firecube.core.controlplane.types import WriteDomain
+from firecube.core.errors import ClaimConflictError, ManifestError
+from firecube.core.hints import maintenance_refusal_message
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.rows import table_row
+from tests.helpers.storage import make_test_binding
+from tests.unit._helpers.counting_fs import CountingFilesystem, make_counting_local_fs
 
 
 def _chunk_manager(workspace, base_uri: str | None = None) -> ChunkManager:
@@ -656,3 +663,106 @@ class TestChunkManagerIntegration:
         with pytest.raises(AttributeError):
             attr_name = "output_base_uri"
             setattr(manager, attr_name, "s3://test-bucket/data")
+
+
+def _claim(manager, stack, name, owner):
+    domain = WriteDomain(product="test_product", category="zarr_region", name=name)
+    return stack.enter_context(
+        manager.acquire_claim(product="test_product", domain=domain, owner_id=owner)
+    )
+
+
+def test_abandon_releases_only_claims_the_run_owns(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    with closing(manager), ExitStack() as stack:
+        for run_id in ("run-r", "run-r__slot=0-4", "run-r:x"):
+            _record_started_run(manager, product=product, run_id=run_id)
+        for name, owner in (
+            ("grp:slot=0", "run-r:grp:slot=0"),
+            ("grp:schema", "run-r:grp"),
+            ("grp:slot=1", "run-r__slot=0-4:grp:slot=1"),
+            ("grp:slot=2", "run-r:x:grp:slot=2"),
+        ):
+            _claim(manager, stack, name, owner)
+        result = manager.abandon_run(product=product, run_id="run-r", reason="killed writer")
+        left = {claim.owner_id for claim in manager.list_claims(product=product)}
+        assert left == {"run-r__slot=0-4:grp:slot=1", "run-r:x:grp:slot=2"}
+        _claim(manager, stack, "grp:slot=0", "other")
+        prefix = f"{product}:zarr_region:"
+        assert result["released_claims"] == [f"{prefix}grp:schema", f"{prefix}grp:slot=0"]
+        assert result["skipped_claims"] == [f"{prefix}grp:slot=2"]
+
+
+def test_abandon_of_terminal_run_releases_leftover_claims(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        manager.record_run_terminal(
+            product=product, run_id="run-r", output_path="o", output_format="zarr",
+            size=0, meta={}, status="abandoned",
+        )  # fmt: skip
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        result = manager.abandon_run(product=product, run_id="run-r", reason="finish")
+        assert manager.list_claims(product=product) == []
+        assert (result["abandoned"], result["status"]) == (False, "abandoned")
+        assert result["released_claims"] == [f"{product}:zarr_region:grp:slot=0"]
+
+
+def test_claim_conflict_names_owner_run_and_clear_command(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    domain = f"{product}:zarr_region:grp:slot=0"
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        with pytest.raises(ClaimConflictError) as excinfo:
+            _claim(manager, stack, "grp:slot=0", "other")
+        message, root = str(excinfo.value), manager.get_product_root(product)
+        clear = f"firecube chunks claims clear --product-name {root} --domain {domain} --force"
+        assert clear in message
+        assert message.startswith(f"Write-domain claim conflict for {domain}")
+        assert "run-r" in message and "started" in message
+        assert "which releases the claims it alone owns" in message
+        run_hint(message, "firecube chunks claims clear", "--yes-i-really-mean-it")
+        assert manager.list_claims(product=product) == []
+
+
+def test_maintenance_refusal_resolves_a_shared_owner_once(temp_workspace):
+    product, fs = "test_product", CountingFilesystem(make_counting_local_fs(temp_workspace)[1])
+    binding = make_test_binding(temp_workspace, product=product)
+    manager = ChunkManager(binding=binding, workspace=temp_workspace, filesystem=fs)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        for k in range(10):
+            _claim(manager, stack, f"grp:slot={k}", "run-r:grp")
+        claims, ls_calls, unnamed = manager.list_claims(product=product), [], []
+        for batch in (claims, claims[:1]):
+            fs.reset()
+            message = maintenance_refusal_message(
+                repo=manager.repo, product=product, operation="scrub", detail="busy", claims=batch
+            )
+            ls_calls.append(fs.counts["ls"])
+            unnamed += [c.domain for c in batch if f"--domain {c.domain}" not in message]
+        assert unnamed == []
+        assert ls_calls[0] == ls_calls[1], f"owner resolved once per claim: {ls_calls}"
+
+
+def test_abandon_refuses_when_claims_cannot_be_listed(temp_workspace):
+    class _Unlistable(CountingFilesystem):
+        broken = True
+
+        def ls(self, uri, detail=False, refresh=False):
+            if self.broken and uri.path.endswith("/claims"):
+                raise PermissionError("claims directory not listable")
+            return super().ls(uri, detail=detail, refresh=refresh)
+
+    product, fs = "test_product", _Unlistable(make_counting_local_fs(temp_workspace)[1])
+    binding = make_test_binding(temp_workspace, product=product)
+    manager = ChunkManager(binding=binding, workspace=temp_workspace, filesystem=fs)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        with pytest.raises(ManifestError, match=r"(?s)run-r.*again"):
+            manager.abandon_run(product=product, run_id="run-r", reason="killed writer")
+        assert [run.status for run in manager.list_runs(product=product)] == ["abandoned"]
+        fs.broken = False
+        assert [c.owner_id for c in manager.list_claims(product=product)] == ["run-r:grp:slot=0"]

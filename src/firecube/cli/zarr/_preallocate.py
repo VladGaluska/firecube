@@ -531,7 +531,7 @@ def preallocate(
                 category="zarr_schema_global",
                 name=f"{group_name}:setup",
             )
-            owner = f"preallocate:{group_name}:schema_global"
+            owner = f"{preallocate_run_id}:{group_name}:schema_global"
             # The group's metadata (arrays, coordinates, markers) changes only under the
             # setup claim's authority; it covers the group, not the root (made above).
             with hold_authority(
@@ -713,14 +713,21 @@ def preallocate(
                             slot_group=None,
                         )
                     except Exception as exc:
+                        # Function-scope import: keeps the hint module out of CLI start-up.
+                        from firecube.core.hints import abandon_run_command
+
                         # A silently non-terminal run blocks all further ingest of
                         # the product until an operator abandons it. Never swallow.
                         logger.error(
                             "failed to record terminal state for preallocate run %s: %s; "
-                            "the run stays non-terminal and blocks resume until "
-                            "'firecube chunks runs abandon' clears it",
+                            "the run stays non-terminal and blocks resume until it is "
+                            "abandoned:\n  %s",
                             preallocate_run_id,
                             exc,
+                            abandon_run_command(
+                                chunk_manager.get_product_root(identity.product_name),
+                                preallocate_run_id,
+                            ),
                         )
                         if final_state == "complete":
                             # Defer the re-raise so the inner finally below
@@ -735,12 +742,20 @@ def preallocate(
                     try:
                         _preallocate_claim_handle.release()
                     except Exception as exc:
+                        # Function-scope import: keeps the hint module out of CLI start-up.
+                        from firecube.core.hints import clear_claim_command
+
                         logger.error(
                             "failed to release materialization claim for run %s: %s; "
-                            "a stale claim blocks future preallocates until "
-                            "'firecube chunks claims clear' removes it",
+                            "a stale claim blocks future preallocates until it is "
+                            "cleared:\n  %s",
                             preallocate_run_id,
                             exc,
+                            clear_claim_command(
+                                chunk_manager.get_product_root(identity.product_name),
+                                _preallocate_claim_handle.info.domain,
+                                force=True,  # the claim is fresh until its heartbeat times out
+                            ),
                         )
                         # Propagate only on the success path AND when no
                         # terminal-record failure is already queued: the

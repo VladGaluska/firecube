@@ -33,6 +33,7 @@ from firecube.ingestor.types.context import (
     RuntimeIngestContext,
 )
 from firecube.ingestor.types.result_metrics import PipelineMetrics, StorageMetrics
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
@@ -225,7 +226,7 @@ def test_force_reingest_with_empty_coverage_refuses_and_keeps_prior_span(
             )
             _start_run(manager, product=product, run_id="run-new", output_path=output_path)
 
-            with pytest.raises(ManifestError, match="new coverage is empty"):
+            with pytest.raises(ManifestError, match="new coverage is empty") as excinfo:
                 recorder.register_run(
                     ctx=_make_runtime_ctx(
                         run_id="run-new", target=output_path, force_reingest=True
@@ -236,6 +237,7 @@ def test_force_reingest_with_empty_coverage_refuses_and_keeps_prior_span(
                     slice_meta={"plugin": "test_product", "group": "F024"},
                     record_spans=record_spans,
                 )
+            run_hint(str(excinfo.value), "firecube chunks runs abandon", "--dry-run")
 
             current = _current_state(manager, product=product)
             assert current[prior_key]["status"] == "active"

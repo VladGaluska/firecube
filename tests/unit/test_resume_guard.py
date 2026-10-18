@@ -39,6 +39,7 @@ import pytest
 from firecube.core.controlplane import ChunkManager, SpanCoverage
 from firecube.ingestor.errors import ResumeConflictError
 from firecube.ingestor.runtime.resume_guard import ResumeGuard
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.unit
@@ -174,10 +175,12 @@ def test_non_terminal_run_blocks_and_names_abandon_command(tmp_path: Path) -> No
 
     message = str(excinfo.value)
     assert "run-alive" in message
+    root = manager.get_product_root(_PRODUCT)
     assert (
-        f"firecube chunks runs abandon --product-name {_PRODUCT} --run-id run-alive "
-        '--reason "<reason>"'
+        f'firecube chunks runs abandon --product-name {root} --run-id run-alive --reason "<reason>"'
     ) in message
+    assert "Abandoning the run also releases the write claims it alone owns." in message
+    run_hint(message, "firecube chunks runs abandon", "--dry-run")
 
 
 def test_resume_existing_does_not_bypass_non_terminal_run(tmp_path: Path) -> None:

@@ -67,6 +67,7 @@ from firecube.ingestor.api import (
     ZarrGroupSpec,
 )
 from firecube.ingestor.registry import loader as _loader
+from tests.helpers.cli_hints import run_hint
 
 pytestmark = pytest.mark.integration
 
@@ -367,3 +368,46 @@ def test_preallocate_both_failures_propagate_terminal_error(
         "the propagated exception; "
         f"captured error messages: {error_messages!r}"
     )
+
+
+def test_preallocate_failure_logs_runnable_recovery_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_release, held = ClaimHandle.release, []
+
+    def _failing_release(self: ClaimHandle) -> None:
+        if ":coord_materialization:" not in self.info.domain:
+            return real_release(self)
+        held.append(self)
+        raise OSError("simulated release failure")
+
+    def _failing_terminal(self: ChunkManager, **kwargs: Any) -> None:
+        raise RuntimeError("simulated terminal-record failure")
+
+    monkeypatch.setattr(ChunkManager, "record_run_terminal", _failing_terminal)
+    monkeypatch.setattr(ClaimHandle, "release", _failing_release)
+    _, log_records, handler = _install_error_logger_capture()
+    target = tmp_path / "t.zarr"
+    try:
+        CliRunner().invoke(cli, _preallocate_args(target, _make_source_dir(tmp_path)))
+    finally:
+        logging.getLogger("firecube.cli.zarr").removeHandler(handler)
+
+    logs = {r.getMessage().split(" ")[2]: r.getMessage() for r in log_records}
+    run_id = logs["record"].split("preallocate run ")[1].split(": ")[0]
+
+    def run_statuses() -> list[str]:
+        metas = [json.loads(p.read_text()) for p in target.glob(".firecube/runs/*/run.json")]
+        return [meta["status"] for meta in metas if meta["run_id"] == run_id]
+
+    try:
+        assert _coord_materialization_claims_on_disk(target) != []
+        assert run_statuses() == ["started"]
+        run_hint(logs["release"], "firecube chunks claims clear", "--yes-i-really-mean-it")
+        assert _coord_materialization_claims_on_disk(target) == []
+        run_hint(logs["record"], "firecube chunks runs abandon", "--yes-i-really-mean-it")
+        assert run_statuses() == ["abandoned"]
+    finally:
+        for handle in held:
+            real_release(handle)

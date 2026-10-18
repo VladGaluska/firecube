@@ -491,12 +491,19 @@ class ResumeGuard:
             )
             return
 
+        product_uri = self.chunk_manager.get_product_root(product)
+
+        def abandon_cmd_for(run_id: str) -> str:
+            # Function-scope import: keeps the hint module out of CLI start-up.
+            from firecube.core.hints import abandon_run_command
+
+            return (
+                f"{abandon_run_command(product_uri, run_id)}\n"
+                "Abandoning the run also releases the write claims it alone owns."
+            )
+
         for run in non_terminal:
             existing_slot_range = run.slot_range
-            abandon_cmd = (
-                f"firecube chunks runs abandon --product-name {product} --run-id {run.run_id} "
-                '--reason "<reason>"'
-            )
 
             if slot_range is not None and existing_slot_range is None:
                 if run.stale:
@@ -509,7 +516,7 @@ class ResumeGuard:
                 raise ResumeConflictError(
                     f"Non-range run {run.run_id!r} is active for product '{product}'. "
                     "Abandon it first to start a slot-range parallel run:\n"
-                    f"  {abandon_cmd}"
+                    f"  {abandon_cmd_for(run.run_id)}"
                 )
 
             if slot_range is not None and existing_slot_range is not None:
@@ -547,18 +554,18 @@ class ResumeGuard:
                     raise ResumeConflictError(
                         f"Run {run.run_id!r} with same slot_range={slot_range} is active "
                         f"for product '{product}'. Resume with --option resume_existing=true or "
-                        f"abandon:\n  {abandon_cmd}"
+                        f"abandon:\n  {abandon_cmd_for(run.run_id)}"
                     )
                 raise RangeOverlapError(
                     f"Run {run.run_id!r} with slot_range={existing_slot_range} overlaps "
                     f"new slot_range={slot_range} for product '{product}'. "
                     "Overlapping ranges risk Zarr chunk corruption. "
-                    f"Abandon the conflicting run first:\n  {abandon_cmd}"
+                    f"Abandon the conflicting run first:\n  {abandon_cmd_for(run.run_id)}"
                 )
 
             raise ResumeConflictError(
                 f"Non-terminal run(s) [{run.run_id}] exist for product '{product}'. "
-                f"Abandon them first:\n  {abandon_cmd}"
+                f"Abandon them first:\n  {abandon_cmd_for(run.run_id)}"
             )
 
     def _check_completed_spans_for_slot_overlap(

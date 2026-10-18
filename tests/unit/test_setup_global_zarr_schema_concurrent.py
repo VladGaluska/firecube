@@ -71,7 +71,9 @@ class _ClaimSpy:
     def __init__(self) -> None:
         self.acquired: list[str] = []
 
-    def acquire_claim(self, *, product: str, domain: Any, owner_id: str) -> Any:
+    def acquire_claim(
+        self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+    ) -> Any:
         self.acquired.append(domain.identifier)
         return contextlib.nullcontext()
 
@@ -166,7 +168,9 @@ def test_setup_changes_metadata_under_the_authority_naming_its_basis(
     events: list[str] = []
 
     class _Manager:
-        def acquire_claim(self, *, product: str, domain: Any, owner_id: str) -> Any:
+        def acquire_claim(
+            self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+        ) -> Any:
             events.append(f"acquire {domain.identifier} {owner_id}")
             return _RecordingClaim(events)
 

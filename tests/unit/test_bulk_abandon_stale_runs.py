@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +44,15 @@ from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import (
     EVENT_RUN_ABANDONED,
     AbandonSweepResult,
+    WriteDomain,
 )
 from firecube.core.storage.uri import StorageUri
 from tests.helpers.storage import make_test_binding
 from tests.unit._helpers.counting_fs import CountingFilesystem, make_counting_local_fs
 
 pytestmark = pytest.mark.unit
+
+_P = "product.zarr"
 
 
 def _manager(tmp_path: Path, *, product: str = "product.zarr") -> ChunkManager:
@@ -64,9 +68,9 @@ class _PathCountingFilesystem(CountingFilesystem):
         super().__init__(fs)
         self.ls_paths: list[str] = []
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list[Any]:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list[Any]:
         self.ls_paths.append(uri.path)
-        return super().ls(uri, detail=detail)
+        return super().ls(uri, detail=detail, refresh=refresh)
 
 
 def _counting_manager(
@@ -550,10 +554,10 @@ def test_concurrent_all_stale_sweeps_are_idempotent(
     assert len(cached_b_preview) == n_stale
     assert sorted(run.run_id for run in cached_b_preview) == sorted(stale_ids)
 
-    def cached_list_stale_runs_for_b(*, product: str) -> list[Any]:
+    def cached_list_runs_for_b(*, product: str, **_: Any) -> list[Any]:
         return list(cached_b_preview)
 
-    monkeypatch.setattr(manager_b.repo, "list_stale_runs", cached_list_stale_runs_for_b)
+    monkeypatch.setattr(manager_b.repo, "list_runs", cached_list_runs_for_b)
 
     original_a_abandon_run = manager_a.repo.abandon_run
     a_call_count = {"n": 0}
@@ -775,3 +779,101 @@ def test_enumeration_bounded_scales_with_N_not_S(tmp_path: Path) -> None:
     assert abs(ls_a - ls_b) <= 1, (
         f"listing count scales with stale count S: A(S=5)={ls_a}, B(S=15)={ls_b}"
     )
+
+
+def _set_heartbeat(root: Path, domain: str, age_s: float) -> None:
+    for path in (root / _P / ".firecube" / "claims").iterdir():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload["domain"] == domain:
+            payload["last_heartbeat_at"] = time.time() - age_s
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _seed(stack: ExitStack, root: Path, claims: list[tuple[str, int]]):
+    root.mkdir(exist_ok=True)
+    manager, fs = _counting_manager(root)
+    stack.callback(manager.close)
+    now, held = time.time(), []
+    runs = (("old", "started", 7200), ("done", "complete", 7200), ("live", "started", 60))
+    for rid, status, age in runs:
+        end = None if status == "started" else now - age
+        kw = {"status": status, "updated_at": now - age, "completed_at": end}
+        _write_run_json(root, product=_P, run_id=rid, **kw)
+    for i, (owner, age) in enumerate(claims):
+        domain = WriteDomain(product=_P, category="zarr_region", name=f"c{i}")
+        stack.enter_context(manager.acquire_claim(product=_P, domain=domain, owner_id=owner))
+        _set_heartbeat(root, domain.identifier, age)
+        held.append(domain.identifier)
+    return manager, fs, held
+
+
+def test_sweep_releases_claims_of_abandoned_runs(tmp_path: Path) -> None:
+    manager, product, now = _manager(tmp_path), "product.zarr", time.time()
+    with ExitStack() as stack:
+        stack.callback(manager.close)
+        for rid, t in (("old", now - 7200), ("new", now - 60)):
+            _write_run_json(tmp_path, product=product, run_id=rid, status="started", updated_at=t)
+            domain = WriteDomain(product=product, category="zarr_region", name=rid)
+            stack.enter_context(manager.acquire_claim(product=product, domain=domain, owner_id=rid))
+            _set_heartbeat(tmp_path, domain.identifier, 1000 if rid == "old" else 0)
+        result = manager.abandon_stale_runs(product=product, reason="r", dry_run=False)
+        assert [c.owner_id for c in manager.list_claims(product=product)] == ["new"]
+        assert result.abandoned == ["old"]
+        assert result.released_claims == [f"{product}:zarr_region:old"]
+
+
+def test_sweep_releases_claims_left_by_an_abandoned_run(tmp_path: Path) -> None:
+    manager, product, then = _manager(tmp_path), "product.zarr", time.time() - 7200
+    run_kw = {"status": "abandoned", "updated_at": then, "completed_at": then}
+    _write_run_json(tmp_path, product=product, run_id="run-r", **run_kw)
+    domain = WriteDomain(product=product, category="zarr_region", name="grp:slot=0")
+    try:
+        with manager.acquire_claim(product=product, domain=domain, owner_id="run-r:grp"):
+            _set_heartbeat(tmp_path, domain.identifier, 1000)
+            result = manager.abandon_stale_runs(product=product, reason="finish", dry_run=False)
+            assert manager.list_claims(product=product) == []
+            assert result.released_claims == [domain.identifier]
+    finally:
+        manager.close()
+
+
+def test_sweep_resolves_no_owner_of_live_slot_claims(tmp_path: Path) -> None:
+    ls_counts, kept = [], []
+    for n in (2, 20):
+        with ExitStack() as stack:
+            slots = [(f"live:grp:slot={k}", 0) for k in range(n)]
+            manager, fs, _ = _seed(stack, tmp_path / f"n{n}", slots)
+            fs.reset()
+            manager.abandon_stale_runs(product=_P, reason="r", dry_run=False)
+            ls_counts.append(fs.counts["ls"])
+            kept.append(len(manager.list_claims(product=_P)))
+    assert kept == [2, 20]
+    assert ls_counts[0] == ls_counts[1], f"ls calls grow with claims (2 vs 20): {ls_counts}"
+
+
+def test_sweep_releases_only_stale_claims(tmp_path: Path) -> None:
+    with ExitStack() as stack:
+        mgr, _, ids = _seed(stack, tmp_path, [(o, a) for a in (999, 0) for o in ("old", "done")])
+        result = mgr.abandon_stale_runs(product=_P, reason="r", dry_run=False)
+        assert result.released_claims == sorted(ids[:2])
+        assert result.skipped_claims == sorted(ids[2:])
+
+
+def test_sweep_keeps_a_claim_renewed_before_its_delete(tmp_path, monkeypatch):
+    with ExitStack() as stack:
+        manager, _, (domain,) = _seed(stack, tmp_path, [("done", 1000)])
+        abandon = manager.repo.abandon_run
+        renew = lambda **kw: (_set_heartbeat(tmp_path, domain, 0), abandon(**kw))[1]  # noqa: E731
+        monkeypatch.setattr(manager.repo, "abandon_run", renew)
+        result = manager.abandon_stale_runs(product=_P, reason="r", dry_run=False)
+        assert (result.released_claims, result.skipped_claims) == ([], [domain])
+        assert [c.domain for c in manager.list_claims(product=_P)] == [domain]
+
+
+def test_dry_run_previews_claim_releases(tmp_path: Path) -> None:
+    with ExitStack() as stack:
+        manager, _, held = _seed(stack, tmp_path, [("old", 1000), ("done", 1000), ("done", 0)])
+        result = manager.abandon_stale_runs(product=_P, reason="r", dry_run=True)
+        assert (result.previewed, result.abandoned) == (["old"], [])
+        assert (result.released_claims, result.skipped_claims) == (sorted(held[:2]), held[2:])
+        assert len(manager.list_claims(product=_P)) == 3

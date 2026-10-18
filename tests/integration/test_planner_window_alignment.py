@@ -22,6 +22,7 @@ from firecube.core.index_spec import IndexSpec, RegularTimeAxis
 from firecube.core.zarr.planning import coord_chunk_sizes_by_group
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 from firecube.ingestor.errors import ConfigurationError
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding
 
 pytestmark = [pytest.mark.integration, pytest.mark.gate]
@@ -90,10 +91,12 @@ def _assert_window(
     window: tuple[int, int],
     *,
     current_run_id: str = "new-run",
+    whole_extent_groups: dict[str, int] | None = None,
 ) -> None:
     """Probe the live claim path: check the window, then roll the run back."""
     windows = {_GROUP: window}
     handle = manager.claim_coord_materialization_window(
+        whole_extent_groups=whole_extent_groups,
         product=_PRODUCT,
         run_id=current_run_id,
         output_path=f"file:///tmp/{_PRODUCT}",
@@ -128,7 +131,8 @@ def test_sub_chunk_window_with_concurrent_conflict_refuses(tmp_path) -> None:
         assert "coordinate chunk(s) [0]" in message
         assert "active-run" in message
         assert "state: started" in message
-        assert "chunks runs abandon" in message
+        assert "--run-id active-run " in message
+        run_hint(message, "firecube chunks runs abandon", "--dry-run")
     finally:
         manager.close()
 
@@ -192,6 +196,20 @@ def test_sub_chunk_window_with_no_conflict_succeeds(tmp_path) -> None:
         _record_started_run(manager, run_id="active-run", slot_range=(256, 266))
 
         _assert_window(manager, (20, 30))
+    finally:
+        manager.close()
+
+
+def test_whole_extent_refusal_names_a_runnable_abandon_command(tmp_path) -> None:
+    manager = _manager(tmp_path)
+    try:
+        _record_started_run(manager, run_id="live-peer", slot_range=(0, 10))
+        with pytest.raises(ConfigurationError) as exc_info:
+            _assert_window(manager, (256, 512), whole_extent_groups={_GROUP: 512})
+        message = str(exc_info.value)
+        assert "engine-owned arrays, which preallocate writes whole" in message
+        assert "--run-id live-peer " in message
+        run_hint(message, "firecube chunks runs abandon", "--dry-run")
     finally:
         manager.close()
 

@@ -143,11 +143,15 @@ class SpanRecorder:
                 slice_meta=meta,
             )
             if prior_spans and not coverage:
+                # Function-scope import: keeps the hint module out of CLI start-up.
+                from firecube.core.hints import abandon_run_command
+
+                product_uri = self._chunk_manager.get_product_root(product)
                 raise ManifestError(
                     f"force_reingest refusing to commit replacement for product={product!r}: "
                     f"prior_spans={len(prior_spans)} but new coverage is empty. "
-                    "This would erase active coverage. "
-                    f"Abandon the run first: firecube chunks runs abandon {run_id}"
+                    "This would erase active coverage. Abandon the run first:\n"
+                    f"  {abandon_run_command(product_uri, run_id)}"
                 )
             replaced_span_keys, overwrites_by_coverage = _replacement_plan(
                 prior_spans=prior_spans,

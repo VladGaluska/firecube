@@ -33,6 +33,7 @@ from firecube.core.controlplane.types import (
 )
 from firecube.core.errors import ManifestError
 from tests.helpers.storage import make_test_binding
+from tests.unit._helpers.counting_fs import CountingFilesystem, make_counting_local_fs
 
 
 def _make_manager(tmp_path: Path) -> ChunkManager:
@@ -214,3 +215,30 @@ def test_claim_conflict_with_matching_current_json_converges(tmp_path: Path) -> 
 
     assert record == declared
     assert outcome == "matched_existing"
+
+
+@pytest.mark.unit
+def test_resolved_index_loser_skips_conflict_detail_lookups(tmp_path: Path) -> None:
+    listed: list[str] = []
+
+    class _Recording(CountingFilesystem):
+        def ls(self, uri, detail=False, refresh=False):
+            listed.append(uri.path)
+            return super().ls(uri, detail=detail, refresh=refresh)
+
+    fs = _Recording(make_counting_local_fs(tmp_path)[1])
+    cm = ChunkManager(binding=make_test_binding(tmp_path), workspace=tmp_path, filesystem=fs)
+    declared, domain = _record(run_id="winner"), WriteDomain("prod1", "resolved_index", "current")
+    cm.record_run_started(
+        product="prod1", run_id="winner", output_path="", output_format="zarr", size=0, meta={}
+    )
+    current = _resolved_index_current(tmp_path, "prod1")
+    current.parent.mkdir(parents=True, exist_ok=True)
+    current.write_bytes(declared.to_json_bytes())
+    with cm.acquire_claim(product="prod1", domain=domain, owner_id="winner"):
+        listed.clear()
+        _, outcome = cm.ensure_resolved_index(
+            product="prod1", record=declared, max_retries=1, initial_backoff_s=0.01
+        )
+    assert outcome == "matched_existing"
+    assert [path for path in listed if "/runs/winner" in path] == []

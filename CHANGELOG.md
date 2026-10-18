@@ -168,9 +168,66 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   number of chunk objects in the store. On a store of 173,283 objects, the
   check fell from about 1.8 s per batch to under 0.01 s. No action is
   required.
+- A claim-conflict error now names the owner of the claim. It prints the
+  `firecube chunks claims clear` command for the claim. If one recorded run
+  owns the claim, it also prints the run, its status and the
+  `firecube chunks runs abandon` command for that run. If no recorded run or
+  several runs own the claim, the error says so (#86).
+- Every `firecube chunks runs abandon` command that Firecube prints now runs
+  as printed. The command carries `--product-name` with the product URI and
+  `--run-id` with the run. Replace the `<reason>` placeholder. In a script,
+  add `--yes-i-really-mean-it` (#86).
+- The refusals of `firecube archive create`, `archive restore` and the
+  chunk deletion commands now print the `firecube chunks claims clear` command for
+  each blocking claim. Before, they named `firecube chunks runs abandon`
+  without arguments. If one recorded run owns the claim, they also print the
+  status of that run and the abandon command for that run (#86).
+- The claim that `firecube zarr preallocate` takes while it sets up the schema
+  now carries the id of the preallocate run. Its conflict error names that run.
+  If the run cannot record its terminal state, the log prints the command that
+  abandons the run. If the run cannot release the claim, the log prints the
+  command that clears the claim (#86).
+- Ingest no longer builds the conflict detail when it retries a claim that
+  another writer holds. The intermediate retries of the schema setup skip the
+  detail. Its final attempt still builds it, even if the setup then converges
+  (#86).
 
 ### Fixed
 
+- `firecube chunks runs abandon` now releases the write claims that the run
+  alone owns. Before, the claims stayed and a resume after a killed writer
+  failed with a claim conflict (#86). The command prints `Released claim
+  <domain>` for each claim it deletes. It prints `Left claim <domain>` for a
+  claim it keeps, because the owner matches more than one run or the claim
+  changed. Clear such a claim with `firecube chunks claims clear`. Abandoning
+  a run that is still alive also removes its slot guards. Its heartbeat writes
+  the claim again at its next beat. The beat interval defaults to 30 s. The
+  claim can therefore return within seconds of the abandon. Stop the run
+  before you abandon it.
+- If `firecube chunks runs abandon` cannot list the claims, it now exits 1 and
+  prints the error. Before, it reported success and left the claims in place.
+  Firecube has already recorded the run as abandoned. Run the same command
+  again to release the claims (#86).
+- `firecube chunks runs abandon` on a run that is already terminal now
+  releases the claims that the run still owns. Before, it released nothing.
+  The run keeps its status (#86).
+- A committed `firecube chunks runs abandon --all-stale --yes-i-really-mean-it`
+  now releases the claims of runs that an earlier abandon ended and a crash
+  interrupted. It lists the claims once and prints each `Released claim` and
+  `Left claim` line, also when it abandons no run. If it cannot list the
+  claims, it exits 1 and abandons no run. Run it again (#86).
+- The `--all-stale` sweep releases a claim only when the claim is stale. A
+  claim is stale 120 s after its last heartbeat. The sweep checks this again
+  just before it deletes the claim. It keeps a fresh claim and prints
+  `Left claim <domain>`. A process that still renews a claim keeps it. Stop
+  that process. Then run `firecube chunks runs abandon` for the run, or
+  `firecube chunks claims clear --force` for the claim (#86).
+- Without `--yes-i-really-mean-it`, the `--all-stale` sweep is a dry run. It
+  deletes nothing and abandons no run. It now also lists the claims. It prints
+  `Would release claim <domain>` for each claim that a committed sweep
+  releases. It prints `Would leave claim <domain>` for each claim that the
+  sweep keeps. It lists only kept claims whose owner includes a terminal run
+  or a run in the sweep (#86).
 - `firecube zarr slots` no longer holds the whole plan in memory. It writes
   each range as it computes it, so the number of ranges does not change its
   memory use. A plan of 44 million ranges needed more than 100 GB.

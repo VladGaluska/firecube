@@ -41,7 +41,9 @@ class _ChunkManager:
     def __init__(self) -> None:
         self.audit_records: list[dict[str, Any]] = []
 
-    def acquire_claim(self, *, product: str, domain: Any, owner_id: str):
+    def acquire_claim(
+        self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+    ):
         _ = (product, domain, owner_id)
         return nullcontext()
 

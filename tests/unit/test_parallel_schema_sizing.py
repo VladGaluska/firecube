@@ -63,7 +63,9 @@ class _ChunkManager:
     def __init__(self) -> None:
         self.domains: list[WriteDomain] = []
 
-    def acquire_claim(self, *, product: str, domain: WriteDomain, owner_id: str):
+    def acquire_claim(
+        self, *, product: str, domain: WriteDomain, owner_id: str, describe_conflict: bool = True
+    ):
         _ = (product, owner_id)
         self.domains.append(domain)
         return nullcontext()

@@ -545,6 +545,8 @@ def test_bt2_poison_delete_flow(tmp_path: Path, driver: Literal["fsspec", "obsto
             "run_id": run_id,
             "status": "abandoned",
             "abandoned": True,
+            "released_claims": [],
+            "skipped_claims": [],
         }
 
         runs_after = manager.list_runs(product=product)

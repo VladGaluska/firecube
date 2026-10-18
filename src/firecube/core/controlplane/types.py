@@ -374,12 +374,26 @@ class ClearSweepResult:
 
 @dataclass(slots=True)
 class AbandonSweepResult:
-    """Result of a bulk stale-run abandonment operation."""
+    """Result of a bulk stale-run abandonment operation.
+
+    Attributes:
+        previewed: Run ids that were stale when the sweep listed them.
+        abandoned: Run ids the sweep recorded as abandoned.
+        skipped_fresh: Run ids whose heartbeat refreshed before the abandon.
+        skipped_already_terminal: Run ids that were terminal or gone before the abandon.
+        released_claims: Claim domains the sweep deletes, sorted: stale claims whose owner
+            resolves to one terminal run alone. A dry run lists those it would delete.
+        skipped_claims: Claim domains of terminal runs the sweep leaves, sorted: fresh,
+            renewed or changed claims, or an ambiguous owner. A dry run lists those it would
+            leave.
+    """
 
     previewed: list[str] = field(default_factory=list)
     abandoned: list[str] = field(default_factory=list)
     skipped_fresh: list[str] = field(default_factory=list)
     skipped_already_terminal: list[str] = field(default_factory=list)
+    released_claims: list[str] = field(default_factory=list)
+    skipped_claims: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

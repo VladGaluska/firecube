@@ -42,6 +42,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -104,12 +105,12 @@ def s3_bucket(moto_s3_endpoint: str) -> Iterator[Any]:
         client.delete_bucket(Bucket=_BUCKET)
 
 
-def _binding_for_s3(endpoint: str) -> StorageBinding:
+def _binding_for_s3(endpoint: str, driver: Any = "obstore") -> StorageBinding:
     uri = StorageUri(protocol="s3", authority=_BUCKET, path=f"/{_PRODUCT}")
     return StorageBinding(
         identity=ProductIdentity.from_uri(uri, "zarr", product_name=_PRODUCT),
         driver=StorageDriverConfig(
-            driver="obstore",
+            driver=driver,
             endpoint_url=endpoint,
             credentials=Credentials(access_key=_ACCESS_KEY, secret_key=_SECRET_KEY),
             region=_REGION,
@@ -204,4 +205,36 @@ def test_concurrent_claim_acquisition_against_obstore_s3(
     finally:
         for handle in successes:
             handle.release()
+        manager.close()
+
+
+@pytest.mark.integration
+def test_abandon_releases_claim_missing_from_a_cached_listing(
+    moto_s3_endpoint: str, s3_bucket: Any, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = ChunkManager(binding=_binding_for_s3(moto_s3_endpoint, "fsspec"), workspace=workspace)
+
+    def put_claim(name: str, owner: str) -> str:
+        domain = WriteDomain(product=_PRODUCT, category="zarr_region", name=name)
+        key = f"{_PRODUCT}/.firecube/claims/{domain.claim_name}"
+        now = time.time()
+        payload = {"product": _PRODUCT, "domain": domain.identifier, "owner_id": owner}
+        payload |= {"claim_path": f"s3://{_BUCKET}/{key}", "acquired_at": now}
+        payload |= {"last_heartbeat_at": now, "heartbeat_interval_s": 30, "stale_threshold_s": 120}
+        s3_bucket.put_object(Bucket=_BUCKET, Key=key, Body=json.dumps(payload).encode())
+        return key
+
+    try:
+        put_claim("slot=0", "other:grp")
+        assert len(manager.list_claims(product=_PRODUCT)) == 1
+        manager.record_run_started(
+            product=_PRODUCT, run_id="run-r", output_path="", output_format="zarr", size=0, meta={}
+        )
+        claim_key = put_claim("slot=1", "run-r:grp")
+        manager.abandon_run(product=_PRODUCT, run_id="run-r", reason="killed writer")
+        listed = s3_bucket.list_objects_v2(Bucket=_BUCKET, Prefix=f"{_PRODUCT}/.firecube/claims/")
+        assert claim_key not in [obj["Key"] for obj in listed.get("Contents", [])]
+    finally:
         manager.close()

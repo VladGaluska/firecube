@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -34,6 +35,7 @@ from firecube.core.storage.uri import StorageUri
 from firecube.core.tensogram.converter import zarr_to_tgm
 from firecube.core.zarr import zip_archive
 from firecube.core.zarr.scrub import run_scrub
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding, make_test_session
 
 pytestmark = pytest.mark.integration
@@ -102,6 +104,18 @@ def _make_archive(source_zarr: Path, archive_path: Path) -> None:
     zarr_to_tgm(str(source_zarr), str(archive_path), group="F024")
 
 
+def _assert_clear_hint_runs_without_abandon(message: str) -> None:
+    run_hint(message, "firecube chunks claims clear", "--yes-i-really-mean-it")
+    assert "firecube chunks runs abandon" not in message
+
+
+def _assert_owner_abandon_hint_runs(message: str, root: str) -> None:
+    assert f"--product-name {root} --run-id running-ingest" in message
+    assert "or abandon run running-ingest (status: started)," in message
+    run_hint(message, "firecube chunks claims clear", "--yes-i-really-mean-it")
+    run_hint(message, "firecube chunks runs abandon", "--dry-run")
+
+
 def test_execute_deletion_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
     product = "product.zarr"
     manager = _claiming_manager(tmp_path)
@@ -118,7 +132,7 @@ def test_execute_deletion_aborts_when_product_has_active_writer_claim(tmp_path: 
             manifest_files=set(),
         )
 
-        with pytest.raises(ManifestError, match="firecube chunks runs abandon"):
+        with pytest.raises(ManifestError) as excinfo:
             manager.execute_deletion(
                 plan,
                 delete_storage=True,
@@ -128,6 +142,28 @@ def test_execute_deletion_aborts_when_product_has_active_writer_claim(tmp_path: 
 
         claims = manager.list_claims(product=product)
         assert [info.domain for info in claims] == [_claim_domain(product).identifier]
+        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
+    finally:
+        claim.release()
+        manager.close()
+
+
+def test_execute_deletion_names_abandon_for_a_recorded_owner(tmp_path: Path) -> None:
+    product, manager = "product.zarr", _claiming_manager(tmp_path)
+    manager.record_run_started(
+        product=product, run_id="running-ingest", output_path="", output_format="zarr",
+        size=0, meta={},
+    )  # fmt: skip
+    claim = manager.acquire_claim(
+        product=product, domain=_claim_domain(product), owner_id="running-ingest:F024"
+    )
+    plan = DeletionPlan([_sample_chunk(product)], 1, {product}, set())
+    try:
+        with pytest.raises(ManifestError) as excinfo:
+            manager.execute_deletion(
+                plan, delete_storage=True, delete_manifest=False, dry_run=False
+            )
+        _assert_owner_abandon_hint_runs(str(excinfo.value), manager.get_product_root(product))
     finally:
         claim.release()
         manager.close()
@@ -142,11 +178,12 @@ def test_delete_spans_aborts_when_product_has_active_writer_claim(tmp_path: Path
         owner_id="running-ingest:F024",
     )
     try:
-        with pytest.raises(ManifestError, match="firecube chunks runs abandon"):
+        with pytest.raises(ManifestError) as excinfo:
             manager.delete_spans([_sample_span(product)], dry_run=False)
 
         claims = manager.list_claims(product=product)
         assert [info.domain for info in claims] == [_claim_domain(product).identifier]
+        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
     finally:
         claim.release()
         manager.close()
@@ -176,14 +213,18 @@ def test_scrub_aborts_when_product_has_active_writer_claim(
     )
 
     try:
-        with pytest.raises(ManifestError, match="firecube chunks runs abandon"):
+        with pytest.raises(ManifestError) as excinfo:
             run_scrub(session, "F024")
+        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
     finally:
         claim.release()
         manager.close()
 
 
-def test_archive_restore_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
+def _restore_with_claimed_target(
+    tmp_path: Path, check: Callable[[str], None], *, record_owner: bool = False
+) -> None:
+    """Run a refused restore, then `check` its output while the claim is still held."""
     runner = CliRunner()
     env = _local_env(tmp_path)
     source_zarr = tmp_path / "source.zarr"
@@ -192,6 +233,11 @@ def test_archive_restore_aborts_when_product_has_active_writer_claim(tmp_path: P
     _make_archive(source_zarr, archive_path)
 
     manager = _claiming_manager(tmp_path)
+    if record_owner:
+        manager.record_run_started(
+            product="restored.zarr", run_id="running-ingest", output_path="", output_format="zarr",
+            size=0, meta={},
+        )  # fmt: skip
     claim = manager.acquire_claim(
         product="restored.zarr",
         domain=_claim_domain("restored.zarr"),
@@ -215,10 +261,21 @@ def test_archive_restore_aborts_when_product_has_active_writer_claim(tmp_path: P
             env=env,
         )
         assert result.exit_code != 0
-        assert "firecube chunks runs abandon" in result.output
+        check(result.output)
     finally:
         claim.release()
         manager.close()
+
+
+def test_archive_restore_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
+    _restore_with_claimed_target(tmp_path, _assert_clear_hint_runs_without_abandon)
+
+
+def test_archive_restore_names_abandon_for_a_recorded_owner(tmp_path: Path) -> None:
+    root = StorageUri.from_local_path(tmp_path / "restored.zarr").to_str()
+    _restore_with_claimed_target(
+        tmp_path, lambda out: _assert_owner_abandon_hint_runs(out, root), record_owner=True
+    )
 
 
 def _zip_create_with_control_plane(tmp_path: Path):
@@ -233,11 +290,24 @@ def _zip_create_with_control_plane(tmp_path: Path):
 def test_archive_create_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
     manager = _claiming_manager(tmp_path, product="s.zarr")
     claim = manager.acquire_claim(product="s.zarr", domain=_claim_domain("s.zarr"), owner_id="w")
+    try:
+        result = _zip_create_with_control_plane(tmp_path)
+        assert result.exit_code != 0
+        _assert_clear_hint_runs_without_abandon(result.output)
+    finally:
+        claim.release()
+    assert not (tmp_path / "out.zip").exists()
+
+
+def test_archive_refusal_after_a_lost_race_names_clear_once(tmp_path, monkeypatch):
+    manager = _claiming_manager(tmp_path, product="s.zarr")
+    domain = WriteDomain(product="s.zarr", category="maintenance", name="archive_create")
+    claim = manager.acquire_claim(product="s.zarr", domain=domain, owner_id="other-archive")
+    held = manager.list_claims(product="s.zarr")
+    monkeypatch.setattr(ChunkManager, "list_claims", Mock(side_effect=[[], held]))
     result = _zip_create_with_control_plane(tmp_path)
     claim.release()
-    assert result.exit_code != 0
-    assert "firecube chunks runs abandon" in result.output
-    assert not (tmp_path / "out.zip").exists()
+    assert result.output.count(f"--domain {domain.identifier}") == 1, result.output
 
 
 def test_archive_create_keeps_archive_error_and_releases_claim(tmp_path, monkeypatch):

@@ -34,7 +34,7 @@ The `.firecube/` directory is the authoritative product-local control-plane root
 - `ChunkManager.list_chunks()` supports time-range filtering via `time_min_after`, `time_max_before`, and `time_overlaps` params; use these instead of post-filtering the full list.
 - `ChunkManager.list_runs()` supports `status` and `non_terminal` filtering.
 - `ChunkManager.time_coverage_summary()` returns per-group time bounds and span counts, useful for diagnostics and resume overlap detection.
-- Resume authority is control-plane-primary: `ResumeGuard` decides whether a run may proceed based solely on WAL state. Non-terminal runs block resume and require explicit `chunks runs abandon`. The data store is not consulted unless `validate_zarr=true`.
+- Resume authority is control-plane-primary: `ResumeGuard` decides whether a run may proceed based solely on WAL state. Non-terminal runs block resume and require explicit `chunks runs abandon`, which also releases the write claims whose owner resolves to that run alone. The data store is not consulted unless `validate_zarr=true`.
 - For products with mixed bounded/unbounded groups, the full resolved-index record is not persisted; per-group identity verification for bounded groups happens at ingest startup (see restored per-group verification path).
 
 ## Plugin Contract

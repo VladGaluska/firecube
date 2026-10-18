@@ -35,6 +35,7 @@ from firecube.core.controlplane.types import (
     MAINTENANCE_OP_DELETE,
     STATE_DELETED_BY_FIRECUBE,
     ChunkInfo,
+    ClaimInfo,
     DeletionPlan,
     WriteDomain,
 )
@@ -590,12 +591,6 @@ class DeletionEngine:
             manifest_files=manifests,
         )
 
-    def _maintenance_claim_message(self, *, product: str, operation: str, detail: str) -> str:
-        return (
-            f"Cannot run {operation} for product {product}: {detail}. "
-            "If a prior writer is stuck, resolve it with `firecube chunks runs abandon`."
-        )
-
     def _acquire_maintenance_claims(
         self, *, products: Iterable[str], operation: str
     ) -> list[tuple[str, WriteDomain]]:
@@ -605,32 +600,46 @@ class DeletionEngine:
 
         owner_id = f"maintenance:{operation}:{uuid.uuid4()}"
         acquired: list[tuple[str, WriteDomain]] = []
+        acquiring = product_list[0]
         try:
             for product in product_list:
                 active_claims = self.repo.list_claims(product=product)
                 if active_claims:
+                    # Function-scope import: keeps the hint module out of CLI start-up.
+                    from firecube.core.hints import maintenance_refusal_message
+
                     details = ", ".join(
                         f"{claim.domain} (owner={claim.owner_id})" for claim in active_claims
                     )
                     raise ManifestError(
-                        self._maintenance_claim_message(
+                        maintenance_refusal_message(
+                            repo=self.repo,
                             product=product,
                             operation=operation,
                             detail=f"active write claim(s) exist: {details}",
+                            claims=active_claims,
                         )
                     )
 
-            for product in product_list:
-                domain = WriteDomain(product=product, category="maintenance", name=operation)
-                self.repo.acquire_claim(product=product, domain=domain, owner_id=owner_id)
-                acquired.append((product, domain))
+            for acquiring in product_list:
+                domain = WriteDomain(product=acquiring, category="maintenance", name=operation)
+                self.repo.acquire_claim(product=acquiring, domain=domain, owner_id=owner_id)
+                acquired.append((acquiring, domain))
         except ClaimConflictError as exc:
+            # Function-scope import: keeps the hint module out of CLI start-up.
+            from firecube.core.hints import maintenance_refusal_message
+
             detail = str(exc) or "write claim acquisition failed"
+            blocking: list[ClaimInfo] = []
+            with suppress(Exception):
+                blocking = self.repo.list_claims(product=acquiring)
             raise ManifestError(
-                self._maintenance_claim_message(
-                    product=product_list[0],
+                maintenance_refusal_message(
+                    repo=self.repo,
+                    product=acquiring,
                     operation=operation,
                     detail=detail,
+                    claims=blocking,
                 )
             ) from exc
         except Exception:

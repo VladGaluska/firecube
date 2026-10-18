@@ -70,9 +70,9 @@ class _PathCountingFilesystem(CountingFilesystem):
         self.open_paths.clear()
         self.exists_paths.clear()
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list[Any]:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list[Any]:
         self.ls_paths.append(uri.path)
-        return super().ls(uri, detail=detail)
+        return super().ls(uri, detail=detail, refresh=refresh)
 
     def exists(self, uri: StorageUri) -> bool:
         self.exists_paths.append(uri.path)

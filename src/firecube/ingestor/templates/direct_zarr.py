@@ -206,15 +206,21 @@ def _hold_setup_authority(
     product: str,
     domain: WriteDomain,
     owner_id: str,
+    describe_conflict: bool,
 ) -> contextlib.AbstractContextManager[MetadataAuthority]:
     """Take the setup claim of *group_name* and the authority over its subtree it entitles.
 
     The authority is released before the claim. Without a control plane
     (``chunk_manager`` is ``None``) it is explicitly ``PROCESS_LOCAL``: it
-    excludes the threads of this process only.
+    excludes the threads of this process only. *describe_conflict* is set on the last attempt.
     """
     claim = (
-        chunk_manager.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        chunk_manager.acquire_claim(
+            product=product,
+            domain=domain,
+            owner_id=owner_id,
+            describe_conflict=describe_conflict,
+        )
         if chunk_manager is not None
         else None
     )
@@ -350,6 +356,7 @@ def _setup_global_zarr_schema(
                     product=product,
                     domain=domain,
                     owner_id=f"{run_id}:{group_name}:schema_global",
+                    describe_conflict=_schema_attempt == _schema_max_retries,
                 ) as authority:
                     # Re-check INSIDE the claim: another pod may have converged
                     # between the outer satisfied-check and claim acquisition.

@@ -197,3 +197,22 @@ def test_runs_abandon_all_stale(
         assert r.exit_code == 0, r.output
         assert manager.run_calls == [("TEST_PRODUCT.zarr", "run-xyz", "crashed")]
         assert "Abandoned run run-xyz for TEST_PRODUCT.zarr" in r.output
+
+
+def test_sweep_prints_claims_released_without_abandoned_runs(monkeypatch: pytest.MonkeyPatch):
+    manager = _FakeRunsManager(AbandonSweepResult(released_claims=["P.zarr:zarr_region:grp"]))
+    monkeypatch.setattr("firecube.cli.chunks._runs.resolve_manager", lambda *a, **k: manager)
+    args = "chunks runs abandon --product-name file:///tmp/wk/P.zarr --all-stale --reason crashed"
+    r = CliRunner().invoke(cli, [*args.split(), "--yes-i-really-mean-it"])
+    assert r.exit_code == 0, r.output
+    assert "Released claim P.zarr:zarr_region:grp" in r.output
+
+
+def test_dry_run_prints_claims_the_sweep_would_release(monkeypatch: pytest.MonkeyPatch):
+    sweep = AbandonSweepResult(previewed=["r"], released_claims=["P:a"], skipped_claims=["P:b"])
+    manager = _FakeRunsManager(sweep)
+    monkeypatch.setattr("firecube.cli.chunks._runs.resolve_manager", lambda *a, **k: manager)
+    args = "chunks runs abandon --product-name file:///tmp/wk/P.zarr --all-stale --reason crashed"
+    r = CliRunner().invoke(cli, args.split())
+    assert "Would release claim P:a" in r.output and "Would leave claim P:b" in r.output
+    assert "Released claim" not in r.output

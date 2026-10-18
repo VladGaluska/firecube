@@ -29,6 +29,7 @@ Archive subcommands distinguish two URI categories:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -160,37 +161,46 @@ def _echo_archive_info(info_dict: dict[str, Any], *, as_json: bool, format_label
             )
 
 
-def _maintenance_claim_message(*, product: str, operation: str, detail: str) -> str:
-    return (
-        f"Cannot run {operation} for product {product}: {detail}. "
-        "If a prior writer is stuck, resolve it with `firecube chunks runs abandon`."
-    )
-
-
 def _acquire_maintenance_claim(
     *, manager, product: str, operation: str, owner_id: str
 ) -> tuple[WriteDomain, Any]:
     """Acquire the maintenance claim; return its domain and the handle whose release stops the heartbeat."""
     active_claims = manager.list_claims(product=product)
     if active_claims:
+        # Function-scope import: keeps the hint module out of CLI start-up.
+        from firecube.core.hints import maintenance_refusal_message
+
         details = ", ".join(f"{claim.domain} (owner={claim.owner_id})" for claim in active_claims)
         raise click.ClickException(
-            _maintenance_claim_message(
+            maintenance_refusal_message(
+                repo=manager.repo,
                 product=product,
                 operation=operation,
                 detail=f"active write claim(s) exist: {details}",
+                claims=active_claims,
             )
         )
 
     domain = WriteDomain(product=product, category="maintenance", name=operation)
     try:
-        handle = manager.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        # The refusal below names the owner and the commands, so the conflict detail stays off.
+        handle = manager.acquire_claim(
+            product=product, domain=domain, owner_id=owner_id, describe_conflict=False
+        )
     except ClaimConflictError as exc:
+        # Function-scope import: keeps the hint module out of CLI start-up.
+        from firecube.core.hints import maintenance_refusal_message
+
+        blocking: list[Any] = []
+        with contextlib.suppress(Exception):
+            blocking = manager.list_claims(product=product)
         raise click.ClickException(
-            _maintenance_claim_message(
+            maintenance_refusal_message(
+                repo=manager.repo,
                 product=product,
                 operation=operation,
                 detail=str(exc) or "write claim acquisition failed",
+                claims=blocking,
             )
         ) from exc
     return domain, handle

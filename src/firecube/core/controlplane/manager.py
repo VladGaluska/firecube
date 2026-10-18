@@ -34,7 +34,7 @@ from firecube.core.controlplane._paths import run_dir_for
 from firecube.core.controlplane.claims import ClaimHandle
 from firecube.core.controlplane.deletion import DeletionEngine
 from firecube.core.controlplane.events import ConsolidatedTimeCoord
-from firecube.core.controlplane.repo import ManifestRepository
+from firecube.core.controlplane.repo import ClaimOwner, ManifestRepository, _owner_candidates
 from firecube.core.controlplane.types import (
     EVENT_SLOT_INDEX_MODEL_RECORDED,
     EVENT_SLOT_INDEX_MODEL_VERIFIED,
@@ -721,6 +721,9 @@ class ChunkManager:
             # Serial (non-range) runs own the full extent by convention; keep
             # symmetric with resume_guard._check_non_terminal_runs (reverse leg).
             if serial_peers:
+                # Function-scope import: keeps the hint module out of CLI start-up.
+                from firecube.core.hints import abandon_run_command
+
                 serial_peer = serial_peers[0]
                 elapsed = "unknown"
                 if serial_peer.started_at:
@@ -729,9 +732,9 @@ class ChunkManager:
                 raise ConfigurationError(
                     f"conflicting serial ingest run {serial_peer.run_id} is live "
                     f"(holds full extent; state: {serial_peer.status}, running for {elapsed}); "
-                    f"if this run is confirmed dead, abandon it explicitly: "
-                    f"firecube chunks runs abandon {serial_peer.run_id} "
-                    f"then re-run preallocate. Automatic timeout is not implemented."
+                    f"if this run is confirmed dead, abandon it explicitly, then re-run "
+                    f"preallocate. Automatic timeout is not implemented.\n"
+                    f"  {abandon_run_command(self.get_product_root(product), serial_peer.run_id)}"
                 )
             for group, window in windows_by_group.items():
                 chunk_size = coord_chunk_sizes.get(group)
@@ -746,6 +749,9 @@ class ChunkManager:
                     peer_chunks = set(chunk_axis_range(peer_range[0], peer_range[1], chunk_size))
                     overlap = sorted(proposed_chunks & peer_chunks)
                     if overlap:
+                        # Function-scope import: keeps the hint module out of CLI start-up.
+                        from firecube.core.hints import abandon_run_command
+
                         elapsed = "unknown"
                         if peer.started_at:
                             elapsed_s = datetime.now(tz=UTC).timestamp() - float(peer.started_at)
@@ -754,9 +760,9 @@ class ChunkManager:
                             f"group {group!r} window [{window[0]}, {window[1]}) touches "
                             f"coordinate chunk(s) {overlap} owned by run {peer.run_id} "
                             f"(state: {peer.status}, materializing for {elapsed}); "
-                            f"if this run is confirmed dead, abandon it explicitly: "
-                            f"firecube chunks runs abandon {peer.run_id} "
-                            f"then re-run preallocate. Automatic timeout is not implemented."
+                            f"if this run is confirmed dead, abandon it explicitly, then re-run "
+                            f"preallocate. Automatic timeout is not implemented.\n"
+                            f"  {abandon_run_command(self.get_product_root(product), peer.run_id)}"
                         )
             whole = dict(whole_extent_groups or {})
             for group in whole:
@@ -765,13 +771,16 @@ class ChunkManager:
                         continue
                     peer_range = peer.slot_range
                     assert peer_range is not None
+                    # Function-scope import: keeps the hint module out of CLI start-up.
+                    from firecube.core.hints import abandon_run_command
+
                     raise ConfigurationError(
                         f"group {group!r} has engine-owned arrays, which preallocate writes "
                         f"whole, but run {peer.run_id} is live on window "
                         f"[{peer_range[0]}, {peer_range[1]}) (state: {peer.status}); wait for "
-                        f"it to finish, or if it is confirmed dead abandon it explicitly: "
-                        f"firecube chunks runs abandon {peer.run_id} "
-                        f"then re-run preallocate. Automatic timeout is not implemented."
+                        f"it to finish, or if it is confirmed dead abandon it explicitly, then "
+                        f"re-run preallocate. Automatic timeout is not implemented.\n"
+                        f"  {abandon_run_command(self.get_product_root(product), peer.run_id)}"
                     )
 
             claimed = [*windows_by_group.values(), *((0, extent) for extent in whole.values())]
@@ -847,13 +856,138 @@ class ChunkManager:
         reason: str,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Mark a non-terminal run as abandoned (control-plane only, no data cleanup)."""
-        return self.repo.abandon_run(
+        """Abandon a run and release the write claims it owns; data stays untouched.
+
+        It records a non-terminal run as abandoned first; a terminal run keeps its status.
+        Either way, it then deletes every claim of the product whose owner resolves to this
+        run alone.
+
+        A claim owner id resolves through its candidates: the id itself and each prefix
+        ending just before a `:`. The single candidate recorded as a run owns the claim.
+
+        Args:
+            product: Product name.
+            run_id: Run to abandon.
+            reason: Operator reason, recorded with the abandon.
+            meta: Extra metadata for the terminal record.
+
+        Returns:
+            `product`, `run_id`, `status` and `abandoned` (False when the run was already
+            terminal), plus `released_claims`, the deleted claim domains, and
+            `skipped_claims`, the domains left because their owner is ambiguous or changed.
+            Both lists are sorted and always present.
+
+        Raises:
+            ManifestError: The run is not recorded for the product, or the claims cannot be
+                listed after the abandon is recorded; the message then says to run it again.
+        """
+        outcome = self.repo.abandon_run(
             product=product,
             run_id=run_id,
             reason=reason,
             meta=meta,
         )
+        released, skipped = self._release_run_claims(
+            product=product, run_id=run_id, status=str(outcome.get("status"))
+        )
+        return {**outcome, "released_claims": released, "skipped_claims": skipped}
+
+    def _resolve_claim_owner(self, *, product: str, owner_id: str) -> ClaimOwner:
+        """Return the recorded runs among the candidates of a claim owner id, via the repository."""
+        return self.repo.resolve_claim_owner(product=product, owner_id=owner_id)
+
+    def _list_claims_to_release(
+        self, *, product: str, recovery: Callable[[], str]
+    ) -> list[ClaimInfo]:
+        """List the product's claims from a fresh listing, for a release.
+
+        A listing error raises ManifestError naming the product, the error and then the text
+        `recovery` returns. A ManifestError, including a malformed claim file, propagates.
+        """
+        try:
+            return self.repo.list_product_claims(product=product)
+        except ManifestError:
+            raise
+        except Exception as exc:
+            raise ManifestError(
+                f"The write claims of {product} could not be listed: {exc}.\n{recovery()}"
+            ) from exc
+
+    def _release_claims(
+        self,
+        *,
+        product: str,
+        claims: Iterable[ClaimInfo],
+        decide: Callable[[ClaimOwner], Literal["release", "skip"] | None],
+        stale_only: bool = False,
+        dry_run: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Release or skip each listed claim as `decide` says for its resolved owner.
+
+        Resolves each distinct owner id once. A claim to release that changed since the
+        listing is skipped instead; one already gone is in neither list. With `stale_only`,
+        a claim that is fresh when re-read, or whose heartbeat moved, is skipped too.
+
+        With `dry_run` it deletes nothing and judges `stale_only` on the listed claim.
+        Returns the released and the skipped domains, sorted.
+        """
+        service = self.repo.claims
+        assert service is not None
+        owners: dict[str, ClaimOwner] = {}
+        released: list[str] = []
+        skipped: list[str] = []
+        for claim in claims:
+            owner = owners.get(claim.owner_id)
+            if owner is None:
+                owner = self._resolve_claim_owner(product=product, owner_id=claim.owner_id)
+                owners[claim.owner_id] = owner
+            decision = decide(owner)
+            if decision == "skip":
+                skipped.append(claim.domain)
+            elif decision == "release" and dry_run:
+                kept = stale_only and not claim.stale
+                (skipped if kept else released).append(claim.domain)
+            elif decision == "release":
+                outcome = service.release_claim_if_unchanged(
+                    product=product, claim=claim, stale_only=stale_only
+                )
+                if outcome == "released":
+                    released.append(claim.domain)
+                elif outcome == "changed":
+                    skipped.append(claim.domain)
+        return sorted(released), sorted(skipped)
+
+    def _release_run_claims(
+        self, *, product: str, run_id: str, status: str
+    ) -> tuple[list[str], list[str]]:
+        """Delete the claims whose owner resolves to `run_id` alone, after its abandon.
+
+        Considers only owners equal to `run_id` or starting with `run_id:`; any other recorded
+        run among an owner's candidates leaves the claim skipped. Lists the claims strictly:
+        a listing error raises ManifestError saying the run is recorded `status` and that
+        running the abandon again releases its claims.
+        """
+
+        def recovery() -> str:
+            # Function-scope import: keeps the hint module out of CLI start-up.
+            from firecube.core.hints import abandon_run_command
+
+            command = abandon_run_command(self.get_product_root(product), run_id)
+            return (
+                f"Run {run_id} is recorded {status}; run the abandon again to release its "
+                f"claims:\n  {command}"
+            )
+
+        claims = [
+            claim
+            for claim in self._list_claims_to_release(product=product, recovery=recovery)
+            if claim.owner_id == run_id or claim.owner_id.startswith(f"{run_id}:")
+        ]
+
+        def decide(owner: ClaimOwner) -> Literal["release", "skip"]:
+            return "release" if owner.run is not None and owner.run.run_id == run_id else "skip"
+
+        return self._release_claims(product=product, claims=claims, decide=decide)
 
     def create_deletion_plan(
         self,
@@ -963,9 +1097,74 @@ class ChunkManager:
             "records": records,
         }
 
-    def acquire_claim(self, *, product: str, domain: WriteDomain, owner_id: str):
-        """Acquire an exclusive write claim for a domain."""
-        return self.repo.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+    def acquire_claim(
+        self, *, product: str, domain: WriteDomain, owner_id: str, describe_conflict: bool = True
+    ):
+        """Acquire an exclusive write claim for a domain.
+
+        Pass ``describe_conflict=False`` when the caller catches the conflict and retries.
+
+        Raises:
+            ClaimConflictError: Another owner holds the claim. With ``describe_conflict`` the
+                message names that owner's run and status, then the commands that release it.
+        """
+        try:
+            return self.repo.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        except ClaimConflictError as exc:
+            if not describe_conflict:
+                raise
+            raise ClaimConflictError(
+                f"{exc}\n{self._claim_conflict_detail(product=product, domain=domain)}"
+            ) from exc
+
+    def _claim_conflict_detail(self, *, product: str, domain: WriteDomain) -> str:
+        """Describe who holds a conflicting claim and how to release it; never raises.
+
+        Re-reads the claim, resolves its owner to a recorded run and prints the clear command,
+        plus the abandon command when exactly one run owns the claim.
+        """
+        # Function-scope import: keeps the hint module out of CLI start-up.
+        from firecube.core.hints import abandon_run_command, clear_claim_command
+
+        try:
+            product_uri = self.get_product_root(product)
+        except Exception as exc:
+            return f"The product root could not be resolved: {exc}."
+        try:
+            service = self.repo.claims
+            assert service is not None
+            claim = service.read_claim_by_domain(product=product, domain=domain.identifier)
+        except Exception as exc:
+            clear = clear_claim_command(product_uri, domain.identifier)
+            return (
+                f"The claim could not be read: {exc}.\n"
+                f"If no process of its owner is running, clear the claim:\n  {clear}"
+            )
+        if claim is None:
+            return "The claim was released after the conflict; retry."
+        clear = clear_claim_command(product_uri, domain.identifier, force=not claim.stale)
+        abandon = ""
+        try:
+            owner = self._resolve_claim_owner(product=product, owner_id=claim.owner_id)
+            if owner.run is not None:
+                run = owner.run
+                stale = ", stale" if run.stale else ""
+                who = f"Owner {claim.owner_id} is run {run.run_id} (status: {run.status}{stale})."
+                abandon = (
+                    f"\nor abandon run {run.run_id}, which releases the claims it alone owns:"
+                    f"\n  {abandon_run_command(product_uri, run.run_id)}"
+                )
+            elif owner.ambiguous:
+                candidates = ", ".join(run.run_id for run in owner.runs)
+                who = f"Owner {claim.owner_id} matches more than one recorded run: {candidates}."
+            else:
+                who = f"Owner {claim.owner_id} is not a recorded run of this product."
+        except Exception as exc:
+            who = f"The run status of owner {claim.owner_id} could not be read: {exc}."
+            abandon = ""
+        return (
+            f"{who}\nIf no process of that owner is running, clear the claim:\n  {clear}{abandon}"
+        )
 
     def list_claims(self, *, product: str | None = None):
         """List active write claims, optionally filtered by product."""
@@ -1066,7 +1265,10 @@ class ChunkManager:
             try:
                 with (
                     self.acquire_claim(
-                        product=product, domain=domain, owner_id=record.recorded_by_run_id
+                        product=product,
+                        domain=domain,
+                        owner_id=record.recorded_by_run_id,
+                        describe_conflict=False,
                     ),
                     self._holding(domain, record.recorded_by_run_id),
                 ):
@@ -1228,7 +1430,7 @@ class ChunkManager:
     ) -> AbandonSweepResult:
         """Bulk-abandon stale non-terminal runs for a product with mutation-time re-check.
 
-        Between preview (``list_stale_runs``) and mutation (``abandon_run``), a
+        Between preview (``list_runs``) and mutation (``abandon_run``), a
         live pod could refresh the run's heartbeat or the run could reach a
         terminal status. Each mutation re-reads the current run entry and only
         abandons runs that remain stale AND non-terminal.
@@ -1236,12 +1438,39 @@ class ChunkManager:
         runs whose heartbeat refreshed are recorded as ``skipped_fresh``. The
         sweep continues past any single-run race so one live pod cannot block
         cleanup of unrelated stale runs.
+
+        The sweep lists the product's runs once, then its claims once, from a fresh listing,
+        before it abandons anything. A claim listing error raises ManifestError and abandons
+        nothing.
+
+        After the abandons it resolves a claim's owner only when the owner id, or a `:`
+        prefix, names a run listed terminal or one it abandoned. Other claims stay unreported.
+        It releases a claim when its owner resolves to one terminal run alone and the claim is
+        stale when re-read before the delete. A fresh claim, a moved heartbeat or an ambiguous
+        owner leaves the claim in `skipped_claims`. Releasing a stale claim finishes a release
+        a crash interrupted.
+
+        A dry run treats the stale runs as abandoned and judges each claim as listed. It
+        reports in `released_claims` and `skipped_claims` what a committed sweep would do, and
+        deletes and abandons nothing.
         """
         result = AbandonSweepResult()
-        stale = self.list_stale_runs(product=product)
+        runs = self.repo.list_runs(product=product)
+        stale = [run for run in runs if not run.is_terminal and run.stale]
+        terminal = {run.run_id for run in runs if run.is_terminal}
         result.previewed = [run.run_id for run in stale]
+        claims = self._list_claims_to_release(
+            product=product,
+            recovery=lambda: "No run was abandoned; run the sweep again.",
+        )
         if dry_run:
-            return result
+            return self._release_sweep_claims(
+                product=product,
+                result=result,
+                claims=claims,
+                ended=terminal | set(result.previewed),
+                dry_run=True,
+            )
         self.repo._ensure_bound()
         assert self.repo._resolver is not None
         assert self.repo._wal_reader is not None
@@ -1264,14 +1493,56 @@ class ChunkManager:
                 result.skipped_fresh.append(run.run_id)
                 continue
             try:
-                outcome = self.abandon_run(product=product, run_id=run.run_id, reason=reason)
+                outcome = self.repo.abandon_run(product=product, run_id=run.run_id, reason=reason)
             except ManifestError:
                 result.skipped_already_terminal.append(run.run_id)
                 continue
-            if outcome.get("abandoned"):
-                result.abandoned.append(run.run_id)
-            else:
+            if not outcome.get("abandoned"):
                 result.skipped_already_terminal.append(run.run_id)
+                continue
+            result.abandoned.append(run.run_id)
+
+        # Outside the ManifestError guard above: a corrupt claim file fails loudly.
+        return self._release_sweep_claims(
+            product=product,
+            result=result,
+            claims=claims,
+            ended=terminal | set(result.abandoned),
+            dry_run=False,
+        )
+
+    def _release_sweep_claims(
+        self,
+        *,
+        product: str,
+        result: AbandonSweepResult,
+        claims: list[ClaimInfo],
+        ended: set[str],
+        dry_run: bool,
+    ) -> AbandonSweepResult:
+        """Release a sweep's stale claims whose owner resolves to one ended run alone.
+
+        Resolves only owners with a candidate in `ended`, so live runs' claims cost no reads.
+        A committed sweep trusts the resolved run status; a dry run also counts `ended` runs
+        as terminal. Fills the claim fields of `result` and returns it.
+        """
+        candidates = [
+            claim
+            for claim in claims
+            if any(candidate in ended for candidate in _owner_candidates(claim.owner_id))
+        ]
+
+        def has_ended(run: RunInfo) -> bool:
+            return run.is_terminal or (dry_run and run.run_id in ended)
+
+        def decide(owner: ClaimOwner) -> Literal["release", "skip"] | None:
+            if owner.run is not None:
+                return "release" if has_ended(owner.run) else None
+            return "skip" if any(has_ended(run) for run in owner.runs) else None
+
+        result.released_claims, result.skipped_claims = self._release_claims(
+            product=product, claims=candidates, decide=decide, stale_only=True, dry_run=dry_run
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -1325,7 +1596,12 @@ class ChunkManager:
         for attempt in range(int(max_retries) + 1):
             try:
                 with (
-                    self.acquire_claim(product=product, domain=domain, owner_id=run_id),
+                    self.acquire_claim(
+                        product=product,
+                        domain=domain,
+                        owner_id=run_id,
+                        describe_conflict=False,
+                    ),
                     self._holding(domain, run_id),
                 ):
                     return self._apply_slot_model_precedence(product, model, run_id)

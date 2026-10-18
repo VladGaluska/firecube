@@ -63,7 +63,9 @@ def _intent(group: str, ts_index: int = 0) -> WriteIntent:
 class _ChunkManager:
     storage_config = None
 
-    def acquire_claim(self, *, product: str, domain: Any, owner_id: str):
+    def acquire_claim(
+        self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+    ):
         _ = (product, domain, owner_id)
         return nullcontext()
 
