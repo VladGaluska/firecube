@@ -128,6 +128,6 @@ def test_slots_auto_uses_input_data(tmp_path: Path) -> None:
     result = CliRunner().invoke(cli, _slots_args(target_dir, input_dir.as_uri()))
 
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["product_name"] == PRODUCT_NAME
     assert payload["ranges"], result.output

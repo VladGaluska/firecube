@@ -35,10 +35,9 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   2. Abandon its run with `firecube chunks runs abandon`.
   3. Run `firecube zarr preallocate` again.
 - Ingest reads the engine-owned markers from the array's own metadata, so
-  stale consolidated metadata does not hide them. `firecube zarr
-  consolidate-time-coord` and validation still read consolidated metadata and
-  can see stale values. Append resume reads the stored array metadata when it
-  classifies slots, writes and fills.
+  stale consolidated metadata does not hide them. Validation still reads
+  consolidated metadata and can see stale values. Append resume reads the
+  stored array metadata when it classifies slots, writes and fills.
 - `--archive-format [tensogram|zip]` option on `firecube archive create`.
   `--archive-format zip` packs a Zarr product into a single local
   `.zip` file that opens as a Zarr zip store. The default stays `tensogram`.
@@ -73,8 +72,32 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
     --yes-i-really-mean-it`.
   - If the source has no `.firecube/schema.json` file, the command writes no claim and no
     record, and does not modify the source.
+- Host code outside the engine can now bind the index of a plugin the way the
+  engine does, through the public method `BaseIngestor.bind_index_at_startup(ctx)`.
+  - When a run preallocates a product or plans slots, the engine calls the method itself.
+    A call before either operation is not a prerequisite.
+  - The method runs the same binding that ingest runs at start-up. Pass it the plugin context of the run.
+  - Each call resolves the index again.
+  - If the `index_spec` of a `DirectZarrIngestor` plugin returns `None`, the plugin has no binding.
+  - Call the method. Do not override it.
 
 ### Changed
+- The refusal for a legacy index record now names the function that rebuilds
+  the index: `firecube.ingestor.runtime.index_record.rebuild_index_record`. The
+  `firecube zarr slots` warning about a legacy index record names it too. If
+  you work from Python, call that function instead of the command
+  `firecube zarr index rebuild`. The exception type stays the same.
+- A refusal that asks you to run `firecube zarr preallocate` now also names
+  the Python function that does the same:
+  `firecube.ingestor.runtime.preallocate.preallocate_product`. If you start
+  ingest from Python, call that function instead of the command. Four
+  refusals change:
+  - An engine-owned array is not materialized.
+  - An engine-owned slot holds no value.
+  - A managed time coordinate slot holds no value.
+  - A target array is shorter than the declared time axis.
+
+  The exception types stay the same.
 - `firecube zarr slots` refuses a plan of more than 1,000,000 ranges. The
   refusal names the range count, and the range count and slot size of each
   group. It also names the smallest `--slot-size` that gives an executable plan
@@ -204,6 +227,31 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Fixed
 
+- `firecube zarr index verify` and `firecube zarr slots` now print a recovery
+  that works. Before, they told you to run `firecube zarr index rebuild`, and
+  that command refuses these states. Each state now has its own text.
+  - If the root attrs hold the resolved-index hash and
+    `.firecube/index/current.json` is absent, `verify` exits with code 1.
+    Restore the file. Or remove the root attrs
+    `firecube_resolved_index_identity_hash` and `firecube_resolved_index`,
+    then run `firecube zarr index rebuild` with the plugin that wrote the data.
+  - If the root attr `firecube_resolved_index_identity_hash` differs from the
+    record, `verify` exits with code 1. Remove that attr, then run
+    `firecube zarr index rebuild`. The command writes the attr again from the
+    record.
+  - If the plugin resolves an index that differs from the record,
+    `firecube zarr slots` warns. Use the plugin that wrote the product, or a
+    new target.
+- `firecube zarr consolidate-time-coord` now reports a backfilled
+  `ConsolidatedTimeCoord` event only after Firecube records the event. Before,
+  it reported the backfill before the record. A failed record could then leave
+  a report of work that did not happen.
+- `firecube zarr consolidate-time-coord` now refuses to rewrite and reseal a
+  coordinate that carries a `firecube_coord_managed` stamp. It refuses even when
+  consolidated metadata, at the root or in any group below it, predates the
+  stamp. The command now reads the live metadata of the root and of every group
+  below it. Before, it could read consolidated metadata that predated the stamp
+  and rewrite the coordinate.
 - `firecube archive restore --overwrite` of a `.tgm` archive now checks the
   archive before it deletes anything. It reads the archive version and runs the
   quick structural check of every message. If the archive fails a check, the

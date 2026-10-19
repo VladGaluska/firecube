@@ -642,6 +642,14 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
 
         return resolve_index_spec_for_ingestor(self, ctx)
 
+    def bind_index_at_startup(self, ctx: PluginContext) -> None:
+        """Bind the plugin's index spec to a resolved index for `ctx`.
+
+        Args:
+            ctx: The plugin context of the run.
+        """
+        self._bind_index_at_startup(ctx)
+
     def _bind_index_at_startup(self, ctx: PluginContext) -> None:
         """Hook: bind IndexSpec to a resolved IndexBinding at pod startup.
 

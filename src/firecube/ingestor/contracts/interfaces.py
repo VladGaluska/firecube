@@ -49,8 +49,11 @@ from firecube.ingestor.types.context import (
 )
 
 if TYPE_CHECKING:
+    from firecube.core.api import IndexSpec, ItemInfo, ResolvedIndex
     from firecube.core.storage.completion import StagedPromotionUnits
     from firecube.core.zarr.guard.metadata_authority import MetadataAuthority
+    from firecube.ingestor.templates.config import TemplateConfig
+    from firecube.ingestor.templates.direct_zarr import ZarrGroupSpec
 
 
 @runtime_checkable
@@ -281,6 +284,48 @@ class PipelineHost(Protocol):
         ...
 
 
+class PreallocateHost(Protocol):
+    """Protocol for a plugin that `preallocate_product` and `plan_slots` can operate on.
+
+    A host declares an index spec and a Zarr schema, and resolves its index.
+    `DirectZarrIngestor` subclasses satisfy it.
+    """
+
+    time_dim_name: ClassVar[str]
+    """The name of the time coordinate array."""
+
+    template_config: TemplateConfig | None
+    """The resolved template configuration, or `None` before configuration."""
+
+    def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+        """Return the Zarr groups and arrays the host declares."""
+        ...
+
+    def index_spec(self, ctx: PluginContext) -> IndexSpec | None:
+        """Return the host's index spec, or `None` for a serial-only host."""
+        ...
+
+    def resolved_index(self, ctx: PluginContext) -> ResolvedIndex:
+        """Return the resolved index, cached per context."""
+        ...
+
+    def bind_index_at_startup(self, ctx: PluginContext) -> None:
+        """Resolve and store the host's index binding for `ctx`."""
+        ...
+
+    def discover_source_files(self, ctx: PluginContext) -> Iterable[Any]:
+        """Return the source items of the run."""
+        ...
+
+    def filter_item(self, item: Any, ctx: PluginContext) -> bool:
+        """Return whether one discovered item proceeds."""
+        ...
+
+    def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo | None:
+        """Return the item's slot coordinate, or `None` to drop it."""
+        ...
+
+
 @runtime_checkable
 class _SparseWindowRefusal(Protocol):
     """Internal: a host that refuses a staged window covering a unit only partly."""
@@ -335,6 +380,7 @@ __all__ = [
     "PipelineResult",
     "PipelineRunState",
     "PluginContext",
+    "PreallocateHost",
     "RegionWriteStrategy",
     "RuntimeIngestContext",
     "SourceFile",

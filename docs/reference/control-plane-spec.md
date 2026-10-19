@@ -254,7 +254,15 @@ evaluated in this order:
 
 Refusals surface as documented control-plane errors, never as silent
 overwrites. Row 5 is the guard against pointing a changed declaration at an
-existing store; `firecube zarr index rebuild` is the explicit way through.
+existing store. Use the plugin that wrote the product, or a new target.
+`firecube zarr index rebuild` does not change this row.
+
+For row 4, restore `index/current.json`. Or remove the root attrs
+`firecube_resolved_index_identity_hash` and `firecube_resolved_index`, then
+run `firecube zarr index rebuild` with the plugin that wrote the data. For
+row 7, remove the root attr `firecube_resolved_index_identity_hash`, then run
+`firecube zarr index rebuild`. The command writes the attr again from the
+record. `rebuild` refuses both states while the attrs remain.
 
 ## Slot Index: `slot_index/current.json`
 

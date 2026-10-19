@@ -2023,5 +2023,7 @@ def check_legacy_index_record(
     raise LegacyIndexRecordError(
         f"Legacy index record detected at {legacy_path}. "
         f"Run `firecube zarr index rebuild --target {product_uri} --plugin {plugin_name} "
-        f"--product-name {product}` to migrate."
+        f"--product-name {product}` "
+        "(from Python: `firecube.ingestor.runtime.index_record.rebuild_index_record`) "
+        "to migrate."
     )

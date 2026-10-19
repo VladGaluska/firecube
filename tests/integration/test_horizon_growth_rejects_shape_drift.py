@@ -131,7 +131,8 @@ def test_setup_global_zarr_schema_rejects_existing_smaller_horizon(tmp_path: Pat
     message = str(exc_info.value)
     assert (
         message == "Schema drift for group data: existing array shape[0]=10 < global_expected=20. "
-        "Run `firecube zarr preallocate` first."
+        "Run `firecube zarr preallocate` (from Python: "
+        "`firecube.ingestor.runtime.preallocate.preallocate_product`) first."
     )
     arr = cast(Any, zarr.open_group(store=str(store_path), mode="r", zarr_format=3)["data/data"])
     assert arr.shape == (SMALL_HORIZON, 10)

@@ -20,13 +20,11 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Generator, Iterable, Iterator, Sequence
-from dataclasses import dataclass
-from typing import Any, cast
+from collections.abc import Generator, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 
-from firecube.cli import _slot_planning
 from firecube.cli._ctx import get_storage_config
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
 from firecube.cli._product import require_full_uri, resolve_product_identity
@@ -35,17 +33,6 @@ from firecube.cli._shared_options import (
     product_name_option,
     storage_driver_option,
     storage_type_option,
-)
-from firecube.cli._slot_planning import (
-    PLAN_SCHEMA_VERSION,
-    _chunk_aligned_remaining,
-    _complement_intervals,
-    _iter_partitions,
-    _merge_intervals,
-    _partition_count,
-    _query_slots_coverage,
-    _resolve_per_group_slot_sizes,
-    _smallest_executable_slot_size,
 )
 from firecube.cli._typed_options import TypedOptionsParam
 from firecube.cli._uri_policy import (
@@ -57,11 +44,24 @@ from firecube.cli.zarr._common import _configure_ingestor_for_cli
 from firecube.core.controlplane import ChunkManager
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
-from firecube.ingestor.api import ZarrGroupSpec
-from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.registry import loader as ingestor_loader
 from firecube.ingestor.registry.loader import discover_ingestors
+from firecube.ingestor.runtime import slot_plan
 from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
+
+if TYPE_CHECKING:
+    from firecube.core.config import StorageConfig
+    from firecube.ingestor.runtime.slot_plan import (
+        GroupSlotPlan,
+        SlotPlanBlockedError,
+        SlotPlanCeilingError,
+    )
+
+#: Plan JSON schema version. Independent of control-plane SCHEMA_VERSION.
+PLAN_SCHEMA_VERSION = "v1"
+
+#: Ranges in the whole plan, all groups, above which one stderr hint precedes the plan.
+PLAN_RANGE_HINT = 100_000
 
 
 def _warn_stderr(message: str) -> None:
@@ -194,7 +194,7 @@ Examples:
     is_flag=True,
     help=(
         f"Emit a plan with more ranges than the ceiling "
-        f"({_slot_planning.PLAN_RANGE_CEILING:,} ranges in the whole plan)."
+        f"({slot_plan.PLAN_RANGE_CEILING:,} ranges in the whole plan)."
     ),
 )
 @format_option(default="json")
@@ -290,143 +290,43 @@ def slots(
             run_id="zarr-slots",
         )
 
-    try:
-        from firecube.core.index_spec import AUTO, IrregularTimeAxis
-        from firecube.ingestor.api import BaseIngestor
-
-        index_spec = ingestor.index_spec(plugin_ctx)
-        if (
-            input_data is None
-            and index_spec is not None
-            and any(
-                isinstance(axis, IrregularTimeAxis) and axis.values is AUTO
-                for axis in index_spec.groups.values()
-            )
-            and type(ingestor).discover_source_files is BaseIngestor.discover_source_files
-        ):
-            raise click.ClickException(
-                f"Plugin '{plugin}' requires --input-data for AUTO discovery. "
-                "Pass --input-data <source> or override discover_source_files() in the plugin."
-            )
-        ingestor._bind_index_at_startup(plugin_ctx)
-        resolved_index = ingestor.resolved_index(plugin_ctx)
-    except click.ClickException:
-        raise
-    except Exception as exc:
-        raise click.ClickException(
-            f"Plugin '{plugin}' returned no index_spec. "
-            "See the plugin's documentation for parallel-write support."
-        ) from exc
-    current_record = chunk_manager.get_resolved_index(product=identity.product_name)
-    if current_record is not None and current_record.identity_hash != resolved_index.identity_hash:
-        _warn_stderr(
-            "Plugin resolved index differs from persisted record; "
-            "run `firecube zarr index rebuild` to reconcile."
+    def coverage_storage_config() -> StorageConfig:
+        # Built as before the move: no `anonymous` override, unlike `storage_config`.
+        return get_storage_config(
+            ctx,
+            overrides={
+                "storage_type": storage_type,
+                "storage_driver": resolved_storage_driver,
+            },
+            cache=False,
         )
-    elif (
-        current_record is None
-        and chunk_manager.get_slot_index_model(product=identity.product_name) is not None
-    ):
-        _warn_stderr(
-            "Legacy slot-index record detected without a resolved-index record; "
-            "run `firecube zarr index rebuild` to migrate."
-        )
-    global_schema = {group: resolved_index.size(group) for group in resolved_index.groups}
-    for group_name, expected in global_schema.items():
-        if expected <= 0:
-            raise click.ClickException(
-                f"Plugin '{plugin}' returned a non-positive count {expected} "
-                f"for group '{group_name}'. Expected positive integers only."
-            )
-
-    schema = ingestor.zarr_schema(plugin_ctx)
-    from firecube.ingestor.runtime.parallel_gate import validate_global_expected_subset_of_schema
 
     try:
-        validate_global_expected_subset_of_schema(global_schema, schema)
-    except ConfigurationError as exc:
+        plans = slot_plan.plan_slots(
+            ingestor=ingestor,
+            plugin_ctx=plugin_ctx,
+            plugin_name=plugin,
+            chunk_manager=chunk_manager,
+            identity=identity,
+            target=target,
+            storage_config=storage_config,
+            coverage_storage_config=coverage_storage_config,
+            input_data=input_data,
+            slot_size=slot_size,
+            resume=not no_resume,
+            allow_above_ceiling=yes_i_really_mean_it,
+            alignment_warnings=output_format != "json",
+            warn=_warn_stderr,
+        )
+    except slot_plan.SlotPlanBlockedError as exc:
+        raise click.ClickException(_blocked_refusal(exc)) from exc
+    except slot_plan.SlotPlanCeilingError as exc:
+        raise click.ClickException(_ceiling_refusal(exc)) from exc
+    except slot_plan.SlotPlanError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    from firecube.ingestor.runtime.parallel_gate import warn_on_chunk_alignment
-
-    if output_format == "json":
-        with _suppress_logger_warnings("firecube.ingestor.runtime.parallel_gate"):
-            warn_on_chunk_alignment(global_schema, schema)
-    else:
-        warn_on_chunk_alignment(global_schema, schema)
-
-    stored_units = _stored_time_units(
-        target,
-        storage_config,
-        schema,
-        time_coord_name=ingestor._resolve_time_dim_name(),
-    )
-    resolved_slot_sizes = _resolve_per_group_slot_sizes(
-        schema, slot_size, stored_units=stored_units
-    )
-
-    if no_resume:
-        coverage_by_group: dict[str, list[tuple[int, int]]] = {g: [] for g in global_schema}
-    else:
-        try:
-            coverage_by_group = _query_slots_coverage(
-                ctx,
-                target=target,
-                product_name=product_name,
-                storage_type=storage_type,
-                storage_driver=resolved_storage_driver,
-                groups=list(global_schema.keys()),
-            )
-        except Exception as exc:
-            raise click.ClickException(
-                f"firecube zarr slots: resume-aware coverage lookup failed ({exc}). "
-                f"Either fix the underlying failure or pass --no-resume to emit "
-                f"full ranges without coverage narrowing."
-            ) from exc
-
-    plans: list[_GroupPlan] = []
-    for group_name in sorted(global_schema.keys()):
-        total = int(global_schema[group_name])
-        covered = _merge_intervals(coverage_by_group.get(group_name, []))
-        remaining = _complement_intervals(covered, total)
-        group_slot_size = resolved_slot_sizes.get(group_name, total)
-        aligned_remaining, blocked_for_group = _chunk_aligned_remaining(
-            remaining, group_slot_size, total
-        )
-        plans.append(
-            _GroupPlan(
-                name=group_name,
-                total=total,
-                slot_size=group_slot_size,
-                covered=covered,
-                remaining=remaining,
-                aligned=aligned_remaining,
-                blocked=blocked_for_group,
-            )
-        )
-    groups_out = [plan.summary() for plan in plans]
-
-    blocked_groups = [
-        (group["name"], group["blocked_ranges"]) for group in groups_out if group["blocked_ranges"]
-    ]
-    if blocked_groups:
-        details = "; ".join(
-            f"group '{name}' has blocked ranges {ranges}" for name, ranges in blocked_groups
-        )
-        raise click.ClickException(
-            "firecube zarr slots: cannot emit executable slots — chunk-alignment coverage would silently drop work. "
-            f"Blocked: {details}. "
-            "Remediation: preview with "
-            "`firecube chunks delete-span --product-name <product-name> --run-id <id> --force --dry-run`, "
-            "then commit with `--yes-i-really-mean-it` and re-ingest using `firecube ingest ... --option force_reingest=true`. "
-            "See docs/operations/parallel-zarr-writes.md#recover-a-blocked-plan."
-        )
-
     range_count = sum(plan.range_count for plan in plans)
-    if range_count > _slot_planning.PLAN_RANGE_CEILING and not yes_i_really_mean_it:
-        units = _resolve_per_group_slot_sizes(schema, None, stored_units=stored_units)
-        raise click.ClickException(_ceiling_refusal(plans, range_count, units))
-    if range_count > _slot_planning.PLAN_RANGE_HINT:
+    if range_count > PLAN_RANGE_HINT:
         _warn_stderr(_range_hint(plans, range_count))
 
     header = {
@@ -437,106 +337,42 @@ def slots(
         "storage_driver": resolved_storage_driver,
         "write_mode": write_mode,
         "strategy": "indexed-region",
-        "groups": groups_out,
+        "groups": [_group_summary(plan) for plan in plans],
     }
     _emit_slots_output(header, plans, output_format)
 
 
-def _stored_time_units(
-    target: str,
-    storage_config: Any,
-    schema: Sequence[ZarrGroupSpec],
-    *,
-    time_coord_name: str,
-) -> dict[str, list[int]]:
-    """Return the stored chunk or shard time extent of each pod-written array the target has.
-
-    Existing pod-written arrays constrain the slot size by their stored chunk or shard,
-    the unit pod startup judges windows by. The target opens read-only and nothing is
-    created in it; a target without a root group, or without an array, adds no unit.
-    """
-    import zarr
-    from firecube.core.filesystem.ops import create_filesystem_for_uri
-    from firecube.core.filesystem.store_factory import create_zarr_store
-    from firecube.core.zarr.guard.engine_owned import is_pod_written_slot_array
-    from firecube.core.zarr.guard.unit_ownership import stored_write_unit
-
-    unreadable = f"firecube zarr slots: cannot read the layout of existing arrays in {target}"
-    units: dict[str, list[int]] = {}
-    try:
-        # Existence goes through the storage driver before any zarr store is built:
-        # building one can create the target, and only an absent root means no units.
-        fs, target_uri = create_filesystem_for_uri(target, storage_config, format="zarr")
-        if not fs.exists(target_uri.join("zarr.json")):
-            return units
-        handle = create_zarr_store(uri=target, storage_config=storage_config, mode="r")
-        root = cast(
-            Any,
-            zarr.open_group(
-                **handle.zarr_kwargs(), mode="r", zarr_format=3, use_consolidated=False
-            ),
-        )
-        for group_spec in schema:
-            for arr_spec in group_spec.arrays:
-                if not is_pod_written_slot_array(arr_spec, time_coord_name=time_coord_name):
-                    continue
-                path = f"{group_spec.group}/{arr_spec.name}"
-                # An absent array adds nothing; one that exists must parse, or the plan fails.
-                if not fs.exists(target_uri.join(*path.strip("/").split("/"), "zarr.json")):
-                    continue
-                arr = root[path]
-                if getattr(arr, "ndim", 0) == 0:
-                    continue
-                units.setdefault(group_spec.group, []).append(int(stored_write_unit(arr)[0][0]))
-    except Exception as exc:
-        raise click.ClickException(f"{unreadable} ({type(exc).__name__}: {exc}).") from exc
-    return units
+def _group_summary(plan: GroupSlotPlan) -> dict[str, Any]:
+    """Return the group's entry of the plan's `groups` list."""
+    owner = plan.static_owner
+    return {
+        "name": plan.name,
+        "total_slots": plan.total,
+        "slot_size": plan.slot_size,
+        "covered_ranges": [[s, e] for s, e in plan.covered],
+        "remaining_ranges": [[s, e] for s, e in plan.remaining],
+        "blocked_ranges": [[s, e] for s, e in plan.blocked],
+        "static_owner": None if owner is None else {"slot_start": owner[0], "slot_end": owner[1]},
+    }
 
 
-@dataclass(frozen=True)
-class _GroupPlan:
-    """One group's slot plan as intervals; its ranges are generated on demand, never stored."""
-
-    name: str
-    total: int
-    slot_size: int
-    covered: list[tuple[int, int]]
-    remaining: list[tuple[int, int]]
-    aligned: list[tuple[int, int]]
-    blocked: list[tuple[int, int]]
-
-    @property
-    def range_count(self) -> int:
-        """Return the number of ranges `ranges()` yields."""
-        return _partition_count(self.aligned, self.slot_size)
-
-    def ranges(self) -> Iterator[tuple[int, int]]:
-        """Yield the group's ranges in slot order, one at a time."""
-        return _iter_partitions(self.aligned, self.slot_size)
-
-    def summary(self) -> dict[str, Any]:
-        """Return the group's entry of the plan's `groups` list.
-
-        `static_owner` is the group's first range: the first slot_size piece of the first
-        aligned interval, the lowest range since aligned intervals are sorted.
-        """
-        static_owner = None
-        if self.aligned:
-            owner_start, interval_end = self.aligned[0]
-            owner_end = min(owner_start + self.slot_size, interval_end)
-            static_owner = {"slot_start": owner_start, "slot_end": owner_end}
-        return {
-            "name": self.name,
-            "total_slots": self.total,
-            "slot_size": self.slot_size,
-            "covered_ranges": [[s, e] for s, e in self.covered],
-            "remaining_ranges": [[s, e] for s, e in self.remaining],
-            "blocked_ranges": [[s, e] for s, e in self.blocked],
-            "static_owner": static_owner,
-        }
+def _blocked_refusal(exc: SlotPlanBlockedError) -> str:
+    """Build the refusal for a plan with blocked ranges, naming the recovery commands."""
+    details = "; ".join(
+        f"group '{name}' has blocked ranges {[[s, e] for s, e in intervals]}"
+        for name, intervals in exc.blocked.items()
+    )
+    return (
+        "firecube zarr slots: cannot emit executable slots — chunk-alignment coverage would silently drop work. "
+        f"Blocked: {details}. "
+        "Remediation: preview with "
+        "`firecube chunks delete-span --product-name <product-name> --run-id <id> --force --dry-run`, "
+        "then commit with `--yes-i-really-mean-it` and re-ingest using `firecube ingest ... --option force_reingest=true`. "
+        "See docs/operations/parallel-zarr-writes.md#recover-a-blocked-plan."
+    )
 
 
-def _group_counts(plans: Iterable[_GroupPlan]) -> str:
+def _group_counts(plans: Iterable[GroupSlotPlan]) -> str:
     """Describe each group's range count and slot size, for operator messages."""
     return "; ".join(
         f"group '{plan.name}': {plan.range_count} ranges at slot size {plan.slot_size}"
@@ -544,15 +380,10 @@ def _group_counts(plans: Iterable[_GroupPlan]) -> str:
     )
 
 
-def _ceiling_refusal(plans: list[_GroupPlan], range_count: int, units: dict[str, int]) -> str:
+def _ceiling_refusal(exc: SlotPlanCeilingError) -> str:
     """Build the refusal for a plan above the range ceiling, naming an executable size if any."""
-    ceiling = _slot_planning.PLAN_RANGE_CEILING
-    suggested = _smallest_executable_slot_size(
-        {plan.name: plan.remaining for plan in plans},
-        {plan.name: plan.total for plan in plans},
-        units,
-        ceiling,
-    )
+    plans, range_count, ceiling = exc.plans, exc.range_count, exc.ceiling
+    suggested = exc.suggested_slot_size
     if suggested is None:
         remedy = (
             f"No --slot-size gives an executable plan of at most {ceiling} ranges; "
@@ -569,7 +400,7 @@ def _ceiling_refusal(plans: list[_GroupPlan], range_count: int, units: dict[str,
     )
 
 
-def _range_hint(plans: list[_GroupPlan], range_count: int) -> str:
+def _range_hint(plans: list[GroupSlotPlan], range_count: int) -> str:
     """Build the one-line stderr hint for a plan above the range hint threshold."""
     return (
         f"firecube zarr slots: the plan has {range_count} ranges ({_group_counts(plans)}). "
@@ -594,7 +425,7 @@ def _echo_batched(pieces: Iterable[str]) -> None:
         click.echo("".join(batch), nl=False)
 
 
-def _json_pieces(header: dict[str, Any], plans: list[_GroupPlan]) -> Iterator[str]:
+def _json_pieces(header: dict[str, Any], plans: list[GroupSlotPlan]) -> Iterator[str]:
     """Yield the plan as JSON text, byte-identical to `json.dumps(plan, indent=2)` plus a newline.
 
     The header goes through `json.dumps` with an empty `ranges` list; each range is formatted
@@ -632,7 +463,9 @@ def _json_pieces(header: dict[str, Any], plans: list[_GroupPlan]) -> Iterator[st
     yield "[]\n}\n" if opener == "[" else "\n  ]\n}\n"
 
 
-def _emit_slots_output(header: dict[str, Any], plans: list[_GroupPlan], output_format: str) -> None:
+def _emit_slots_output(
+    header: dict[str, Any], plans: list[GroupSlotPlan], output_format: str
+) -> None:
     """Write the plan to stdout, generating each range as it is written.
 
     Raises:

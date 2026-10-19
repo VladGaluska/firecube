@@ -1364,7 +1364,8 @@ class RegionZarrWriter:
                     "must run first. Invoke: firecube zarr preallocate "
                     "<plugin> --target <uri> --product-name <name> "
                     "--write-mode <mode> --input-data <path> "
-                    "--slot-start=<n> --slot-end=<m>"
+                    "--slot-start=<n> --slot-end=<m> (from Python: "
+                    "firecube.ingestor.runtime.preallocate.preallocate_product)"
                 )
             if current_norm == incoming_norm:
                 return

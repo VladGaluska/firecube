@@ -164,7 +164,8 @@ class LegacyIndexRecordError(ResolvedIndexError):
     Raised at startup when the cube was previously written by a firecube
     version that predates the resolved-index record and the record has not
     yet been produced. The operator must migrate the cube by re-resolving the
-    index, typically via ``firecube zarr index rebuild``. Continuing silently would
+    index, typically via ``firecube zarr index rebuild`` (from Python:
+    ``firecube.ingestor.runtime.index_record.rebuild_index_record``). Continuing silently would
     let firecube stamp a fresh resolved-index record that could disagree with
     the legacy partitioning of already-written data.
     """

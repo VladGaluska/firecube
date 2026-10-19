@@ -53,7 +53,14 @@ import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
-from firecube.core.zarr._sealing_markers import ATTR_CONSOLIDATED_AT, ATTR_PREALLOCATED
+from firecube.core.config import StorageConfig
+from firecube.core.errors import ConfigurationError, SchemaDriftError
+from firecube.core.zarr._sealing_markers import (
+    ATTR_CONSOLIDATED_AT,
+    ATTR_COORD_MANAGED,
+    ATTR_PREALLOCATED,
+)
+from firecube.core.zarr.coord_consolidation import consolidate_time_coords
 
 pytestmark = pytest.mark.integration
 
@@ -310,3 +317,182 @@ def test_multi_group_cube_consolidates_every_group(tmp_path: Path) -> None:
         assert arr.attrs.get(ATTR_PREALLOCATED) is True
         assert arr.attrs.get(ATTR_CONSOLIDATED_AT) is not None
         assert _count_time_chunk_files(cube, group=group) == _EXPECTED_CHUNK_FILE_COUNT
+
+
+def _local_storage() -> StorageConfig:
+    return StorageConfig(storage_type="local", storage_driver="fsspec")
+
+
+def test_library_consolidation_reports_through_callable_not_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A live library run densifies the coordinate, keeps its values and prints nothing itself."""
+    cube = tmp_path / "cube.zarr"
+    _create_legacy_cube(cube)
+    before = np.asarray(_open_time_array(cube)[:])
+    lines: list[str] = []
+
+    summary = consolidate_time_coords(
+        target=f"file://{cube}",
+        product_name=cube.name,
+        storage_config=_local_storage(),
+        report=lines.append,
+    )
+
+    assert summary.consolidated_groups == ("data",)
+    arr = _open_time_array(cube)
+    assert tuple(arr.chunks) == (_EXPECTED_CHUNK_LEN,)
+    assert arr.attrs.get(ATTR_PREALLOCATED) is True
+    np.testing.assert_array_equal(np.asarray(arr[:]), before)
+    assert lines, "progress must reach the report callable"
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+
+
+def _snapshotted_cube(cube: Path) -> np.ndarray:
+    """Write a 4-slot ``data/time`` at ``chunks=(1,)`` under a root consolidated snapshot."""
+    root = zarr.open_group(store=str(cube), mode="w", zarr_format=3)
+    values = _EPOCH + np.arange(4, dtype=np.int64) * _CADENCE_NS
+    root.require_group("data").create_array(
+        "time", data=values, chunks=(1,), dimension_names=("time",)
+    )
+    zarr.consolidate_metadata(str(cube))
+    return values
+
+
+def _consolidate(cube: Path, **kwargs: Any) -> None:
+    consolidate_time_coords(
+        target=f"file://{cube}", product_name=cube.name, storage_config=_local_storage(), **kwargs
+    )
+
+
+def test_consolidation_keeps_root_consolidated_snapshot_readable(tmp_path: Path) -> None:
+    """A default (consolidated) reader reads the coordinate after a rewrite, not a stale snapshot."""
+    cube = tmp_path / "cube.zarr"
+    values = _snapshotted_cube(cube)
+
+    _consolidate(cube)
+
+    default_root = zarr.open_group(store=str(cube), mode="r")
+    assert default_root.metadata.consolidated_metadata is not None
+    coord = default_root["data/time"]
+    assert isinstance(coord, zarr.Array)
+    np.testing.assert_array_equal(np.asarray(coord[:]), values)
+
+
+def test_consolidation_heals_a_failed_snapshot_refresh_on_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two failed snapshot refreshes must not let the third run report healed over a stale snapshot."""
+    from firecube.core.zarr import coord_consolidation
+
+    cube = tmp_path / "cube.zarr"
+    values = _snapshotted_cube(cube)
+    real_refresh = coord_consolidation._refresh_consolidated_metadata
+    calls: list[int] = []
+
+    def _flaky_refresh(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) <= 2:
+            raise OSError("injected refresh failure")
+        return real_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(coord_consolidation, "_refresh_consolidated_metadata", _flaky_refresh)
+    sinks: list[list[str]] = [[], [], []]
+    for sink in sinks[:2]:
+        with pytest.raises(OSError, match="injected refresh failure"):
+            _consolidate(cube, report=sink.append)
+    _consolidate(cube, report=sinks[2].append)
+
+    assert not [ln for sink in sinks[:2] for ln in sink if "backfilled consolidated WAL" in ln]
+    assert sum("backfilled consolidated WAL event" in ln for ln in sinks[2]) == 1
+    default_root = zarr.open_group(store=str(cube), mode="r")
+    coord = default_root["data/time"]
+    assert isinstance(coord, zarr.Array)
+    assert tuple(coord.chunks) == (4,)
+    np.testing.assert_array_equal(np.asarray(coord[:]), values)
+
+
+def test_failed_backfill_record_does_not_report_the_backfill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backfill whose WAL event fails to record must not be reported as backfilled."""
+    from firecube.core.controlplane.manager import ChunkManager
+    from firecube.core.zarr import coord_consolidation as cc
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError("injected failure")
+
+    cube, lines = tmp_path / "cube.zarr", []
+    _snapshotted_cube(cube)
+    monkeypatch.setattr(cc, "_refresh_consolidated_metadata", _boom)
+    with pytest.raises(OSError, match="injected"):
+        _consolidate(cube)
+    monkeypatch.undo()
+    monkeypatch.setattr(ChunkManager, "record_time_coord_consolidation", _boom)
+    with pytest.raises(OSError, match="injected"):
+        _consolidate(cube, report=lines.append)
+    assert not [ln for ln in lines if "backfilled consolidated WAL" in ln]
+
+
+def test_library_dry_run_on_drifted_cube_reports_blocked_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A dry run counts a drifted group as blocked and leaves every store byte alone."""
+    cube = tmp_path / "cube.zarr"
+    _create_legacy_cube(cube)
+    _write_drifted_reference(cube, size=_LEGACY_SLOTS)
+    before = _md5_of_files(cube)
+
+    summary = consolidate_time_coords(
+        target=f"file://{cube}",
+        product_name=cube.name,
+        storage_config=_local_storage(),
+        dry_run=True,
+    )
+
+    assert summary.blocked_by_drift == 1
+    assert summary.consolidated_groups == ()
+    assert _md5_of_files(cube) == before
+
+
+def test_library_refuses_s3_before_opening_any_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An s3 storage config raises ConfigurationError before the store factory is called."""
+
+    def _boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("store must not be opened for s3")
+
+    monkeypatch.setattr("firecube.core.filesystem.store_factory.create_zarr_store", _boom)
+
+    with pytest.raises(ConfigurationError, match="s3"):
+        consolidate_time_coords(
+            target="s3://example-bucket/cube.zarr",
+            product_name="cube.zarr",
+            storage_config=StorageConfig(storage_type="s3", storage_driver="fsspec"),
+        )
+
+
+def test_library_refuses_marker_hidden_by_subgroup_consolidated_snapshot(tmp_path: Path) -> None:
+    """A stale consolidated snapshot on a subgroup must not hide a live coord-managed marker."""
+    cube = tmp_path / "cube.zarr"
+    _create_legacy_cube(cube)
+    # The snapshot lives on the subgroup, taken before the marker exists; the root has none.
+    zarr.consolidate_metadata(str(cube), path="data")
+    writable = zarr.open_group(store=str(cube), mode="r+", zarr_format=3, use_consolidated=False)
+    writable["data/time"].attrs[ATTR_COORD_MANAGED] = True
+    before = np.asarray(_open_time_array(cube)[:])
+
+    with pytest.raises(SchemaDriftError):
+        consolidate_time_coords(
+            target=f"file://{cube}",
+            product_name=cube.name,
+            storage_config=_local_storage(),
+        )
+
+    arr = _open_time_array(cube)
+    assert arr.attrs.get(ATTR_COORD_MANAGED) is True
+    assert ATTR_PREALLOCATED not in arr.attrs
+    assert tuple(arr.chunks) == (1,)
+    np.testing.assert_array_equal(np.asarray(arr[:]), before)

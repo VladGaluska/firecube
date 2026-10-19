@@ -433,7 +433,8 @@ def _setup_global_zarr_schema(
                                 ):
                                     raise SchemaSizeMismatchError(
                                         f"Schema drift for group {group_name}: existing array shape[0]={arr.shape[0]} "
-                                        f"< global_expected={expected_time_count}. Run `firecube zarr preallocate` first."
+                                        f"< global_expected={expected_time_count}. Run `firecube zarr preallocate` "
+                                        "(from Python: `firecube.ingestor.runtime.preallocate.preallocate_product`) first."
                                     ) from exc
                                 raise
                     writer.set_group_attrs(

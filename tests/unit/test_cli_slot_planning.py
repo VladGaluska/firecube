@@ -15,21 +15,21 @@
 """Tests for extracted slot-planning helpers.
 
 Mirrors the existing test_plan_*.py tests but imports from the new
-_slot_planning module directly (not through plan.py re-exports).
+core.zarr.planning module directly (not through plan.py re-exports).
 """
 
 from pathlib import Path
 from typing import Any
 
-import click
 import numpy as np
 import pytest
 
-from firecube.cli import _slot_planning
-from firecube.cli._slot_planning import (
-    PLAN_SCHEMA_VERSION,
-    _chunk_aligned_remaining,
-    _resolve_per_group_slot_sizes,
+from firecube.cli.zarr._slots import PLAN_SCHEMA_VERSION
+from firecube.core.errors import ConfigurationError
+from firecube.core.zarr import planning
+from firecube.core.zarr.planning import (
+    chunk_aligned_remaining,
+    resolve_per_group_slot_sizes,
 )
 from tests.helpers.rows import table_row
 
@@ -60,7 +60,7 @@ def test_chunk_aligned_remaining(subtests: Any, tmp_path: Path) -> None:
     )
     for row_id, intervals, slot_size, total, expected_aligned, expected_blocked in rows:
         with table_row(subtests, row_id, tmp_path):
-            aligned, blocked = _chunk_aligned_remaining(intervals, slot_size=slot_size, total=total)
+            aligned, blocked = chunk_aligned_remaining(intervals, slot_size=slot_size, total=total)
             assert aligned == expected_aligned
             assert blocked == expected_blocked
 
@@ -77,12 +77,12 @@ def test_resolve_per_group_slot_sizes_explicit() -> None:
             ],
         )
     ]
-    result = _resolve_per_group_slot_sizes(schema, explicit=200)
+    result = resolve_per_group_slot_sizes(schema, explicit=200)
     assert result == {"group1": 200}
 
 
 def test_resolve_per_group_slot_sizes_invalid_explicit() -> None:
-    """Explicit size not divisible by group LCM should raise ClickException."""
+    """Explicit size not divisible by group LCM should raise ConfigurationError."""
     from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 
     schema = [
@@ -93,8 +93,8 @@ def test_resolve_per_group_slot_sizes_invalid_explicit() -> None:
             ],
         )
     ]
-    with pytest.raises(click.ClickException):
-        _resolve_per_group_slot_sizes(schema, explicit=75)  # 75 not divisible by 100
+    with pytest.raises(ConfigurationError):
+        resolve_per_group_slot_sizes(schema, explicit=75)  # 75 not divisible by 100
 
 
 def test_resolve_per_group_slot_sizes_auto() -> None:
@@ -110,7 +110,7 @@ def test_resolve_per_group_slot_sizes_auto() -> None:
             ],
         )
     ]
-    result = _resolve_per_group_slot_sizes(schema, explicit=None)
+    result = resolve_per_group_slot_sizes(schema, explicit=None)
     assert result["g1"] == 200  # LCM(100, 200)
 
 
@@ -129,6 +129,6 @@ def test_resolve_per_group_slot_sizes_auto() -> None:
 def test_smallest_executable_slot_size(
     remaining: list[tuple[int, int]], total: int, unit: int, ceiling: int, expected: int | None
 ) -> None:
-    helper = getattr(_slot_planning, "_smallest_executable_slot_size", None)
-    assert helper is not None, "_smallest_executable_slot_size is not defined"
+    helper = getattr(planning, "smallest_executable_slot_size", None)
+    assert helper is not None, "smallest_executable_slot_size is not defined"
     assert helper({"g": remaining}, {"g": total}, {"g": unit}, ceiling) == expected

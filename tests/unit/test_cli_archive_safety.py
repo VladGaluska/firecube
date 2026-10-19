@@ -136,6 +136,26 @@ def test_info_reports_archive_version_in_json(tmp_path, monkeypatch: pytest.Monk
     assert payload["format"] == "v1"
 
 
+@pytest.mark.contract
+def test_list_prints_earlier_messages_before_a_late_decode_failure(tmp_path, monkeypatch):
+    def decode(self, index):
+        if index:
+            raise ValueError("late decode failure")
+        return _FakeTensogramMetadata()
+
+    _install_fake_tensogram(monkeypatch)
+    monkeypatch.setattr(_FakeTensogramArchive, "message_count", lambda self: 2)
+    monkeypatch.setattr(_FakeTensogramArchive, "file_decode_metadata", decode)
+    archive = tmp_path / "archive.tgm"
+    archive.write_bytes(b"fake")
+    result = CliRunner().invoke(cli, ["archive", "list", "--archive", archive.as_uri()])
+    assert (result.exit_code, str(result.exception)) == (1, "late decode failure")
+    assert result.stdout == (
+        "Messages: 2\n\nGroup: F024\n  Source:  file:///tmp/product.zarr\n"
+        "  Codec:   zstd\n  Objects: 0\n"
+    )
+
+
 def test_create_overwrite_non_tty_without_yes_exits_nonzero(tmp_path):
     src = tmp_path / "src.zarr"
     src.mkdir()

@@ -58,6 +58,9 @@ PREALLOCATE_COMMAND = (
 )
 """Recovery command named by every refusal about unmaterialized values."""
 
+PREALLOCATE_FUNCTION = "firecube.ingestor.runtime.preallocate.preallocate_product"
+"""Python entry point named beside the recovery command (a string: core imports no ingestor)."""
+
 
 def is_engine_owned_spec(arr_spec: Any) -> bool:
     """Return True when *arr_spec* is declared ``engine_owned=True``.
@@ -506,7 +509,7 @@ def require_engine_owned_materialized(root: Any | None, array_paths: Sequence[st
         raise ConfigurationError(
             f"engine-owned arrays {missing} are not materialized in the target (absent, or "
             f"a preallocate did not finish); pods only verify them. Write them first "
-            f"with: {PREALLOCATE_COMMAND}"
+            f"with: {PREALLOCATE_COMMAND} (from Python: {PREALLOCATE_FUNCTION})"
         )
 
 
@@ -556,7 +559,7 @@ def _slot_holds_no_value(array_path: str, slot: int) -> SchemaDriftError:
     return SchemaDriftError(
         f"engine-owned array {array_path!r} slot {slot} holds no value: "
         f"preallocate saw no source item for it. Re-run {PREALLOCATE_COMMAND} "
-        "with inputs that include this slot."
+        f"(from Python: {PREALLOCATE_FUNCTION}) with inputs that include this slot."
     )
 
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from enum import Enum, auto
 from typing import Any
 
@@ -47,7 +48,11 @@ from firecube.ingestor.config.engine import (
 )
 from firecube.ingestor.templates.config import TemplateConfig
 from firecube.ingestor.types.config import PluginConfig
-from firecube.ingestor.types.context import IngestContext
+from firecube.ingestor.types.context import (
+    IngestContext,
+    PluginContext,
+    RuntimeIngestContext,
+)
 
 
 class ExecutionMode(Enum):
@@ -139,6 +144,67 @@ class TierConfigurator:
         )
 
         return engine_config, template_config, plugin_config
+
+
+def configure_ingestor(
+    ingestor: Any,
+    *,
+    target: str,
+    options: Mapping[str, object],
+    run_id: str,
+    source: str = "",
+    storage: Any = None,
+    input_filters: list[str] | None = None,
+) -> PluginContext:
+    """Configure an ingestor without the CLI and return its plugin context.
+
+    Run this before ``preallocate_product`` or ``plan_slots``. It splits
+    ``options`` into tiers, assigns the three configs to ``ingestor``, and returns the context.
+
+    Args:
+        ingestor: Ingestor instance. It receives ``engine_config``,
+            ``template_config`` and ``plugin_config``.
+        target: Product URI the operation writes to.
+        options: Already-typed option values, keyed by option name. The mapping is not mutated.
+        run_id: Run identifier recorded in the context.
+        source: Source URI. Empty when the operation reads no source.
+        storage: Storage context passed through unchanged; ``None`` leaves storage unbound.
+        input_filters: Input filter patterns added to ``options`` when given.
+
+    Returns:
+        The plugin context built for the configured ingestor.
+
+    Raises:
+        ValueError: If ``options`` holds a key no tier owns.
+        click.UsageError: If ``options`` holds the removed ``output_name`` key.
+    """
+    resolved_options = dict(options)
+    if input_filters is not None:
+        resolved_options["input_filters"] = input_filters
+    ingest_ctx = IngestContext(
+        source=source,
+        target=target,
+        in_memory=True,
+        output_format="zarr",
+        options=resolved_options,
+        storage=storage,
+        run_id=run_id,
+    )
+    runtime_ctx = RuntimeIngestContext.from_ingest_context(
+        ingest_ctx,
+        run_id=run_id,
+        temp_root=None,
+        materializer=None,
+    )
+    configurator = TierConfigurator(
+        ingestor.template_config_class,
+        ingestor.plugin_config_class,
+        plugin_name=ingestor.name,
+    )
+    ingestor.engine_config, ingestor.template_config, ingestor.plugin_config = (
+        configurator.configure(runtime_ctx)
+    )
+    return PluginContext(runtime_ctx)
 
 
 def determine_execution_mode(engine_config: EngineConfig) -> ExecutionMode:

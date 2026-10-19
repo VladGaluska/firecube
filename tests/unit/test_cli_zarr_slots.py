@@ -29,6 +29,8 @@ import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
+from firecube.core.config import StorageConfig
+from firecube.core.controlplane import ChunkManager
 from firecube.core.index_spec import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.api import (
     DirectZarrIngestor,
@@ -41,7 +43,16 @@ from firecube.ingestor.api import (
     register_ingestor,
 )
 from firecube.ingestor.registry import loader
+from firecube.ingestor.runtime import slot_plan
+from firecube.ingestor.runtime.configure import configure_ingestor
+from firecube.ingestor.runtime.slot_plan import (
+    GroupSlotPlan,
+    SlotPlanBlockedError,
+    SlotPlanCeilingError,
+    plan_slots,
+)
 from tests.helpers.rows import table_row
+from tests.helpers.storage import make_test_binding
 
 
 def _cli_index_spec(size: int) -> IndexSpec:
@@ -510,7 +521,7 @@ def test_zarr_slots_streams_large_plan_in_bounded_memory(
 def test_zarr_slots_refuses_plan_above_range_ceiling_unless_confirmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("firecube.cli._slot_planning.PLAN_RANGE_CEILING", 10, raising=False)
+    monkeypatch.setattr("firecube.ingestor.runtime.slot_plan.PLAN_RANGE_CEILING", 10, raising=False)
     _register_sized_plugin("slots_test_ceiling", 11)
     args = [*_required_args(tmp_path, "slots_test_ceiling"), "--no-resume"]
 
@@ -527,7 +538,7 @@ def test_zarr_slots_refuses_plan_above_range_ceiling_unless_confirmed(
 def test_zarr_slots_hints_on_stderr_above_range_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr("firecube.cli._slot_planning.PLAN_RANGE_HINT", 5, raising=False)
+    monkeypatch.setattr("firecube.cli.zarr._slots.PLAN_RANGE_HINT", 5, raising=False)
     _register_sized_plugin("slots_test_hint", 11, chunks=None)
 
     result = CliRunner().invoke(cli, _required_args(tmp_path, "slots_test_hint"))
@@ -559,3 +570,103 @@ def test_zarr_slots_aligns_to_stored_units_of_existing_arrays(
     assert (plan["groups"][0]["slot_size"], len(plan["ranges"])) == (250, 4)
     assert refused.exit_code != 0
     assert "250" in refused.output
+
+
+def _plan_in_python(tmp_path: Path, groups: dict[str, tuple[int, int]], **kwargs: Any) -> Any:
+    """Plan `groups` (name -> (slots, time chunk)) the way a Python caller does, without Click."""
+    schema = [
+        ZarrGroupSpec(
+            group=name,
+            arrays=[
+                ZarrArraySpec(name="data", chunks=(chunk, 10), shape=(n, 10), dtype=np.float32)
+            ],
+        )
+        for name, (n, chunk) in groups.items()
+    ]
+    spec = IndexSpec(
+        name="plan_slots_test_v1",
+        groups={
+            name: RegularTimeAxis(
+                coordinate="timestamp",
+                epoch="2026-01-01T00:00:00Z",
+                cadence_s=1,
+                mode="exact",
+                slot_count=n,
+            )
+            for name, (n, _) in groups.items()
+        },
+    )
+    members = {
+        "PRODUCT_NAME": "plan_slots_product",
+        "index_spec": lambda self, ctx: spec,
+        "zarr_schema": lambda self, ctx: schema,
+    }
+    binding = make_test_binding(tmp_path, product="x.zarr")
+    manager = ChunkManager(binding=binding, workspace=tmp_path)
+    ingestor = type("PlanSlotsPlugin", (_SlotsCapablePlugin,), members)(chunk_manager=manager)
+    target = (tmp_path / "x.zarr").as_uri()
+    ctx = configure_ingestor(ingestor, target=target, options={}, run_id="run-1")
+    return plan_slots(
+        ingestor=ingestor,
+        plugin_ctx=ctx,
+        plugin_name="plan_slots_test",
+        chunk_manager=manager,
+        identity=binding.identity,
+        target=target,
+        storage_config=StorageConfig(storage_type="local"),
+        coverage_storage_config=lambda: StorageConfig(storage_type="local"),
+        **kwargs,
+    )
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_plan_slots_fresh_target_gives_lazy_plan_per_group(tmp_path: Path) -> None:
+    plans = _plan_in_python(tmp_path, {"b": (300, 100), "a": (1000, 100)}, resume=False)
+
+    assert [type(p) for p in plans] == [GroupSlotPlan, GroupSlotPlan]
+    assert [p.name for p in plans] == ["a", "b"]
+    ranges = plans[0].ranges()
+    assert iter(ranges) is ranges
+    assert next(ranges) == (0, 100)
+    assert [(p.range_count, len(list(p.ranges()))) for p in plans] == [(10, 10), (3, 3)]
+
+    (big,) = _plan_in_python(tmp_path, {"data": (200_000, 1)}, resume=False)
+    tracemalloc.start()
+    try:
+        count = big.range_count
+        first = next(big.ranges())
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert (count, first) == (200_000, (0, 1))
+    assert peak < 256 * 1024
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_plan_slots_refuses_blocked_work_with_its_intervals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(slot_plan, "_query_slots_coverage", lambda **kw: {"a": [(0, 73)], "b": []})
+
+    with pytest.raises(SlotPlanBlockedError) as refused:
+        _plan_in_python(tmp_path, {"a": (1000, 100), "b": (300, 100)})
+
+    assert refused.value.blocked == {"a": [(73, 100)]}
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_plan_slots_refuses_plan_above_ceiling_unless_overridden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(slot_plan, "PLAN_RANGE_CEILING", 10)
+
+    with pytest.raises(SlotPlanCeilingError) as refused:
+        _plan_in_python(tmp_path, {"data": (11, 1)}, resume=False)
+    plans = _plan_in_python(tmp_path, {"data": (11, 1)}, resume=False, allow_above_ceiling=True)
+
+    assert (refused.value.range_count, refused.value.suggested_slot_size) == (11, 2)
+    assert [p.range_count for p in plans] == [11]

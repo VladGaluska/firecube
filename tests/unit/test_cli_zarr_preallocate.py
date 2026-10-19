@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Iterator
+import json
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import pytest
@@ -25,8 +26,25 @@ import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
-from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
+from firecube.core.api import IndexSpec, ItemInfo, RegularTimeAxis, ResolvedIndex
+from firecube.core.controlplane import ChunkManager
+from firecube.core.product.resolver import ProductResolver
+from firecube.core.runtime import resolve_storage_config
+from firecube.core.storage.binding import StorageBinding
+from firecube.core.storage.driver_config import StorageDriverConfig
+from firecube.core.storage.session import StorageSession
+from firecube.ingestor.api import ConfigurationError, ZarrArraySpec, ZarrGroupSpec
+from firecube.ingestor.contracts.interfaces import PreallocateHost
 from firecube.ingestor.registry import loader as _loader
+from firecube.ingestor.runtime.configure import configure_ingestor
+from firecube.ingestor.runtime.preallocate import (
+    PreallocateDryRunGroup,
+    SlotWindowError,
+    preallocate_product,
+)
+from firecube.ingestor.templates.config import TemplateConfig
+from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
+from firecube.ingestor.types.context import PluginContext
 from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
@@ -216,3 +234,156 @@ def test_preallocate_mismatched_existing_array_errors(subtests: Any, tmp_path: P
             assert result.exit_code != 0, result.output
             for part in (*parts, "expected", "found"):
                 assert part in result.output
+
+
+def _preallocate_as_a_python_caller(
+    target_path: Path, host: Callable[[Any], PreallocateHost] | None = None, **kwargs: Any
+) -> None:
+    """Run ``preallocate_product`` with no Click: configure, bind, call, close."""
+    import direct_zarr_capable_test_plugin as plugin_module
+
+    uri = f"file://{target_path}"
+    storage_config = resolve_storage_config(
+        config_file=None,
+        overrides={"storage_type": "local", "storage_driver": "fsspec"},
+        set_global=False,
+    )
+    identity = ProductResolver.resolve(uri, format="zarr", product_name="python_caller_product")
+    binding = StorageBinding(
+        identity=identity, driver=StorageDriverConfig.from_storage_config(storage_config)
+    )
+    chunk_manager = ChunkManager(binding=binding)
+    try:
+        ingestor = plugin_module.DirectZarrCapableTestIngestor(chunk_manager=chunk_manager)
+        assert isinstance(ingestor, DirectZarrIngestor)
+        plugin_ctx = configure_ingestor(ingestor, target=uri, options={}, run_id="py-caller")
+        preallocate_product(
+            ingestor=ingestor if host is None else host(ingestor),
+            plugin_ctx=plugin_ctx,
+            plugin_name="direct_zarr_capable_test_plugin",
+            chunk_manager=chunk_manager,
+            session=StorageSession(binding),
+            storage_config=storage_config,
+            run_id="py-caller",
+            write_mode="direct",
+            **kwargs,
+        )
+    finally:
+        chunk_manager.close()
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_preallocate_product_reports_through_callbacks_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import direct_zarr_capable_test_plugin as plugin_module
+
+    cls = plugin_module.DirectZarrCapableTestIngestor
+    bounded = cls.index_spec
+    unbounded = RegularTimeAxis(coordinate="timestamp", epoch="2024-01-01T00:00:00Z", cadence_s=1)
+
+    def mixed_index(self: Any, ctx: Any) -> IndexSpec:
+        spec = bounded(self, ctx)
+        return IndexSpec(name=spec.name, groups={**spec.groups, "open_ended": unbounded})
+
+    monkeypatch.setattr(cls, "index_spec", mixed_index)
+    target_path = tmp_path / "out.zarr"
+    reported: list[str] = []
+    warned: list[str] = []
+
+    _preallocate_as_a_python_caller(target_path, report=reported.append, warn=warned.append)
+
+    root = zarr.open_group(store=str(target_path), mode="r", zarr_format=3)
+    assert cast(Any, root["data/data"]).shape == (1000, 10)
+    assert cast(Any, root["data/lat"]).shape == (10,)
+    summary = json.loads(reported[-1])
+    assert (summary["status"], summary["groups"]) == ("ok", {"data": 1000})
+    assert len(warned) == 1 and "skipping unbounded group 'open_ended'" in warned[0]
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_preallocate_product_dry_run_previews_each_group_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "out.zarr"
+    previews: list[PreallocateDryRunGroup] = []
+    reported: list[str] = []
+
+    _preallocate_as_a_python_caller(
+        target_path,
+        dry_run=True,
+        slot_start=0,
+        slot_end=500,
+        on_dry_run_group=previews.append,
+        report=reported.append,
+    )
+
+    assert json.loads(reported[0])["recorded_by_run_id"] == "dry-run"
+    assert not (target_path / "data").exists()
+    assert [(p.group, p.window) for p in previews] == [("data", (0, 500))]
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_preallocate_product_runs_on_a_host_that_only_has_the_protocol_members(
+    tmp_path: Path,
+) -> None:
+    import direct_zarr_capable_test_plugin as plugin_module
+
+    class ForwardingHost:
+        """Forwards exactly the nine `PreallocateHost` members and nothing else."""
+
+        time_dim_name: ClassVar[str] = plugin_module.DirectZarrCapableTestIngestor.time_dim_name
+
+        def __init__(self, plugin: Any) -> None:
+            self._plugin = plugin
+            self.template_config: TemplateConfig | None = plugin.template_config
+
+        def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+            return self._plugin.zarr_schema(ctx)
+
+        def index_spec(self, ctx: PluginContext) -> IndexSpec | None:
+            return self._plugin.index_spec(ctx)
+
+        def resolved_index(self, ctx: PluginContext) -> ResolvedIndex:
+            return self._plugin.resolved_index(ctx)
+
+        def bind_index_at_startup(self, ctx: PluginContext) -> None:
+            self._plugin.bind_index_at_startup(ctx)
+
+        def discover_source_files(self, ctx: PluginContext) -> Iterable[Any]:
+            return self._plugin.discover_source_files(ctx)
+
+        def filter_item(self, item: Any, ctx: PluginContext) -> bool:
+            return self._plugin.filter_item(item, ctx)
+
+        def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo | None:
+            return self._plugin.inspect_item(item, ctx)
+
+    as_host: Callable[[Any], PreallocateHost] = ForwardingHost
+    previews: list[PreallocateDryRunGroup] = []
+
+    _preallocate_as_a_python_caller(
+        tmp_path / "out.zarr", host=as_host, dry_run=True, on_dry_run_group=previews.append
+    )
+
+    assert [p.group for p in previews] == ["data"]
+
+
+@pytest.mark.contract
+@pytest.mark.integration
+def test_preallocate_product_refuses_window_beyond_extent_before_creating_arrays(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "out.zarr"
+
+    with pytest.raises(SlotWindowError) as excinfo:
+        _preallocate_as_a_python_caller(target_path, slot_start=0, slot_end=1001)
+
+    assert isinstance(excinfo.value, ConfigurationError)
+    assert "1001" in str(excinfo.value) and "1000" in str(excinfo.value)
+    assert not (target_path / "data").exists()

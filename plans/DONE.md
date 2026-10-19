@@ -1,5 +1,135 @@
 # Done
 
+## 2026-10-19 — The archive lifecycle runs below the CLI; recovery advice that works; a backfill is reported once recorded (fix/parallel-chunk-ownership)
+
+**Decision.** Two commits, each revertable alone, nothing pushed. The new modules are internal and importable (no facade export, no reference page), as `index_record` is. AB changes no behaviour; C changes text and one output point.
+
+- `0ada39b` `refactor(archive): move lifecycle and inspection below the CLI` (AB). `src/firecube/cli/archive.py` became the package `src/firecube/cli/archive/` (`__init__.py`, `_common.py`, `_create.py`, `_restore.py`, `_inspect.py`; 59, 52, 260, 190 and 267 lines). `create_archive`, `restore_archive`, `ArchiveCreateResult`, `ArchiveRestoreResult`, `ArchiveClaimError`, `ArchiveConversionError` and `ArchiveRecordError` live in `src/firecube/ingestor/runtime/archive.py`. `tgm_info`, `open_tgm_listing`, `validate_tgm`, `TgmValidation` and `TensogramArchiveError` live in `src/firecube/core/tensogram/inspection.py`. The two `UNTIL archive-lifecycle` rows left `tests/architecture/test_cli_boundary.py`.
+- C, `fix(index): recovery advice that works; report a backfill once recorded`, hash pending (not landed when this entry was written). `firecube zarr index verify` and `firecube zarr slots` give a recovery that was run for the three states whose advice named `firecube zarr index rebuild`, which refuses them. `consolidate_time_coords` reports a backfilled consolidated WAL event after `record_time_coord_consolidation` succeeds for it, not before.
+
+**Decision.** Choices inside the plan (P8 to P11).
+
+- P8: the remote-artifact branches of the old `create` and `restore` (temporary paths and transfers) were unreachable and were dropped. They sat behind `StorageUri.from_local_path(...).is_remote()`, and `from_local_path` always yields protocol `file`.
+- P9: kept as they were and recorded in `plans/TODO.md`. Create's `manager.close()` is unguarded and can replace a pending error (restore guards it). A refused restore claim records the run started and failed. Admission is list-then-claim.
+- P10: `archive list` on a `.tgm` keeps its interleaving. `open_tgm_listing` is a context manager whose listing decodes each message's metadata as the command iterates and its objects when asked, so a late decode failure leaves the lines before it on stdout. `tests/unit/test_cli_archive_safety.py` pins it; the pin failed on a planted eager listing.
+- P11: `IndexRebuildResult` stays as `rebuild_index_record`'s return value for Python callers (`tests/integration/test_cli_index_rebuild.py` reads it). Rendering the CLI from it would print the two stdout lines after the terminal record, which the ordering test pins.
+- Start-up: exactly four new modules at `import firecube.cli.main` (`firecube.cli.archive._common`, `._create`, `._restore`, `._inspect`), accepted by Neo (D3).
+- The five command decorators changed from `@archive.command(` to `@click.command(` with the same arguments, because the group imports the commands; the other order is circular.
+
+**Coverage.**
+
+- The replay compares CLI output, streams, exit codes and log records of every CliRunner call; it does not capture persisted run records or WAL events, which the existing tests hold.
+- Replay (ran): 618 recorded CLI calls against the `27b02ea` baseline. AB: 0 problems. C: 0 problems with the allowances, which are four stdout records where the backfill line moved (c1), two sentence swaps (the old and the new advice text, n1), and two rules Neo waived on 2026-10-19. The run-id rule covers only `tests/integration/test_archive_restore_audit.py::test_successful_restore_appears_in_chunks_runs_list_cli`, call 1, stdout. The group-order rule covers only `tests/integration/test_tensogram_archive.py::test_multigroup_archive_restore_cycle`, calls 0 and 1, stdout and stderr. The differ was checked by seven planted changes (create, restore stream, info, validate, list, restore warning, claim refusal text), each of which it reported; a wrong-field allowance still differed, a right-field one did not, and the control did not.
+- Start-up (ran): `bash EV/recorder/startup_check.sh EV/startup-new.txt` exits 0 on AB's tree, so the only added modules are the four above.
+- Tests added since `27b02ea`: 350 lines of the 350 budget (AB 250, C 100). Reproductions failed before each fix: the two backfill cases (`tests/integration/test_consolidate_time_coord_command.py`) and the advice tests of `test_cli_index_verify.py` and `test_direct_zarr_resolved_index.py`. The recovery steps in the advice were run on scratch products and each ended in VERIFIED.
+
+**Findings.**
+
+- The library raises two `ValueError`s the commands cannot reach and no test pins: an unknown `archive_format`, and a zip archive in `create_archive` given `group`, `start_date`, `end_date` or `variables`.
+- The converters now resolve at call time inside the library functions, after the CLI has built the session. Tests that patch them on their modules keep working.
+- `zarr index rebuild` prints a raw `ManifestError` traceback in the attrs-without-record and attrs-drift states (`plans/DONE.md` 2026-10-18 already noted the raw propagation). Out of scope here; open in `plans/TODO.md`.
+- `docs/operations/firecube-index.md` (the `rebuild` section and the table row for a missing or corrupted record) still says `rebuild` recovers a corrupted or foreign-format record, which `ChunkManager._apply_resolved_index_precedence` (`manager.py:1341`) and `ResolvedIndexRecord.from_json_bytes` (`types.py:665-712`) refuse. Open in `plans/TODO.md` for the scribe.
+- The consolidated-metadata sweep (D1) is its own plan, next after this one; the full list of default opens is in `plans/TODO.md`.
+
+## 2026-10-18 — CLI boundary gate; index rebuild and verify, and time-coordinate consolidation run below the CLI (fix/parallel-chunk-ownership)
+
+**Decision.** A tagged architecture gate pins the CLI-boundary debt row by row, and three operations leave Click. Four groups of work on the branch (three committed, the fourth still uncommitted when this entry was written), nothing pushed, each new module internal and importable (no facade export, no reference page), as `coord_materialization` is. Behaviour-preserving except the one text change named below.
+
+- `6d887f0` `tests/architecture/test_cli_boundary.py`. Six tests: no Click outside `cli/`, no `firecube.cli` import outside `cli/`, no CLI command or flag text in the strings that raise or log in `core/` and `ingestor/`, no private `core` or `ingestor` module imported by `cli/`, a 500-line ceiling per `cli/` module, and well-formed tags. Each allowlist row carries `PERMANENT: <reason>` or `UNTIL <owner>: <reason>`. A row that matches nothing, or whose count or tokens differ, fails, so the allowlist only shrinks by edit. `src/firecube/__main__.py` is a `PERMANENT` row (`python -m firecube` is the CLI's own entry point). The two prose matches and the one dependency-install hint of check 3 are `PERMANENT` rows. The other check-3 rows, the two Click imports and `src/firecube/core/hints.py` are `UNTIL structured-errors`.
+- `954242b` `rebuild_index_record` and `verify_index_record` in `src/firecube/ingestor/runtime/index_record.py`, with frozen `IndexRebuildResult` and `IndexVerification` and `IndexRecordError(ConfigurationError)`. `src/firecube/cli/index.py` keeps `_manager`, `_load_plugin`, `_load_record`, `_exit_no_record`, `show` and the rendering. The legacy-index refusal (`check_legacy_index_record`) and the slots legacy warning also name `firecube.ingestor.runtime.index_record.rebuild_index_record`, right after the backticked command.
+- `2eb7601` `consolidate_time_coords` in `src/firecube/core/zarr/coord_consolidation.py`, with frozen `ConsolidationSummary` and `ProductIdentityError(ConfigurationError)`. `src/firecube/cli/zarr/_consolidate.py` shrank to 176 lines and keeps the options, URI policy, the `--chunk-size` check, the s3 refusal, the storage config, the dry-run summary and exit 1.
+- The fourth group types `preallocate_product` and `plan_slots` against `PreallocateHost` and adds `BaseIngestor.bind_index_at_startup(ctx)`, which only calls the private `_bind_index_at_startup`. `slot_plan.py` reads `ingestor.time_dim_name` where it called `_resolve_time_dim_name()`. Docstrings stop naming `DirectZarrIngestor` as the host.
+
+**Decision.** Output and error mapping, as in the entry below.
+
+- `rebuild_index_record` takes `report` and `warn` callables, which the plan first left out (it had the CLI render from a result). Rendering after the call let an interrupted terminal record lose the stdout line and delayed the conflict stderr line, so the library calls them at the points where the command echoed, before the finalizing `finally`. The CLI passes `click.echo` and a stderr echo. `IndexRebuildResult` is returned but the CLI no longer renders from it.
+- The `ClickException` of the rebuild moved range became `IndexRecordError` with identical text; the CLI catches `IndexRecordError` and `ResolvedIndexConflictError` and nothing else, so what propagated raw before (a plugin `TypeError`, `ManifestError`, `ResolvedIndexClaimTimeoutError`) still does. A plugin's `click.ClickException` from `index_spec` is re-raised unchanged by `verify` and wrapped by `rebuild`, as before.
+- `consolidate_time_coords` calls `report(line)` where the command echoed. Its `ClickException`s became `ConfigurationError` (the two time-dim refusals) or `SchemaDriftError` (unexpected recovery state, coordinate-managed, non-datetime dtype, sealing failures) with identical text. `wrap_user_facing_errors` renders both as before. `ProductIdentityError` becomes `click.UsageError`, exit 2, as before.
+- Identity resolution keeps its place after the store open and the reference read. The library refuses an s3 storage config with today's text before any store opens; from the CLI that check stays unreachable because the CLI refuses first. The unreachable remote rewrite (`_rewrite_time_coord_remote` and every `remote=True` branch) was deleted, not moved.
+- The one intended text change: the legacy-index refusal and the slots legacy warning name the Python function. Four recorded calls carry the suffix.
+
+**Decision.** The consolidation move also fixes the stale-metadata open (`plans/TODO.md`, the consolidated-metadata entry). The root and every descendant group are opened with `use_consolidated=False`, because a subgroup that carries its own consolidated snapshot still hid a live `firecube_coord_managed` stamp when only the root was opened live (found in review). Before the fix, a store whose consolidated metadata predated the stamp exited 0, rewrote the coordinate and replaced the marker with `firecube_preallocated`. The premise that after this only validation reads consolidated metadata is false: `src/firecube/core/zarr/validation.py` (:475, :476, :613, :625, :795), `_read_array_meta_from_store` in `src/firecube/ingestor/runtime/zarr/append.py` (:84), `src/firecube/core/zarr/state.py` (:190, :192, :265, :267), `src/firecube/core/zarr/io.py` (:50) and `src/firecube/core/tensogram/metadata.py` (:212) still open with the default (read in code; not probed).
+
+**Coverage.**
+
+- The replay compares CLI output, streams, exit codes and log records of every CliRunner call on `9beeab3` against the final tree; it does not capture persisted run records or WAL events, which the existing tests that read them hold.
+- Replay (`final.jsonl`, `final-raw.txt`; ran): 546 records, 542 base keys. Without allowances 4 problems, all the suffix. With `allow-b.args` 0 problems. 4 records carry the suffix and 4 keys exist only in the candidate (the new tests). The differ was checked by planted changes (`planted/`: consolidate text, consolidate exit, rebuild stream, verify text, index refusal each differ; the control does not).
+- Start-up: `import firecube.cli.main` loads 1545 modules against 1546 on `9beeab3` (`startup-modules.txt`).
+- Tests added since `9beeab3`: 768 lines by `git diff --numstat 9beeab3 -- tests/` (gate 440, index tests 137, consolidation reproduction 25, consolidation tests and patch repoint 103, host Protocol test and markers 63). Neo raised the budget from 650 to 800; `ultron tdd budget` reads the frozen 650 in the plan header and reports over budget.
+- The gate: red on the clean tree for every test but the tag test, green with rows, and stale rows, a malformed tag and a swapped token each fail (`gate/red.txt`, `gate/stale.txt`).
+- The reproduction of the consolidation symptom failed before the fix and passes after it (`repro/rc-red.txt`): `tests/integration/test_cross_regime_marker_refusals.py::test_consolidate_refuses_coord_managed_despite_stale_consolidated_metadata`.
+
+**Findings.**
+
+- The earlier layering review (section 2) is stale: of its 97 rows, 27 still sit at their line, and its hints rows cite `core/controlplane/hints.py`, which no longer exists. The gate's rows come from a scan of the `9beeab3` tree.
+- The observability boundary test has no stale-row check and no `UNTIL` tag; the new gate adds both.
+- Check 2 was not empty: `src/firecube/__main__.py` imports `firecube.cli.main`. Check 3 misses literals that reach the user through a variable, a return value or a `warn(...)` call (23 sites, for example `core/zarr/guard/engine_owned.py` and `ingestor/runtime/slot_plan.py`), and a command split around an f-string placeholder. Recorded, not closed.
+- The consolidation writes still bypass `guarded_write` and `MetadataAuthority` and take no claim (`plans/TODO.md`, the `consolidate-time-coord` entry stays open). The move put that code inside `core/zarr/`. The post-delete recovery also renames a managed sibling before refusing (pre-existing).
+- An array named `<coord>.consolidating` is still deleted by consolidation (`plans/TODO.md`, identity in strings), recorded, not scheduled.
+- `rebuild` prints "Rebuilt index record" when `ensure_resolved_index` only re-mirrored the attribute (outcome `created`); a `ManifestError` from it propagates raw and is untested; `verify` passes `plugin or product_name` as the plugin name in the legacy message.
+- The index commands configure no tier config on the plugin; preserved.
+- Citations to `plans/DONE.md:97-103` and `:99` for the coordinate-materializer precedent were wrong; the precedent is the 2026-09-01 entry below.
+- The three advice texts that name `firecube zarr index rebuild` for states the command refuses stay untouched: `plan_slots` in `slot_plan.py` and the two attrs-drift messages in `src/firecube/cli/index.py` (`ensure_resolved_index` refuses a root attribute without a record, a matching record with a diverging attribute, and a hash mismatch).
+- Strings that name a CLI command or flag and moved below `cli/` verbatim: the `--time-dim` refusals in `core/zarr/coord_consolidation.py` (`consolidate_time_coords`, `_resolve_time_dim_for_group`). They are `UNTIL structured-errors` rows of the gate. The index move took none.
+- Two failures found while executing, not fixed. The first is present without this work; the second is a load-sensitive candidate with no clean-base reproduction: `tests/integration/test_slots_auto_input_data.py::test_slots_auto_uses_input_data` fails alone on the clean branch (it parses `CliRunner` `result.output`, which mixes stderr; `init_observability` binds the log handler to the first runner's stderr per process, `src/firecube/core/observability/logging.py:112`), and `tests/integration/test_concurrent_preallocate_race.py::test_two_concurrent_preallocates_with_slot_group_env_share_a_single_claim_and_never_overlap` failed once under load with `ControlPlaneCorruptionError` on a `.firecube-atomic-*.tmp` claim file and passed twice alone. Both are open in `plans/TODO.md`.
+
+## 2026-10-18 — `zarr preallocate` and `zarr slots` run below the CLI (fix/parallel-chunk-ownership)
+
+**Decision.** The preallocate operation and the slot plan no longer live in Click modules. Four commits, behaviour-preserving, nothing renamed publicly. The new modules are internal and importable, as `coord_materialization` is: no export from `firecube.ingestor.api`, no reference page.
+
+- `2a728a1` `configure_ingestor` in `src/firecube/ingestor/runtime/configure.py`. It builds the contexts and runs `TierConfigurator` without Click. `_configure_ingestor_for_cli` still coerces the options and delegates.
+- `da86cd9` The slot algebra (`merge_intervals`, `complement_intervals`, `iter_partitions`, `partition_count`, `chunk_aligned_remaining`, `resolve_per_group_slot_sizes`, `smallest_executable_slot_size`) moved to `src/firecube/core/zarr/planning.py`. `plan_slots`, `GroupSlotPlan`, `PLAN_RANGE_CEILING`, `SlotPlanError`, `SlotPlanBlockedError`, `SlotPlanCeilingError`, `_stored_time_units` and `_query_slots_coverage` moved to `src/firecube/ingestor/runtime/slot_plan.py`. The commit deletes `src/firecube/cli/_slot_planning.py` and `_partition_remaining`, which had no caller. `PLAN_SCHEMA_VERSION` and `PLAN_RANGE_HINT` live in `src/firecube/cli/zarr/_slots.py`.
+- `3182fca` `preallocate_product`, `PreallocateDryRunGroup` and `SlotWindowError` in `src/firecube/ingestor/runtime/preallocate.py`, with the helpers `_discover_engine_owned_values`, `_ensure_ancestors`, `_resolve_preallocate_windows`, `_refuse_ownership_change`, `_create_array` and `_materialize_engine_owned_arrays`. The command keeps options, input filters, URI policy, storage config, binding, session, `ChunkManager`, plugin lookup, ingestor construction and configuration. It closes the `ChunkManager` in `finally`.
+- `9fc6e0e` The four refusals that ask for `firecube zarr preallocate` also name `firecube.ingestor.runtime.preallocate.preallocate_product`.
+
+Both operations are half-open `[start, end)` throughout. `firecube.core.controlplane.ranges` is inclusive. The one conversion happens where the code reads stored coverage.
+
+**Decision.** Output and error mapping. The library calls `report(line)` where the command echoed to stdout. It calls `warn(line)` where the command echoed to stderr. The text and the point stay the same, both JSON documents included. Printing the summary after the call returns would drop it when the terminal record fails. The dry-run preview is the exception: `on_dry_run_group` receives one `PreallocateDryRunGroup` per group, and the command prints today's lines from it. The command passes the `firecube.cli.zarr` logger, so log records keep their name. `slots` passes `_warn_stderr` as `warn`, so the drift warnings still go to descriptor 2.
+
+- Each `ClickException` in the moved preallocate range became `ConfigurationError` (caller input) or `SchemaDriftError` (store state) with identical text. `wrap_user_facing_errors` renders both as `ClickException(str(exc))`, exit 1.
+- The window `click.UsageError` texts became `SlotWindowError`. The command maps it back to `click.UsageError`, so exit 2 and the usage block stay.
+- `LegacyIndexRecordError` surfaces as `SchemaDriftError`.
+- The change deletes two `ClickException` re-wraps of an already-typed error, because `wrap_user_facing_errors` renders the same text.
+- `slots` has no `wrap_user_facing_errors`. The command catches `SlotPlanError` and nothing else, and raises today's `ClickException`. `resolve_per_group_slot_sizes` raises `ConfigurationError`. `plan_slots` converts it to `SlotPlanError` at both calls (`slot_plan.py`). The command converts the `SlotPlanError` family to `click.ClickException`.
+- The failure and terminal run records carry fixed texts, so the exception type change leaves them unchanged.
+
+**Findings.**
+
+- Eight test files changed.
+  - `tests/integration/test_cli_zarr_preallocate.py` and `tests/integration/test_preallocate_auto_rebuild.py` patch `firecube.core.observability.create_ingestion_telemetry` instead of `firecube.cli.zarr._preallocate.observability.create_ingestion_telemetry`. It is the same module attribute.
+  - `tests/unit/test_cli_slot_planning.py`, `tests/integration/test_direct_zarr_shard_sharing_reproduction.py`, `tests/integration/test_phase3_5_blocked_ranges.py` and `tests/unit/test_cli_zarr_slots.py` import from or patch the new homes. The invalid-explicit case in `test_cli_slot_planning.py` expects `ConfigurationError` instead of `click.ClickException`.
+  - `tests/integration/test_horizon_growth_rejects_shape_drift.py` expects the exact shape-refusal text with the new parenthetical.
+  - `tests/unit/test_cli_zarr_preallocate.py` and `tests/unit/test_cli_zarr_slots.py` also hold the new `preallocate_product` and `plan_slots` tests. The three `plan_slots` tests carry no definition-time markers.
+- `tests/integration/test_preallocate_auto_rebuild.py` never asserts that the code uses its telemetry fake. Its unbounded group bypasses the factory. The test therefore cannot prove that the patch intercepts the call. This limit existed before the change.
+- `tests/architecture/test_cli_no_private_cross_subsystem_imports.py` flags underscore names in `ImportFrom` only. It does not catch private module paths (`guard._layout`), private calls (`_bind_index_at_startup`) or private attributes (`_storage_config`, `_open_root`). The change did not widen it.
+- Those private accesses left `cli/` and still exist in `src/firecube/ingestor/runtime/`. `preallocate.py`, `slot_plan.py` and `parallel_gate.py` call `_bind_index_at_startup`. `preallocate.py` holds the `_storage_config` getattr and `_open_root`. `preallocate.py`, `parallel_gate.py` and `planning.py` import `guard._layout`. The change adds no public alias.
+- CLI-naming strings moved below `cli/` verbatim, for the structured-errors plan.
+  - `preallocate.py`: the `--input-data` text of the engine-owned discovery refusal, and the `--slot-group`, `--slot-start` and `--slot-end` window messages.
+  - `slot_plan.py`: the `--input-data` AUTO-discovery text, two `firecube zarr index rebuild` texts, the coverage-lookup text naming `--no-resume`, and the unreadable-layout text.
+  - `core/zarr/planning.py`: the two `--slot-size` texts.
+- The coverage query builds its storage config without the `anonymous` override that the command's own config has. The change keeps that gap and does not fix it.
+- The handoff's shared window-planning helpers do not exist. The two commands share only plugin configuration and two functions of `parallel_gate.py`.
+- A plugin-raised `click.ClickException` from `index_spec`, binding or `resolved_index` now shows `returned no index_spec`, because the library cannot import Click. No in-tree plugin or fixture raises it.
+- Three open slots items stay as they were. An explicit `--slot-size` can plan a last window that pods refuse. Obstore `exists()` reads a denied target as empty. The `click.Abort` handling of `_stored_time_units` has not changed.
+
+**Coverage.** Two test files lock the library contract.
+
+- `tests/unit/test_cli_zarr_preallocate.py`: a live run reports through `report` and `warn` and writes nothing to stdout or stderr. A dry run calls `on_dry_run_group` once per bounded group and creates no array. An out-of-group window raises `SlotWindowError` before any array exists.
+- `tests/unit/test_cli_zarr_slots.py`: one `GroupSlotPlan` per bounded group with a lazy `ranges()`. `SlotPlanBlockedError`. `SlotPlanCeilingError` and the override.
+
+The plan measured behaviour and did not assert it (measured). 484 recorded `CliRunner` calls of the CLI-driving tests ran on the final tree and on `41a369b`. 484 normalised records compare equal under the recorded allowances: the parenthetical of `9fc6e0e` (4 calls) and two differences that Neo accepted. The first difference is the log `lineno` of `configure.py`, which moved with the added code. The second is a thread race over which of two parallel batches logs a failure in `tests/integration/test_chunk_ownership_races.py`. The recording covers stdout, stderr, exit code, exception type, `firecube` log records and descriptor-level writes. The harness has limits. It masks path-dependent identity digests when they are well-formed 64-hex. It re-serialises parallel-run JSON after sorting object lists. It decodes stderr and descriptor bytes with replacement. Its clock and 32-hex normalisation is broader than the identified fields. The allowances apply to every string field.
+
+**Results.** Performance against a same-job `41a369b` control, five runs per scenario (measured).
+
+- The performance judge reported FAIL on the final tree. The judge allows no increase in the median of any counted event.
+- W2 `open` is 10820 against 10819. W2 `os.scandir` is 45 against 44.
+- The +1 `open` is in the `zarr preallocate` step: 1958 on the control and 1959 on the final tree, in 20 of 20 runs. The count is repeatable. Other event counts vary by run. For example, `os.scandir` in W2 ranged from 40 to 48 per run across both trees.
+- Neo accepted the +1 `open`. The gate text stays.
+- The ingest-window step keeps its median `open` count in all four measured rounds (8860 or 8861 on both trees).
+- The cause is one more module file, `firecube.ingestor.runtime.preallocate`, opened once per preallocate process (inferred, not measured).
+- Start-up modules: 1546, equal to the baseline. S0 (`firecube --help`) is identical on every counted event.
+- W2 wall medians were 1.40–1.49 s on the final tree and 1.44–1.45 s on the control. The gate counts events. It reports wall time without gating it.
+
 ## 2026-10-18 — The branch's data-loss paths are closed (fix/parallel-chunk-ownership)
 
 **Decision.** Before the branch merges, three reproduced data-loss paths close and one avoidable perf delta is cut. The staged `unclaimed` PUT, the ledger exclusion and the zip restore are new on this branch, so no release carries them. The `.tgm` delete-first, its late start record and its clear-by-domain are in v0.1.7. There is one commit per symptom. Step `rv` of the plan tests that each reverts alone, and it has not run yet. Nothing is pushed. Five commits sit on top of 111fbaf:

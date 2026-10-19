@@ -40,6 +40,7 @@ from firecube.core.tensogram import restore as tgm_restore
 from firecube.core.tensogram.converter import zarr_to_tgm
 from firecube.core.zarr import zip_archive
 from firecube.core.zarr.scrub import run_scrub
+from firecube.ingestor.runtime.archive import ArchiveClaimError, create_archive, restore_archive
 from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding, make_test_session
 
@@ -336,9 +337,11 @@ def _restore_state(tmp_path: Path) -> tuple[list[str], list[str]]:
         manager.close()
 
 
-def _overwrite_restore(tmp_path: Path, kind: str, monkeypatch, on_write: Callable[[], None]):
-    """Run `archive restore --overwrite` over a product; `on_write` runs after each archive write
-    and after the restore function returns."""
+def _overwrite_restore(
+    tmp_path: Path, kind: str, monkeypatch, on_write: Callable[[], None], *, library: bool = False
+):
+    """Run an overwrite restore, by the command or (`library`) by `restore_archive`; `on_write`
+    runs after each archive write and after the restore function returns."""
     src, target, archive = (
         tmp_path / "source.zarr",
         tmp_path / "restored.zarr",
@@ -367,15 +370,29 @@ def _overwrite_restore(tmp_path: Path, kind: str, monkeypatch, on_write: Callabl
 
     for owner, name in (writer, entry):
         monkeypatch.setattr(owner, name, spy_on(getattr(owner, name)))
+    if library:
+        return restore_archive(
+            session=make_test_session(tmp_path, product="restored.zarr"),
+            archive=archive.as_uri(),
+            archive_path=str(archive),
+            archive_format="zip" if kind == "zip" else "tensogram",
+            target=target.as_uri(),
+            overwrite=True,
+        )
     args = ["archive", "restore", "--archive", archive.as_uri(), "--target", target.as_uri()]
     args += ["--overwrite", "--yes-i-really-mean-it", "--storage-type", "local"]
     return CliRunner().invoke(cli, [*args, "--storage-driver", "fsspec"], env=_local_env(tmp_path))
 
 
+ROUTES = [False, pytest.param(True, marks=pytest.mark.contract)]
+
+
+@pytest.mark.parametrize("lib", ROUTES, ids=["cli", "library"])
 @pytest.mark.parametrize("kind", ["zip", "tgm"])
-def test_overwrite_restore_holds_its_claim_and_run_while_writing(tmp_path, monkeypatch, kind):
+def test_overwrite_restore_holds_its_claim_and_run_while_writing(tmp_path, monkeypatch, kind, lib):
     states = []
-    _overwrite_restore(tmp_path, kind, monkeypatch, lambda: states.append(_restore_state(tmp_path)))
+    on_write = lambda: states.append(_restore_state(tmp_path))  # noqa: E731
+    _overwrite_restore(tmp_path, kind, monkeypatch, on_write, library=lib)
     domain = WriteDomain(product="restored.zarr", category="maintenance", name="archive_restore")
     assert len(states) >= 2, states
     assert all(state == ([domain.identifier], ["started"]) for state in states), states
@@ -390,7 +407,8 @@ def test_interrupted_overwrite_restore_leaves_a_started_run(tmp_path, monkeypatc
     assert _restore_state(tmp_path)[1] == ["started"]
 
 
-def test_restore_stops_its_claim_heartbeat(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lib", ROUTES, ids=["cli", "library"])
+def test_restore_stops_its_claim_heartbeat(tmp_path, monkeypatch, lib):
     kwdefaults = FilesystemClaimService.__init__.__kwdefaults__
     monkeypatch.setitem(kwdefaults, "heartbeat_interval_s", 1)
     handles, acquire = [], ChunkManager.acquire_claim
@@ -404,12 +422,66 @@ def test_restore_stops_its_claim_heartbeat(tmp_path, monkeypatch):
     args = ["archive", "restore", "--archive", (tmp_path / "a.tgm").as_uri()]
     args += ["--target", (tmp_path / "r.zarr").as_uri(), "--storage-type", "local"]
     try:
-        result = CliRunner().invoke(
-            cli, [*args, "--storage-driver", "fsspec"], env=_local_env(tmp_path)
-        )
-        assert result.exit_code == 0, result.output
+        if lib:
+            restore_archive(
+                session=make_test_session(tmp_path, product="r.zarr"),
+                archive=(tmp_path / "a.tgm").as_uri(),
+                archive_path=str(tmp_path / "a.tgm"),
+                archive_format="tensogram",
+                target=(tmp_path / "r.zarr").as_uri(),
+            )
+        else:
+            result = CliRunner().invoke(
+                cli, [*args, "--storage-driver", "fsspec"], env=_local_env(tmp_path)
+            )
+            assert result.exit_code == 0, result.output
         time.sleep(2.5)
         assert list((tmp_path / "r.zarr" / ".firecube" / "claims").glob("*")) == []
     finally:
         for handle in handles:
             handle.release()
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("kind", ["zip", "tgm"])
+def test_restore_archive_interrupt_keeps_run_started_and_frees_claim(tmp_path, monkeypatch, kind):
+    interrupt = Mock(side_effect=SystemExit(3))
+    with pytest.raises(SystemExit):
+        _overwrite_restore(tmp_path, kind, monkeypatch, interrupt, library=True)
+    assert _restore_state(tmp_path) == ([], ["started"])
+
+
+@pytest.mark.contract
+def test_create_archive_refuses_an_active_writer_claim_and_records_no_run(tmp_path):
+    (tmp_path / "s.zarr" / ".firecube").mkdir(parents=True)
+    (tmp_path / "s.zarr" / ".firecube" / "schema.json").write_text("{}")
+    out = tmp_path / "out.zip"
+    session = make_test_session(tmp_path, product="s.zarr")
+    manager = _claiming_manager(tmp_path, product="s.zarr")
+    claim = manager.acquire_claim(product="s.zarr", domain=_claim_domain("s.zarr"), owner_id="w")
+    try:
+        with pytest.raises(ArchiveClaimError) as refused:
+            create_archive(
+                session=session, archive=out.as_uri(), archive_path=str(out), archive_format="zip"
+            )
+        runs = manager.list_runs(product="s.zarr")
+    finally:
+        claim.release()
+        manager.close()
+    assert (refused.value.product, refused.value.operation) == ("s.zarr", "archive_create")
+    assert not out.exists()
+    assert [r.run_id for r in runs if r.run_id.startswith("archive-create-")] == []
+
+
+@pytest.mark.contract
+def test_create_archive_of_a_plain_store_takes_no_claim_and_writes_nothing_to_it(tmp_path):
+    source = tmp_path / "plain.zarr"
+    zarr.open_group(str(source), mode="w").create_array("a", data=np.arange(6.0))
+    out = tmp_path / "out.zip"
+    session = make_test_session(tmp_path, product="plain.zarr")
+    tree = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    result = create_archive(
+        session=session, archive=out.as_uri(), archive_path=str(out), archive_format="zip"
+    )
+    assert result.run_id is None and out.exists() and not (source / ".firecube").exists()
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == tree

@@ -111,7 +111,9 @@ firecube zarr index verify \
 
 Rebuild the resolved-index record from a plugin's `index_spec()` declaration.
 Use this command when the record is missing, corrupted, or was written by an
-older Firecube version that used a different format.
+older Firecube version that used a different format. If the root attrs of the
+product still hold the resolved-index hash, the command refuses. See
+[Recover From Attrs Drift](#recover-from-attrs-drift).
 
 ```bash
 firecube zarr index rebuild \
@@ -147,8 +149,29 @@ with code `1` and prints the conflict.
 |---|---|
 | Check what index a product was written with | `show` |
 | Confirm a product is ready for a new ingest run | `verify` |
-| Recover a missing or corrupted index record | `rebuild` |
+| Recover a missing or corrupted index record, with no root attrs hash | `rebuild` |
+| Recover a state that `verify` reports as attrs drift | [Recover From Attrs Drift](#recover-from-attrs-drift) |
 | Migrate a cube that has only a legacy slot-index record | `rebuild` |
+
+## Recover From Attrs Drift
+
+`verify` exits with code 1 and reports attrs drift when the root attrs of the
+product disagree with the record. `rebuild` refuses both states below. Each
+state has its own recovery.
+
+1. If the root attr holds the hash and `.firecube/index/current.json` is
+   absent, restore the file from a backup. Or remove the root attrs
+   `firecube_resolved_index_identity_hash` and `firecube_resolved_index`,
+   then run `firecube zarr index rebuild` with the plugin that wrote the data.
+2. If the record exists and the root attr
+   `firecube_resolved_index_identity_hash` differs from it, remove that attr.
+   Then run `firecube zarr index rebuild`. The command writes the attr again
+   from the record.
+3. Run `firecube zarr index verify` to confirm the result.
+
+If `firecube zarr slots` warns that the plugin resolved index differs from the
+record, use the plugin that wrote the product, or a new target.
+`rebuild` does not change the record in that case.
 
 ## Migration From v0.1.4.post1
 

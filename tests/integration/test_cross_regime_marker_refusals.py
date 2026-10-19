@@ -116,6 +116,31 @@ def test_consolidate_refuses_coord_managed(tmp_path: Path) -> None:
     assert np.array_equal(np.asarray(arr[:]), _OBSERVED), "observed values must be untouched"
 
 
+def test_consolidate_refuses_coord_managed_despite_stale_consolidated_metadata(
+    tmp_path: Path,
+) -> None:
+    target = _managed_store(tmp_path)
+    live = zarr.open_group(store=str(target), mode="r+", zarr_format=3, use_consolidated=False)
+    live_coord = cast(Any, live[f"{_GROUP}/{_COORD}"])
+    del live_coord.attrs[ATTR_COORD_MANAGED]
+    zarr.consolidate_metadata(str(target))  # snapshot without the marker
+    live_coord.attrs[ATTR_COORD_MANAGED] = True  # live stamp the snapshot predates
+
+    result = _consolidate(target)
+
+    assert result.exit_code != 0, "stale consolidated metadata hid the live managed stamp"
+    message = result.output + (str(result.exception) if result.exception is not None else "")
+    assert ATTR_COORD_MANAGED in message
+    arr = cast(
+        Any,
+        zarr.open_group(store=str(target), mode="r", zarr_format=3, use_consolidated=False)[
+            f"{_GROUP}/{_COORD}"
+        ],
+    )
+    assert ATTR_PREALLOCATED not in dict(arr.attrs), "consolidate must not seal a managed array"
+    assert np.array_equal(np.asarray(arr[:]), _OBSERVED), "observed values must be untouched"
+
+
 def test_grid_prefill_rerun_refuses_coord_managed(tmp_path: Path) -> None:
     target = _managed_store(tmp_path)
     writer = RegionZarrWriter(str(target), time_coord_name=_COORD)

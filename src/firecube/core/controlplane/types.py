@@ -609,7 +609,8 @@ class ResolvedIndexRecord:
     declared ``IndexSpec`` produces the same ``identity_hash`` before
     writing. Inspect the record with ``firecube zarr index show`` and
     regenerate it from a plugin declaration with
-    ``firecube zarr index rebuild``.
+    ``firecube zarr index rebuild`` (from Python:
+    ``firecube.ingestor.runtime.index_record.rebuild_index_record``).
 
     Optional ``items`` carries a content-addressed manifest for
     ``IrregularTimeAxis`` cubes. It is omitted from the wire format and

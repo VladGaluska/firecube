@@ -302,6 +302,85 @@ class TestRequireTensogram:
             _compat.require_tensogram("test operation")
 
 
+def _archive(tmp_path, *, controlplane=False):
+    import numpy as np
+    import xarray as xr
+
+    from firecube.core.tensogram.converter import zarr_to_tgm
+
+    src = tmp_path / "src.zarr"
+    xr.Dataset({"FWI": (["t"], np.ones(3, dtype="float32"))}).to_zarr(str(src))
+    if controlplane:
+        (src / ".firecube").mkdir()
+    zarr_to_tgm(str(src), str(tmp_path / "a.tgm"))
+    return str(tmp_path / "a.tgm")
+
+
+class TestTgmInspection:
+    @pytest.mark.integration
+    @pytest.mark.parametrize("controlplane", [True, False])
+    def test_info_reports_variables_and_controlplane_presence(self, tmp_path, controlplane):
+        from firecube.core.tensogram.inspection import tgm_info
+
+        path = _archive(tmp_path, controlplane=controlplane)
+        info = tgm_info(path, operation="firecube archive info")
+        size = (tmp_path / "a.tgm").stat().st_size
+        keys = ["path", "format", "size_bytes", "groups", "has_controlplane", "group_details"]
+        assert list(info) == keys
+        assert [info[k] for k in keys[:5]] == [path, "v1", size, [""], controlplane]
+        assert list(info["group_details"][0]["variables"]) == ["FWI"]
+
+    @pytest.mark.integration
+    def test_info_refuses_unsupported_version_naming_the_path(self, tmp_path):
+        import tensogram
+
+        from firecube.core.tensogram.inspection import TensogramArchiveError, tgm_info
+
+        path = str(tmp_path / "old.tgm")
+        with tensogram.TensogramFile.create(path) as f:  # pyright: ignore[reportAttributeAccessIssue]
+            f.append({"firecube": {"role": "data", "archive_version": "v0"}}, [])
+        with pytest.raises(TensogramArchiveError, match="Unsupported") as exc:
+            tgm_info(path, operation="firecube archive info")
+        assert exc.value.path == path
+
+    @pytest.mark.integration
+    def test_listing_yields_controlplane_and_data_messages_with_objects(self, tmp_path):
+        from firecube.core.tensogram.inspection import open_tgm_listing
+
+        path = _archive(tmp_path, controlplane=True)
+        with open_tgm_listing(path, operation="firecube archive list") as listing:
+            messages = list(listing.messages())
+            assert listing.message_count == len(messages) == 2
+            data, controlplane = messages
+            assert [o.name for o in data.objects()] == ["FWI"]
+            assert (data.is_controlplane, controlplane.is_controlplane) == (False, True)
+            assert controlplane.objects() == ()
+
+    @pytest.mark.integration
+    def test_validate_flags_a_truncated_archive_but_not_an_intact_one(self, tmp_path):
+        from firecube.core.tensogram.inspection import validate_tgm
+
+        path = _archive(tmp_path, controlplane=True)
+        intact = validate_tgm(path, operation="firecube archive validate")
+        assert (intact.message_count, intact.issues) == (2, ())
+        (tmp_path / "cut.tgm").write_bytes((tmp_path / "a.tgm").read_bytes()[:200])
+        cut = validate_tgm(str(tmp_path / "cut.tgm"), operation="firecube archive validate")
+        assert cut.issues
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("name", ["tgm_info", "open_tgm_listing", "validate_tgm"])
+    def test_missing_extras_names_the_operation(self, monkeypatch, name):
+        from firecube.core.tensogram import _compat, inspection
+
+        monkeypatch.setattr(_compat, "HAS_TENSOGRAM", False)
+        call = getattr(inspection, name)
+        with pytest.raises(ImportError) as exc:
+            result = call("missing.tgm", operation="firecube archive probe")
+            if name == "open_tgm_listing":
+                result.__enter__()
+        assert str(exc.value).startswith("firecube archive probe")
+
+
 class TestSchemaHelpers:
     """Tests for archive schema constants and helpers."""
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import time
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -45,7 +46,8 @@ from firecube.core.controlplane.types import (
 from firecube.core.filesystem.fsspec_backend import FsspecFilesystem
 from firecube.core.storage.uri import StorageUri
 from firecube.core.tensogram.converter import zarr_to_tgm
-from tests.helpers.storage import make_test_binding
+from firecube.ingestor.runtime import archive as lib
+from tests.helpers.storage import make_test_binding, make_test_session
 
 pytestmark = pytest.mark.integration
 
@@ -431,3 +433,69 @@ def test_restore_error_survives_failing_bookkeeping(tmp_path, monkeypatch, faili
     assert result.exit_code != 0
     assert "No Zarr v3 root metadata found" in result.output
     assert "bookkeeping boom" in result.output
+
+
+@pytest.mark.contract
+def test_restore_archive_raises_its_own_error_when_bookkeeping_fails(tmp_path, monkeypatch):
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("notes.txt", "no zarr here")
+    boom = Mock(side_effect=OSError("bookkeeping boom"))
+    monkeypatch.setattr(ChunkManager, "record_maintenance_failed", boom)
+    real_rm = FsspecFilesystem.rm
+
+    def rm(self, uri, recursive=False):
+        if "/claims/" in uri.to_str():
+            raise PermissionError("bookkeeping boom")
+        return real_rm(self, uri, recursive)
+
+    monkeypatch.setattr(FsspecFilesystem, "rm", rm)
+    warnings: list[str] = []
+    with pytest.raises(lib.ArchiveConversionError, match="No Zarr v3 root metadata found"):
+        lib.restore_archive(
+            session=make_test_session(tmp_path, product="r.zarr"),
+            archive=archive.as_uri(),
+            archive_path=str(archive),
+            archive_format="zip",
+            target=(tmp_path / "r.zarr").as_uri(),
+            warn=warnings.append,
+        )
+    assert [w.startswith("Warning: ") and "bookkeeping boom" in w for w in warnings] == [True] * 2
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("archive_format", "selection"),
+    [("zip", {}), ("tensogram", {"group": "F024", "variables": ["FWI"]})],
+)
+def test_create_archive_records_the_run_with_its_scope(tmp_path, archive_format, selection):
+    _zip_create_args(tmp_path)  # builds the product and its control plane; the args go unused
+    out = tmp_path / "out.archive"
+    kwargs = {"archive": out.as_uri(), "archive_path": str(out), "archive_format": archive_format}
+    result = lib.create_archive(session=make_test_session(tmp_path), **kwargs, **selection)
+    assert result.run_id is not None
+    events = _read_events(tmp_path / "product.zarr", result.run_id)
+    types = [e["event_type"] for e in events]
+    assert types == [EVENT_MAINTENANCE_STARTED, EVENT_MAINTENANCE_COMPLETED]
+    scope = {"run_kind": "archive_create", "archive_format": archive_format}
+    scope |= dict.fromkeys(["group", "variables", "start_date", "end_date"]) | selection
+    scope |= {
+        "source_product": (tmp_path / "product.zarr").as_uri(),
+        "target_archive": kwargs["archive"],
+    }
+    scope["file_size_bytes"] = out.stat().st_size
+    for event in events:
+        assert scope.items() <= event["record"]["meta"].items(), event["record"]["meta"]
+        datetime.fromisoformat(event["record"]["meta"]["archive_started_at"])
+
+
+@pytest.mark.contract
+def test_create_archive_raises_record_error_with_the_archive_on_disk(tmp_path, monkeypatch):
+    _zip_create_args(tmp_path)
+    denied = Mock(side_effect=PermissionError("record denied"))
+    monkeypatch.setattr(ChunkManager, "record_maintenance_completed", denied)
+    out = tmp_path / "out.zip"
+    kwargs = {"archive": out.as_uri(), "archive_path": str(out), "archive_format": "zip"}
+    with pytest.raises(lib.ArchiveRecordError, match="record denied"):
+        lib.create_archive(session=make_test_session(tmp_path), **kwargs)
+    assert out.exists()
