@@ -219,3 +219,22 @@ def test_candidate_time_dim_logs_when_explicit_name_absent(caplog):
         for record in caplog.records
         if "No explicit time dimension name provided" in record.getMessage()
     ]
+
+
+def test_validate_reads_live_shape_not_root_snapshot(tmp_path):
+    import zarr
+
+    root = zarr.open_group(str(tmp_path / "p.zarr"), mode="w", zarr_format=3)
+    group = root.create_group("G")
+    for name in ("timestamp", "a"):
+        group.create_array(
+            name, shape=(2,), chunks=(2,), dtype="int64", dimension_names=["timestamp"]
+        )
+    zarr.open_array(str(tmp_path / "p.zarr"), path="G/timestamp", mode="r+")[:] = [0, 1]
+    zarr.consolidate_metadata(str(tmp_path / "p.zarr"))
+    zarr.open_array(str(tmp_path / "p.zarr"), path="G/a", mode="r+").resize((4,))
+
+    report = _validate(tmp_path / "p.zarr", "G", time_dim_name="timestamp")
+
+    assert report.is_valid is False
+    assert "array G/a: timestamp length 4 != time coordinate length 2" in report.validity_issues

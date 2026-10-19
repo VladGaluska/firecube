@@ -356,6 +356,9 @@ def tgm_to_zarr(
             if on_group_restored is not None:
                 on_group_restored(cast(str | None, restored["group"]))
 
+        if not first_group:
+            session.zarr.refresh_consolidated_metadata(parse_target(target))
+
         return {
             "source": source,
             "target": target,

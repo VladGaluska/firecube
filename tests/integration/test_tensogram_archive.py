@@ -20,8 +20,10 @@ All tests use synthetic data (tmp_path fixture, no S3).
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, cast
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -380,6 +382,44 @@ def test_chunk_fidelity_preserved_on_restore(tmp_path):
     restored = zarr.open_group(rest, mode="r", path="Data")
     assert cast(Any, restored["var1"]).chunks == (13, 7, 5)
     assert cast(Any, restored["var2"]).chunks == (11, 9)
+
+
+def _archive_cli(tmp_path, *args):
+    result = CliRunner().invoke(
+        cli, ["archive", *args, *_LOCAL_STORAGE_FLAGS], env=_local_env(tmp_path)
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.integration
+def test_restore_creates_no_root_snapshot(tmp_path):
+    src, rest = tmp_path / "src.zarr", tmp_path / "rest.zarr"
+    _make_test_dataset().to_zarr(src, consolidated=False)
+    tgm = (tmp_path / "a.tgm").as_uri()
+    _archive_cli(tmp_path, "create", "--source", src.as_uri(), "--archive", tgm)
+    _archive_cli(tmp_path, "restore", "--archive", tgm, "--target", rest.as_uri())
+
+    assert json.loads((rest / "zarr.json").read_text()).get("consolidated_metadata") is None
+
+
+@pytest.mark.integration
+def test_remote_grouped_restore_refreshes_existing_root_snapshot(tmp_path):
+    """Remote branch simulated: is_remote_target is made true over a real local store."""
+    ds = _make_test_dataset()
+    src, rest = tmp_path / "src.zarr", tmp_path / "rest.zarr"
+    ds.to_zarr(src, group="g1", mode="a", consolidated=False)
+    ds.rename(FWI="OLD").to_zarr(rest, group="g1", mode="a")  # root snapshot lists g1/OLD
+    tgm = (tmp_path / "a.tgm").as_uri()
+    _archive_cli(tmp_path, "create", "--source", src.as_uri(), "--archive", tgm, "--group", "g1")
+    with mock.patch("firecube.core.tensogram.restore.is_remote_target", lambda target: True):
+        _archive_cli(tmp_path, "restore", "--archive", tgm, "--target", rest.as_uri())
+
+    listed = json.loads((rest / "zarr.json").read_text())["consolidated_metadata"]["metadata"]
+    assert "g1/FWI" in listed
+    assert "g1/OLD" not in listed
+    restored = xr.open_zarr(rest, group="g1", consolidated=False)
+    np.testing.assert_allclose(restored["FWI"].values, ds["FWI"].values)
+    restored.close()
 
 
 @pytest.mark.integration

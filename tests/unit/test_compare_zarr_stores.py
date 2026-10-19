@@ -253,3 +253,17 @@ def test_ignores_runtime_managed_attrs(tmp_path: Path) -> None:
     report = _compare(a, b)
     assert report.equivalent is True
     assert report.mismatches == []
+
+
+@pytest.mark.parametrize("stale_side", ["left", "right"])
+def test_compare_reads_live_shape_not_root_snapshot(tmp_path: Path, stale_side: str) -> None:
+    # The stale side's root snapshot still shows the other side's shape.
+    stale = _make_store(tmp_path / "stale.zarr")
+    other = _make_store(tmp_path / "other.zarr")
+    zarr.consolidate_metadata(str(stale))
+    zarr.open_array(str(stale), path="data/values", mode="r+").resize((3, 2))
+
+    report = _compare(stale, other) if stale_side == "left" else _compare(other, stale)
+
+    assert report.equivalent is False
+    assert any("shape" in mismatch for mismatch in report.mismatches)

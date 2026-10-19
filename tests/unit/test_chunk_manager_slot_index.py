@@ -406,11 +406,7 @@ def test_read_slot_index_attrs_hash_for_remote_product_uses_driver_aware_zarr_st
     result = cm.read_slot_index_attrs_hash(product="prod1")
 
     assert create_calls == [
-        {
-            "uri": "s3://bucket/prod1.zarr",
-            "storage_config": cm.storage_config,
-            "mode": "r",
-        }
+        {"uri": "s3://bucket/prod1.zarr", "storage_config": cm.storage_config, "mode": "r"}
     ]
     assert open_calls == [
         {
@@ -418,6 +414,7 @@ def test_read_slot_index_attrs_hash_for_remote_product_uses_driver_aware_zarr_st
             "storage_options": sentinel_storage_options,
             "mode": "r",
             "zarr_format": 3,
+            "use_consolidated": False,
         }
     ]
     assert result == expected_hash

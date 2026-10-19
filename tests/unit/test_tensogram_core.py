@@ -16,7 +16,15 @@
 
 from __future__ import annotations
 
+import json
+
+import numpy as np
 import pytest
+import zarr
+
+from firecube.core.config import StorageConfig
+
+_LOCAL = StorageConfig(storage_type="local")
 
 
 class TestDatasetToGlobalMeta:
@@ -114,6 +122,51 @@ class TestZarrToTgm:
         assert result["variables"] == ["FWI"]
         assert result["file_size_bytes"] > 0
         assert result["compression"] == "zstd"
+
+    @pytest.mark.parametrize("snapshot", ["root", "G"])
+    def test_archives_live_variable_size_under_a_stale_snapshot(self, tmp_path, snapshot):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import zarr_to_tgm
+
+        path = _store_with_stale_snapshot(tmp_path, snapshot)
+        zarr_to_tgm(str(path), str(tmp_path / "o.tgm"), group="G", storage_config=_LOCAL)
+        assert xr.open_dataset(str(tmp_path / "o.tgm"), engine="tensogram")["v"].size == 6
+
+    def test_archives_a_group_created_after_the_root_snapshot(self, tmp_path):
+        from firecube.core.tensogram.converter import zarr_to_tgm
+
+        path = str(tmp_path / "s.zarr")
+        zarr.open_group(path, mode="w", zarr_format=3).create_group("old")
+        zarr.consolidate_metadata(path)
+        live = zarr.open_group(path, mode="r+", use_consolidated=False)
+        live.create_group("new").create_array("v", data=np.zeros(2), dimension_names=["v"])
+        assert "new" in zarr_to_tgm(path, str(tmp_path / "o.tgm"), storage_config=_LOCAL)["groups"]
+
+    def test_archive_lists_groups_variables_and_coordinates_in_name_order(self, tmp_path, subtests):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import zarr_to_tgm
+        from firecube.core.tensogram.inspection import open_tgm_listing, tgm_info
+
+        src, tgt = str(tmp_path / "s.zarr"), str(tmp_path / "o.tgm")
+        names = ["temp", "alpha", "wind", "cloud", "rain"]
+        for g in ["Zeta", "Alpha", "Mid", "Beta"]:
+            data = {v: (("x", "y", "t"), np.zeros((2, 2, 2))) for v in names}
+            coords = {"x": [0, 1], "y": [0, 1], "t": [0, 1]}
+            xr.Dataset(data, coords=coords).to_zarr(src, group=g, mode="a")
+        zarr_to_tgm(src, tgt, storage_config=_LOCAL)
+        with open_tgm_listing(tgt, operation="test") as listing:
+            seen = {m.group_name: [o.name for o in m.objects()] for m in listing.messages()}
+        details = tgm_info(tgt, operation="test")["group_details"]
+        info = {d["group"]: list(d["variables"]) for d in details}
+        with subtests.test(msg="group_order"):
+            assert list(seen) == ["Alpha", "Beta", "Mid", "Zeta"]
+        for group in ["Alpha", "Beta", "Mid", "Zeta"]:
+            with subtests.test(msg=f"{group}_objects"):
+                assert seen[group] == [*sorted(names), "t", "x", "y"]
+            with subtests.test(msg=f"{group}_variables"):
+                assert info[group] == sorted(names)
 
     def test_produces_xarray_openable_file(self, tmp_path):
         """The produced .tgm is openable with xr.open_dataset(engine='tensogram')."""
@@ -413,8 +466,38 @@ class TestSchemaHelpers:
         assert meta["firecube"]["archive_version"] == "v1"
 
 
+def _store_with_stale_snapshot(tmp_path, snapshot, *, group=True, reencode=False):
+    """A store whose snapshot (at ``snapshot``: "root" or "G") predates v growing 4 to 6."""
+    path = tmp_path / "s.zarr"
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    parent = root.create_group("G") if group else root
+    parent.create_array("v", data=np.arange(4, dtype="float32"), chunks=(2,), dimension_names=["v"])
+    zarr.consolidate_metadata(str(path))
+    if snapshot == "G":
+        zarr.consolidate_metadata(str(path / "G"))
+    name = "G/v" if group else "v"
+    live = zarr.open_array(str(path / name), mode="r+")
+    live.resize((6,))
+    live[4:] = [4, 5]
+    if reencode:
+        doc = path / name / "zarr.json"
+        meta = json.loads(doc.read_text())
+        meta["fill_value"] = 7.0
+        meta["chunk_grid"]["configuration"]["chunk_shape"] = [3]
+        doc.write_text(json.dumps(meta))
+    return path
+
+
 class TestExtractZarrArrayMetadata:
     """Tests for extract_zarr_array_metadata."""
+
+    @pytest.mark.parametrize(("snap", "grp"), [("root", None), ("G", "G")])
+    def test_reads_live_chunks_and_fill_value_under_a_stale_snapshot(self, tmp_path, snap, grp):
+        from firecube.core.tensogram.metadata import extract_zarr_array_metadata
+
+        path = _store_with_stale_snapshot(tmp_path, snap, group=grp is not None, reencode=True)
+        meta = extract_zarr_array_metadata(str(path), grp, storage_config=_LOCAL)
+        assert (meta["v"]["chunks"], meta["v"]["fill_value"]) == ((3,), 7.0)
 
     def test_extracts_chunk_shapes(self, tmp_path):
         import zarr

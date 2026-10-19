@@ -81,7 +81,7 @@ def _read_array_meta_from_store(
     """Read dim names, shape, and chunk/shard shape from a non-URI store object."""
     import zarr as _zarr
 
-    _root = _zarr.open_group(store, mode="r")
+    _root = _zarr.open_group(store, mode="r", use_consolidated=False)
     _array = cast(Any, _root[array_path])
     dim_names = list(ds_var_dims)
     shape = [int(x) for x in _array.shape]
@@ -409,7 +409,7 @@ def _compute_touched_data_chunks(
         return {group: {}}
 
     try:
-        ws_group = cast(Any, root[group])
+        root[group]
     except KeyError:
         logger.debug(
             "_compute_touched_data_chunks: workspace group missing; returning empty chunks",
@@ -418,8 +418,11 @@ def _compute_touched_data_chunks(
         return {group: {}}
 
     def _chunks_touched_by_array(name: str) -> list[tuple[int, ...]]:
+        # A group object keeps its own consolidated snapshot: read each array by
+        # its full path from the live root.
+        array_path = "/".join(part for part in (group.strip("/"), name) if part)
         try:
-            arr = cast(Any, ws_group[name])
+            arr = cast(Any, root[array_path])
         except KeyError:
             logger.debug(
                 "_compute_touched_data_chunks: workspace array missing; skipping array",

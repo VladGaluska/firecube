@@ -18,7 +18,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import xarray as xr
+import zarr
 from click.testing import CliRunner
 
 from firecube.cli.catalog import catalog
@@ -45,6 +47,24 @@ def test_discover_catalog_groups_skips_container_nodes(tmp_path: Path) -> None:
     groups = discover_catalog_groups(str(store), storage_config=_local_storage_config(tmp_path))
 
     assert groups == ["group_a", "group_a/derived/coarse"]
+
+
+@pytest.mark.parametrize(("snapshot", "expected"), [("root", ["/"]), ("group", ["G"])])
+def test_discover_catalog_groups_sees_arrays_added_after_the_snapshot(
+    tmp_path: Path, snapshot: str, expected: list[str]
+) -> None:
+    store = str(tmp_path / "f.zarr")
+    zarr.open_group(store, mode="w", zarr_format=3).require_group("G")
+    zarr.consolidate_metadata(store)
+    if snapshot == "group":
+        zarr.consolidate_metadata(str(tmp_path / "f.zarr" / "G"))
+    live = zarr.open_group(store, mode="r+", use_consolidated=False)
+    target = live if snapshot == "root" else live.require_group("G")
+    target.create_array("x", shape=(2,), dtype="f4", dimension_names=("t",))
+    target.create_array("y", shape=(3,), dtype="f4", dimension_names=("t",))  # xarray cannot merge
+    config = _local_storage_config(tmp_path)
+
+    assert discover_catalog_groups(store, storage_config=config) == expected
 
 
 def test_build_catalog_source_specs_applies_plugin_annotations(tmp_path: Path) -> None:

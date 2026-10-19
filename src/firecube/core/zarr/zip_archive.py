@@ -248,6 +248,36 @@ def _refuse_invalid_metadata(zf: zipfile.ZipFile, keys: list[str], archive: str)
             raise ValueError(f"Invalid Zarr metadata {key!r} in archive {archive}: {exc}") from exc
 
 
+def _walk_live(store_kwargs: dict[str, Any]) -> list[tuple[str, zarr.Group | zarr.Array]]:
+    """Return ``(path, node)`` for every array and group below the root, read from live metadata.
+
+    Each group is reopened with ``use_consolidated=False`` and listed at depth 0, so no
+    consolidated snapshot at any level stands in for a child document.
+    """
+    nodes: dict[str, zarr.Group | zarr.Array] = {}
+    pending = [""]
+    with warnings.catch_warnings():
+        # the control plane (.firecube/) is not part of the zarr hierarchy
+        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+        while pending:
+            parent = pending.pop()
+            group = zarr.open_group(
+                **store_kwargs,
+                path=parent or None,
+                mode="r",
+                zarr_format=3,
+                use_consolidated=False,
+            )
+            if parent:
+                nodes[parent] = group  # the reopened group, not the child the parent listed
+            for name, node in group.members():
+                path = f"{parent}/{name}" if parent else name
+                nodes[path] = node
+                if isinstance(node, zarr.Group):
+                    pending.append(path)
+    return sorted(nodes.items())
+
+
 def zip_to_zarr(
     archive: str,
     target: str,
@@ -312,11 +342,7 @@ def zip_to_zarr(
             session.put_bytes(product_uri.join(key), zf.read(key))
 
     # verify: the restored store opens and lists the same groups and arrays
-    root = session.zarr.open_group(product_uri, mode="r")
-    with warnings.catch_warnings():
-        # the control plane (.firecube/) is not part of the zarr hierarchy
-        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
-        members = sorted(root.members(max_depth=None))
+    members = _walk_live(session.zarr.create_store(product_uri, mode="r").zarr_kwargs())
 
     groups = [name for name, node in members if isinstance(node, zarr.Group)]
     arrays = {name: node for name, node in members if isinstance(node, zarr.Array)}
@@ -351,13 +377,8 @@ def zip_info(archive: str) -> dict:
 
     store = create_zip_store(target=str(path), mode="r").store
     try:
-        root = zarr.open_group(store=store, mode="r", zarr_format=3)
         group_vars: dict[str, dict] = {"": {}}  # "" is the root group
-        with warnings.catch_warnings():
-            # the control plane (.firecube/) is not part of the zarr hierarchy
-            warnings.filterwarnings("ignore", message="Object at .* is not recognized")
-            members = sorted(root.members(max_depth=None))
-        for name, node in members:
+        for name, node in _walk_live({"store": store}):
             if isinstance(node, zarr.Group):
                 group_vars.setdefault(name, {})
                 continue
@@ -396,17 +417,18 @@ def list_zip(archive: str) -> list[tuple[str, str]]:
         raise FileNotFoundError(f"Archive not found: {archive}")
     store = create_zip_store(target=str(path), mode="r").store
     try:
-        root = zarr.open_group(store=store, mode="r", zarr_format=3)
-        with warnings.catch_warnings():
-            # the control plane (.firecube/) is not part of the zarr hierarchy
-            warnings.filterwarnings("ignore", message="Object at .* is not recognized")
-            members = sorted(root.members(max_depth=None))
-        groups = [""] + [name for name, node in members if isinstance(node, zarr.Group)]
+        root = zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
+        live_groups: dict[str, zarr.Group] = {
+            "": root,
+            **{
+                name: node
+                for name, node in _walk_live({"store": store})
+                if isinstance(node, zarr.Group)
+            },
+        }
         listing = []
-        for group in groups:
-            node = root[group] if group else root
-            if not isinstance(node, zarr.Group):
-                continue
+        for group in sorted(live_groups):
+            node = live_groups[group]
             if not any(isinstance(m, zarr.Array) for _, m in node.members()):
                 continue
             ds = xr.open_zarr(store, group=group or None, consolidated=False)
@@ -445,6 +467,7 @@ def validate_zip(archive: str, *, quick: bool = False) -> list[str]:
             # the control plane (.firecube/) is not part of the zarr hierarchy
             warnings.filterwarnings("ignore", message="Object at .* is not recognized")
             root.members(max_depth=None)  # parses the metadata of every group and array
+        _walk_live({"store": store})  # parses every document itself, wherever a snapshot sits
     except Exception as exc:
         issues.append(f"cannot open as Zarr: {type(exc).__name__}: {exc}")
     finally:

@@ -1249,20 +1249,23 @@ def verify_post_write_integrity(
             continue
 
         try:
-            ws_group = cast(Any, ws_root[group_name])
+            ws_root[group_name]
         except KeyError:
             continue
         try:
-            target_group = cast(Any, target_root[group_name])
+            target_root[group_name]
         except KeyError:
             continue
 
+        # A group object keeps its own consolidated snapshot: read each array by
+        # its full path from the live root.
+        state_path = "/".join(part for part in (group_name.strip("/"), state_var_name) if part)
         try:
-            ws_arr = cast(Any, ws_group[state_var_name])
+            ws_arr = cast(Any, ws_root[state_path])
         except KeyError:
             continue
         try:
-            target_arr = cast(Any, target_group[state_var_name])
+            target_arr = cast(Any, target_root[state_path])
         except KeyError:
             continue
 
@@ -1301,24 +1304,28 @@ def verify_post_write_integrity(
             continue
 
         try:
-            ws_group = cast(Any, ws_root[group_name])
+            ws_root[group_name]
         except KeyError:
             continue
         try:
-            target_group = cast(Any, target_root[group_name])
+            target_root[group_name]
         except KeyError:
             continue
 
+        # A group object keeps its own consolidated snapshot: read each array by
+        # its full path from the live root.
+        coord_path = "/".join(part for part in (group_name.strip("/"), append_dim) if part)
+        state_path = "/".join(part for part in (group_name.strip("/"), state_var_name) if part)
         try:
-            ws_coord_arr = cast(Any, ws_group[append_dim])
+            ws_coord_arr = cast(Any, ws_root[coord_path])
         except KeyError:
             continue
         try:
-            target_coord_arr = cast(Any, target_group[append_dim])
+            target_coord_arr = cast(Any, target_root[coord_path])
         except KeyError:
             continue
         try:
-            target_state_arr = cast(Any, target_group[state_var_name])
+            target_state_arr = cast(Any, target_root[state_path])
         except KeyError:
             continue
 

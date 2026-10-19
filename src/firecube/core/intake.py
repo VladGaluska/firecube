@@ -183,7 +183,12 @@ def _read_node_type(
         mode="r",
     )
     try:
-        node = zarr.open(**handle.zarr_kwargs(), path=(group or None), mode="r")
+        node = zarr.open(
+            **handle.zarr_kwargs(),
+            path=(group or None),
+            mode="r",
+            use_consolidated=False,
+        )
     except Exception as exc:
         log.warning(
             "intake discovery: cannot read node type at %s (group=%s): %s: %s",
@@ -235,7 +240,7 @@ def _contains_zarr_arrays(
 
     handle = _resolve_dataset_store_handle(target_uri, storage_config, storage_session)
     try:
-        node = zarr.open(**handle.zarr_kwargs(), mode="r")
+        node = zarr.open(**handle.zarr_kwargs(), mode="r", use_consolidated=False)
     except Exception as exc:
         log.warning(
             "intake discovery: cannot open %s as zarr: %s: %s",

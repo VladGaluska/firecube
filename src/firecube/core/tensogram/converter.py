@@ -101,9 +101,10 @@ def zarr_to_tgm(
         groups_to_archive: list[str | None] = [group]
     else:
         zroot = session.zarr.open_group(source_uri, mode="r")
-        groups_to_archive = [
-            name for name, member in zroot.members() if isinstance(member, zarr.Group)
-        ]
+        groups_to_archive = sorted(
+            (name for name, member in zroot.members() if isinstance(member, zarr.Group)),
+            key=str,
+        )
         if not groups_to_archive:
             groups_to_archive = [None]
 
@@ -143,7 +144,7 @@ def zarr_to_tgm(
                         )
                     ds = ds[variables]
 
-                coord_names = [str(name) for name in ds.coords]
+                coord_names = sorted(str(name) for name in ds.coords)
                 zarr_meta = extract_zarr_array_metadata(
                     source,
                     group_name,
@@ -153,7 +154,7 @@ def zarr_to_tgm(
                 objects: list[tuple[dict[str, Any], np.ndarray]] = []
                 base: list[dict[str, Any]] = []
 
-                for var_name in ds.data_vars:
+                for var_name in sorted(ds.data_vars, key=str):
                     variable = ds[var_name].variable
                     if not _is_encodable_dtype(variable.dtype):
                         logger.warning(
@@ -180,7 +181,7 @@ def zarr_to_tgm(
                         )
                     )
 
-                for coord_name in ds.coords:
+                for coord_name in sorted(ds.coords, key=str):
                     coordinate = ds.coords[coord_name].variable
                     if not _is_encodable_dtype(coordinate.dtype):
                         logger.warning(

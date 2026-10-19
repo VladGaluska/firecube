@@ -93,7 +93,9 @@ def seed_touched_data_chunks(
     from firecube.core.uris import storage_uri_from_target
 
     ws_handle = session.zarr.create_store(uri=storage_uri_from_target(temp_store_uri), mode="a")
-    ws_root = zarr.open_group(**ws_handle.zarr_kwargs(), mode="a", zarr_format=3)
+    ws_root = zarr.open_group(
+        **ws_handle.zarr_kwargs(), mode="a", zarr_format=3, use_consolidated=False
+    )
     try:
         target_handle = session.zarr.create_store(
             uri=storage_uri_from_target(final_target_uri), mode="r"
@@ -109,16 +111,20 @@ def seed_touched_data_chunks(
 
     try:
         for group_name, arrays in touched_chunks.items():
-            ws_group = _get_child(ws_root, group_name)
-            target_group = _get_child(target_root, group_name)
-            if ws_group is None or target_group is None:
+            if (
+                _get_child(ws_root, group_name) is None
+                or _get_child(target_root, group_name) is None
+            ):
                 continue
 
             for array_name, chunk_indices in arrays.items():
                 if not chunk_indices:
                     continue
-                ws_arr = _get_child(ws_group, array_name)
-                target_arr = _get_child(target_group, array_name)
+                # A group object keeps its own consolidated snapshot: read each array by
+                # its full path from the live root.
+                array_path = "/".join(part for part in (group_name.strip("/"), array_name) if part)
+                ws_arr = _get_child(ws_root, array_path)
+                target_arr = _get_child(target_root, array_path)
                 if ws_arr is None or target_arr is None:
                     continue
 

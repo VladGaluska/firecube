@@ -23,10 +23,11 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
+from zarr.storage import LocalStore
 
 from firecube.core.config import StorageConfig
 from firecube.core.filesystem.store_factory import create_zarr_store
-from firecube.ingestor.runtime.zarr.append_services import AppendResumeService
+from firecube.ingestor.runtime.zarr.append_services import AppendResumeService, AppendTimestampState
 from firecube.ingestor.runtime.zarr.write import write_dataset_to_zarr
 
 pytestmark = pytest.mark.unit
@@ -209,3 +210,50 @@ def test_region_nan_fill_ignores_stale_consolidated_metadata(tmp_path: Path) -> 
     expected_state = np.ones(times.shape, dtype=np.uint8)
     expected_state[1:4] = 2
     np.testing.assert_array_equal(state, expected_state)
+
+
+def _grown_under_snapshot(store_path: Path, shards: tuple[int, ...] | None = None) -> None:
+    """Consolidate a 2-slot ``default/value``, then grow it to 4 without refreshing."""
+    root = zarr.open_group(str(store_path), mode="w", zarr_format=3)
+    root.create_array("default/value", shape=(2,), chunks=(1,), shards=shards, dtype="i4")
+    zarr.consolidate_metadata(str(store_path))
+    live = zarr.open_group(str(store_path), mode="r+", zarr_format=3, use_consolidated=False)
+    cast(Any, live["default/value"]).resize((4,))
+
+
+def _resume_cursor(service: AppendResumeService, store: object) -> int:
+    ts_state = AppendTimestampState("firecube_timestamp_state", time_dim_name="timestamp")
+    service.prepare_write(
+        ds=ts_state.attach(_dataset(_times(2)), append_dim="timestamp"),
+        group="default",
+        store=store,
+        write_target_uri=None,
+        arrays_for_group=None,
+        ts_state=ts_state,
+    )
+    return service.write_cursor
+
+
+def test_resume_cursor_from_store_object_reads_live_shape(tmp_path: Path) -> None:
+    """A store object whose array grew under a root snapshot resumes at the live length."""
+    store_path = tmp_path / "cursor-store.zarr"
+    _grown_under_snapshot(store_path)
+    kwargs = {**_service_kwargs(store_path), "read_source_uri": None}
+
+    cursor = _resume_cursor(AppendResumeService(**kwargs), LocalStore(str(store_path)))
+
+    assert cursor == 4
+
+
+@pytest.mark.parametrize("shards", [None, (2,)], ids=["unsharded", "sharded"])
+def test_resume_cursor_from_source_uri_reads_live_shape(
+    tmp_path: Path, shards: tuple[int, ...] | None
+) -> None:
+    """A storage-URI source whose array grew under a root snapshot resumes at the live length."""
+    store_path = tmp_path / "cursor-uri.zarr"
+    _grown_under_snapshot(store_path, shards)
+    kwargs = {**_service_kwargs(store_path), "sharding": shards is not None}
+
+    cursor = _resume_cursor(AppendResumeService(**kwargs), LocalStore(str(store_path)))
+
+    assert cursor == 4

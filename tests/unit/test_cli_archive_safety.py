@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import zipfile
 from types import SimpleNamespace
@@ -249,6 +250,22 @@ def test_overwrite_restore_of_an_invalid_archive_keeps_the_target(tmp_path, kind
     after = {k: v for k, v in tree().items() if not k.startswith(".firecube/runs/archive-restore-")}
     assert after == before
     assert r.exit_code != 0, r.output
+
+
+@pytest.mark.parametrize(("snapshot", "child"), [(None, "G"), ("G", "G"), ("G/H", "G/H")])
+def test_validate_rejects_a_broken_child_the_snapshot_still_shows_valid(tmp_path, snapshot, child):
+    src = tmp_path / "src"
+    root = zarr.open_group(str(src), mode="w", zarr_format=3)
+    root.require_group(child).create_array("a", data=np.arange(4.0))
+    zarr.consolidate_metadata(str(src))
+    if snapshot:
+        zarr.consolidate_metadata(str(src / snapshot))
+    broken = src / child / "a" / "zarr.json"
+    broken.write_text(json.dumps({**json.loads(broken.read_text()), "node_type": "banana"}))
+    archive = shutil.make_archive(str(tmp_path / "a"), "zip", src)
+    r = CliRunner().invoke(cli, ["archive", "validate", "--archive", f"file://{archive}"])
+    assert r.exit_code == 1, r.output
+    assert "INVALID:" in r.output and "cannot open as Zarr:" in r.output
 
 
 def test_create_refuses_anonymous_storage(tmp_path, monkeypatch):

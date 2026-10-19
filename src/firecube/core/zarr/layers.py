@@ -83,7 +83,7 @@ def build_multires_layers(
         grp: str | None,
     ) -> xr.Dataset:
         z_uri = StorageUri.parse(z_store)
-        open_kwargs = {"chunks": "auto", "consolidated": False}
+        open_kwargs = {"chunks": "auto"}
         if grp:
             return session.zarr.open_dataset(z_uri, **open_kwargs, group=grp)
         try:
@@ -176,5 +176,8 @@ def build_multires_layers(
         if logger and not silent:
             logger.info("Multi-resolution layer written", extra={"layer": group_name})
         groups_written.append(group_name)
+
+    if groups_written:
+        session.zarr.refresh_consolidated_metadata(StorageUri.parse(str(zarr_store)))
 
     return groups_written

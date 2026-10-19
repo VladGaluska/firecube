@@ -14,12 +14,15 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Any
 
+import numpy as np
 import pytest
 import zarr
 
-from firecube.core.zarr.state import ensure_timestamp_state_array
+from firecube.core.config import StorageConfig
+from firecube.core.zarr.state import ensure_timestamp_state_array, update_timestamp_state
 
 
 def _dimension_names(array: Any) -> tuple[str, ...] | None:
@@ -60,3 +63,50 @@ def test_attach_timestamp_state_backcompat_default_timestamp(tmp_path):
     root = zarr.open_group(store=str(store_path), mode="r")
     state = root["G1/firecube_timestamp_state"]
     assert _dimension_names(state) == ("timestamp",)
+
+
+def _snapshot_state_store(tmp_path, where: str) -> str:
+    """Store whose snapshot (at the root, or at group G alone) lists G/st."""
+    path = str(tmp_path / "p.zarr")
+    zarr.open_group(path, mode="w", zarr_format=3).create_group("G").create_array(
+        "st", shape=(2,), chunks=(2,), dtype="u1", fill_value=0, dimension_names=["timestamp"]
+    )
+    zarr.consolidate_metadata(path, path="G" if where == "group" else "")
+    return path
+
+
+SNAPSHOT_CASES = [
+    pytest.param("config", "root", id="storage_config-root"),
+    pytest.param("options", "group", id="storage_options-group"),
+]
+
+
+def _branch(kind: str) -> dict[str, Any]:
+    return {"storage_config": StorageConfig(storage_type="local")} if kind == "config" else {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("kind", "where"), SNAPSHOT_CASES)
+def test_ensure_state_recreates_array_missing_despite_snapshot(tmp_path, kind, where):
+    path = _snapshot_state_store(tmp_path, where)
+    shutil.rmtree(tmp_path / "p.zarr" / "G" / "st")
+
+    ensure_timestamp_state_array(
+        store_uri=path, array_path="G/st", length=4, chunk_len=2, **_branch(kind)
+    )
+
+    assert zarr.open_array(path, path="G/st", mode="r").shape == (4,)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("kind", "where"), SNAPSHOT_CASES)
+def test_update_state_writes_slots_grown_past_snapshot(tmp_path, kind, where):
+    path = _snapshot_state_store(tmp_path, where)
+    zarr.open_array(path, path="G/st", mode="r+").resize((4,))
+
+    update_timestamp_state(
+        store_uri=path, array_path="G/st", time_index_ranges=[[2, 3]], value=7, **_branch(kind)
+    )
+
+    state = zarr.open_array(path, path="G/st", mode="r")
+    assert np.asarray(state[:]).tolist() == [0, 0, 7, 7]

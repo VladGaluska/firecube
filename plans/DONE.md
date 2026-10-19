@@ -1,5 +1,98 @@
 # Done
 
+## 2026-10-19 — The snapshot leftovers: staged-resume reads, dataset writes and archive order (fix/parallel-chunk-ownership)
+
+**Decision.** Five signed commits, nothing pushed, each revertable alone. C1 `9d34ac2` `fix(append): read staged-resume arrays by full path from the root` (code, tests, `CHANGELOG.md`). C2 `1b3b9e7` `fix(zarr): dataset writes refresh snapshots, never create them` (code, tests, `CHANGELOG.md`, `AGENTS.md`, `plans/DESIGN.md`). C3 `f252e9d` `fix(tensogram): archive groups and variables in name order` (code, test, `CHANGELOG.md`). C4 `de5b412` `test(arch): catch zarr.api opens and mutated kwargs dicts` (the scanner in `tests/unit/test_no_raw_fsspec_usage.py`). D `docs(plans): record the snapshot leftovers` (`plans/TODO.md`, `plans/DONE.md`): hash pending. Base `c7924e8`.
+
+- C1: `_compute_touched_data_chunks` and `verify_post_write_integrity` read each array by its full path from the live root, so a group's own snapshot no longer hides grown cells. The group lookups stay as existence checks.
+- C2: `ZarrIO.write_dataset` passes `consolidated=False` as a literal keyword and never creates a snapshot. `ZarrIO.refresh_consolidated_metadata(uri)` rewrites the snapshot of each group that already has one and creates none. `build_multires_layers` calls it once after its level loop when a level was written, and `tgm_to_zarr` once after its last data message. The zip restore is untouched.
+- C3: `zarr_to_tgm` sorts groups, data variables and coordinates by name (data variables before coordinates). An explicit `group` is unchanged. Existing archives restore as before.
+- C4: the live-metadata scanner resolves calls through `zarr.api.synchronous` and `zarr.api.asynchronous` (dotted, aliased, name-imported, bare `import zarr.api.<module>`). It counts a `**name` as passing the flag only when the name is bound once to a qualifying dict display and never mutated. No new hit in `src/firecube`; the three `PERMANENT` rows are unchanged.
+
+**Decision.** Neo's choices (D1 to D5) and the planner's choices inside them (P1 to P13), short.
+
+- D1: item 1 fixes both group-object reads. D2: item 2 never creates a snapshot and refreshes one that exists; a plain `xr.open_zarr` on a restored store then warns about a slower fallback read. D3: the scanner tightening is done here, as C4. D4: test budget 220 lines. D5: `git commit -sS`, one-line subjects, one commit per item, records in a final commit.
+- P1: the full path is built as `seed_touched_data_chunks` builds it. P2: item 1 went to the heavy coder tier because a missed lookup fails quietly. P3: the other group-object reads stay and are recorded in `plans/TODO.md`.
+- P4: one method, `ZarrIO.refresh_consolidated_metadata`, once per operation; one refresh costs 2N-1 group opens plus one consolidate per group that carries a snapshot. Its default open is the existing `PERMANENT` scanner row. P5: a local `.tgm` restore has nothing to refresh; a remote grouped restore onto a full store does (simulated: the root snapshot listed 14 of 19 nodes without the refresh and 19 with it). P6: the multires tests are the first real multires write in the suite. P7: rule text in `AGENTS.md` and `plans/DESIGN.md`.
+- P8: sorting by `str` name where the archive is written, so the converter fallback and `restore.py` need no edit. P9: byte identity cannot hold (`archived_at`), so the test asserts name order through `tgm_info` and `open_tgm_listing`, with three groups, five data variables and three coordinates created in an order that is neither sorted nor reversed.
+- P10: three `CHANGELOG.md` nodes in sequence, each in its own commit. P11: this record. P12: the replay judge below. P13: the commit subjects.
+
+**Handoff corrections.**
+
+- Item 1: after the touched-map fix alone the integrity check still checked nothing for the grown cells, because it read through the group object too (probe: shape `(8,)` seen where `(12,)` was right). D1 fixes both.
+- Item 2: both callers wrote a non-null root snapshot, because xarray 2026.7.0 consolidates the store root after every write in a mode other than `r+`. A multires write onto a store with a root snapshot refreshed it, so `consolidated=False` alone would have left it stale.
+- Item 3: byte-identical `.tgm` files are impossible; coordinate order varied as well and is sorted too.
+- The recorder exits 1 at `c7924e8` because of the known failing test (`plans/TODO.md`), so recordings are judged by record count and `cli_diff`.
+
+**Coverage.**
+
+- Red runs (ran, on `c7924e8` source, `repro/`): r1 4 failing tests (`None == [(5,)]`, `[999, 0] == [999, 111]`, two `DID NOT RAISE`); r2 cases 1 and 2 failing, cases 3 and 4 passing; f2 showed cases 3 and 4 failing with `write_dataset` changed alone (`f2-no-refresh.txt`) and case 4 failing again with only the restore call left out (`f2-no-restore-refresh.txt`); r3 9 failing subtests in each of three runs; ra the scanner self-check failing.
+- Tests added since `c7924e8`: 206 added lines by `git diff --numstat c7924e8 -- tests/` (26, 29, 40, 27, 59 and 25 over six files), of the 220 budget; the scanner file also deletes 12 lines. `ultron tdd budget <plan> --base c7924e8` printed `+0 lines` on the committed tree, so the numstat is the count.
+- Replay (ran). The judge `order_only.py` accepts only an `archive info` or `archive list` record of a `.tgm` that differs in order alone, compared per group block; checked on four synthetic pairs and four adversarial ones, and on 4b's known result (2 order-only, 3 other).
+- Baseline pair, `base-1` against `base-2` (855 records each): 1 difference, order-only (`test_full_archive_restore_cycle`, call 3). That is item 3's symptom at the baseline.
+- Final pair, `final-1` against `final-2` (861 records each), no allowance: 0 problems. The order is the same on every run.
+- `base-1` against `final-1`: 4 problems and 6 candidate-only keys (the new tests). Three problems are order-only in `archive info` and `archive list` of a `.tgm` (`test_archive_info_shows_groups` call 1; `test_full_archive_restore_cycle` calls 2 and 3). One is other: `test_archive_info_shows_groups` call 0, the `archive create` summary line `Groups:`, now `Alpha, Beta` where it was `Beta, Alpha`. Neo accepted it. No rule or allowance was written.
+- Not in this entry: the full lane and the revert checks, which run after this commit.
+
+**Findings.**
+
+- A remote `.tgm` restore ignores `--overwrite` and clears nothing (`_prepare_target`), and a remote restore of a root-group `.tgm` writes with mode `"w"`, which deletes the target prefix, `.firecube/` included (simulated on a local path, not run on S3). Both open in `plans/TODO.md`.
+- The group-object reads that still trust a group's own snapshot (P3) are listed by function under the audit entry in `plans/TODO.md`.
+- Also recorded in `plans/TODO.md`: `from zarr.api import synchronous as zs` is not flagged by the scanner; `build_multires_layers` over S3 with obstore fails in Dask tokenization before the refresh (a `PanicException`, inferred to predate the plan); case 4 of the restore snapshot test covers one group only, so a multi-group refresh is untested.
+- Rule deviations by testers (python heredoc rewrites of tracked test files in r1 and r3) were recorded in the decisions ledger; the results were linted and reviewed.
+
+## 2026-10-19 — Zarr and xarray opens that decide read live metadata (fix/parallel-chunk-ownership)
+
+**Decision.** Two signed commits, nothing pushed, each revertable alone. G1 `a9a5fc3` `fix(zarr): read live metadata wherever an open decides` holds the source, the red tests, the architecture test, `CHANGELOG.md`, `AGENTS.md`, `plans/DESIGN.md` and `plans/TEST.md`. G2 (`docs(plans): record the consolidated-metadata sweep`: `plans/TODO.md` and `plans/DONE.md`): hash pending. Every zarr or xarray open in `src/firecube` whose result drives a decision passes `use_consolidated=False` (zarr) or `consolidated=False` (xarray), at the site or through the two `ZarrIO` helpers in `src/firecube/core/zarr/io.py`. The intended invariant is that a decision that reads below the root does not trust a group's own snapshot either; the sites this sweep changed do that, and the exceptions are the three deliberate default opens, the converter fallback (P15), the opens that were already live and were not audited for descent (P16), and the known `_compute_touched_data_chunks` gap listed under Findings.
+
+**Ledger.** 34 opens, read at `a5cedc8`.
+
+- 16 stale decision opens fixed: 14 at the site and the two helpers.
+- 4 flag-only opens that cannot go stale (`group_exists`, the two root-attribute reads in `manager.py`, `_read_node_type`).
+- 4 display opens read live (`advise.py:123`, the restore summary, `zip_info`, `list_zip`).
+- 2 `open_array` calls exempt (`metadata_authority.py:499`, `zip_archive.py:242`): `open_array` reads the array's own `zarr.json` and has no `use_consolidated` parameter.
+- 3 deliberate defaults, `PERMANENT` rows in the architecture test: `_refresh_consolidated_metadata`, `_refuse_invalid_metadata`, and `validate_zip`'s whole-document parse (which gains a live walk).
+- 1 recorded gap: the converter fallback (P15).
+
+**Decision.** Choices inside the plan (P1 to P16).
+
+- P1: display sites read live (`zip_info`, `list_zip`, `zip_to_zarr`'s summary, advise's batch-size text); the allowlist has no "display only" row.
+- P2: `ZarrIO.open_group` passes `use_consolidated=False`; `ZarrIO.open_dataset` passes `consolidated=False` as a literal keyword, so a caller cannot pass `consolidated`; `layers.py` dropped its own `"consolidated": False`.
+- P3: one red test per helper, through one decision caller (`converter.py:103` for `open_group`, `converter.py:305` for `open_dataset`).
+- P4: opens that cannot go stale still pass the flag, so the rule has no exception for them.
+- P5: `open_array` never gets the keyword (on its create path it raises `TypeError`, zarr 3.2.1).
+- P6: three deliberate defaults, `PERMANENT` rows. `use_consolidated=False` drops a snapshot before it is parsed, so a live open no longer fails on a malformed snapshot; the two archive validators that judge whole documents keep a default open. `validate_zip` keeps its default open and walk and adds the live walk, so a child document that does not parse is reported at any depth wherever the snapshot sits (F30).
+- P7: the static-marker check is not edited; `_candidate_time_dim` picks `firecube_timestamp_state` by leaf name from the live listing, so only that array's dimension names and shape stop coming from the snapshot.
+- P8: `metadata_authority.py:499` is an `open_array` inside the node lock that already reads only its own document; no change.
+- P9: the architecture test extends `tests/unit/test_no_raw_fsspec_usage.py`, with a tagged row table modelled on `tests/architecture/test_cli_boundary.py`; a row that matches nothing or whose count differs fails.
+- P10: the rule covers `zarr.open_group`, `zarr.open`, `zarr.open_consolidated`, `xarray.open_zarr` and `engine="zarr"` opens, spelled through the module, an alias or a name imported from it, function-scope imports included. `**name` counts when the same function assigns that name a dict display holding the key as the literal `False`.
+- P11: the append resume cursor, the state array and staged seeding went to the heavy coder tier; the flags, the helpers and the zip walks to the ordinary tier.
+- P12: `append.py:184` (`_read_existing_append_values`) has no caller in `src`, and `group_exists` ignores `group` in its fallback; both left as they are and recorded in `plans/TODO.md`.
+- P13: `CHANGELOG.md` corrected and `AGENTS.md`, `plans/DESIGN.md` and `plans/TEST.md` updated in G1; the `plans/TODO.md` entry for the sweep is closed in G2.
+- P14: descent. A group reached as `root["G"]` or through `require_group` keeps its own snapshot when the root was opened live. So a decision that reads below the root reads each array by its full path from a live group, lists a group's children only after opening that group with `use_consolidated=False`, and walks descendants by reopening every group with `use_consolidated=False` and listing it at depth 0. The walk never relies on `members(max_depth=None, use_consolidated_for_children=False)`: zarr 3.2.1's sync `Group.members` accepts that flag and does not pass it on. Sites: `state.py`, `staged_metadata.py` and the zip walks.
+- P15: the converter fallback (`converter.py` `_open_group_dataset`, after a `KeyError` naming `dimension_names`) still trusts a group's own snapshot through `_group_from_root`; recorded, `converter.py` not edited (Neo, D1 revision).
+- P16: opens that already passed the flag before the sweep were not audited for descent; recorded.
+
+**Handoff corrections.**
+
+- Firecube writes consolidated metadata in two places, `_consolidate_metadata_best_effort` (`write.py`, only when `zarr_consolidate` is true, GenericZarr only) and the refresh in `coord_consolidation.py`; `append.py:995-996` never runs on zarr 3. The sweep changes neither.
+- W1 to W3 run the DirectZarr fixture and never consolidate, so no judge sees the live-read cost on a consolidated store.
+- `staged_metadata.py:96` was a data-loss path: seeding copies the target root `zarr.json` byte for byte, snapshot included, then reads workspace children through it; a target grown from 8 to 12 under a snapshot of 8 was seeded only to 8 (probe ran). The loss at promotion is inferred, not run.
+- A flag at the root does not reach a group's own snapshot (review round 1).
+
+**Coverage.**
+
+- Red runs (ran, on `a5cedc8` source, `repro/`): rA 5 failing ids, rB 7, rC 10, and the architecture test red with exactly 21 offenders and no stale row (`repro/ta.txt`); one bogus row failed as a stale row (`repro/ta-stale.txt`).
+- Tests added since `a5cedc8`: 368 added lines by `git diff --numstat a5cedc8 -- tests/` at G1, of the 370 budget. Two existing tests changed without weakening: `tests/unit/test_chunk_manager_slot_index.py` (call dictionary) and the transient-read leaf name in the seed test.
+- Replay (ran, x1): 852 base keys compared, 5 problems, 3 candidate-only keys. Three problems are the tree path in output text (`cc4b-base` against `cc4b-work`). Two are the variable order in `archive info` and `archive list` of a `.tgm` in `test_full_archive_restore_cycle` (`DSR,FWI` became `FWI,DSR`). Neo accepted all five.
+- Perf (ran, p1): the judge on S0, W1, W2 and W3 at zero allowance failed by 1 to 2 events (W2 open +1, W3 mkdir +2). Three more interleaved rounds each failed by 1 to 2 events, on different events. Neo accepted this. The cost on consolidated stores is calculated, not run: 4 reads against 11 for zarr and 1 against 4 for xarray on a 5-node store (measured in the survey probes).
+- Baseline failure, recorded not fixed: `tests/integration/test_cli_input_data_presence.py::test_override_discovery_no_input_data_succeeds` fails in the multi-file recording at `a5cedc8` and at `a9a5fc3`. The plugin-registry reload in `tests/integration/test_cli_zarr_preallocate_slot_index.py` leaves the registry with a stale class.
+
+**Findings.**
+
+- `_compute_touched_data_chunks` (`append.py`, about :412 and :421) read arrays through a group object. A group that carried its own snapshot taken before it grew made it return no touched chunks for the grown cells (review reproduced `{'G': {}}` where `{'G': {'val': [(5,)]}}` was right). A staged resume then skipped seeding for them, and whole-tree promotion replaced target cells next to the new data with fill values (review probe: cells 10 and 11 read `[999, 0]` where `[999, 111]` was right). `verify_post_write_integrity` read through the same stale shape and checked nothing for those cells. Fixed by `9d34ac2` (snapshot-leftovers entry above), which reads both by full path from the live root.
+- `validate_zip` still passes a stale but well-formed snapshot; `zarr_consolidate` has only a sample line in `docs/reference/config.md:40`. Both open in `plans/TODO.md`. `ZarrIO.write_dataset` was fixed in `1b3b9e7`.
+
 ## 2026-10-19 — The archive lifecycle runs below the CLI; recovery advice that works; a backfill is reported once recorded (fix/parallel-chunk-ownership)
 
 **Decision.** Two commits, each revertable alone, nothing pushed. The new modules are internal and importable (no facade export, no reference page), as `index_record` is. AB changes no behaviour; C changes text and one output point.

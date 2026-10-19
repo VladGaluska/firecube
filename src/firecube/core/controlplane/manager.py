@@ -1929,11 +1929,13 @@ class ChunkManager:
                 handle = create_zarr_store(
                     uri=product_root, storage_config=storage_config, mode="r"
                 )
-                root = zarr.open_group(**handle.zarr_kwargs(), mode="r", zarr_format=3)
+                root = zarr.open_group(
+                    **handle.zarr_kwargs(), mode="r", zarr_format=3, use_consolidated=False
+                )
             else:
                 local = local_path_from_target(product_root)
                 store = LocalStore(str(local))
-                root = zarr.open_group(store=store, mode="r", zarr_format=3)
+                root = zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
         except FileNotFoundError:
             return None
         except (PermissionError, OSError, TimeoutError, json.JSONDecodeError, ValueError) as exc:

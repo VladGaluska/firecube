@@ -47,18 +47,17 @@ class ZarrIO:
 
     def open_group(self, uri: StorageUri, mode: str = "r") -> Any:
         kwargs: dict[str, Any] = {**self.create_store(uri, mode).zarr_kwargs(), "mode": mode}
-        return zarr.open_group(**kwargs)
+        return zarr.open_group(**kwargs, use_consolidated=False)
 
     def open_dataset(self, uri: StorageUri, group: str = "", **xr_kwargs: Any) -> xr.Dataset:
         """Open an xarray dataset from a Zarr group using the session store.
 
         ``uri`` must be a canonical ``StorageUri``; raw URI strings are not
-        accepted by this elevated session API. Additional keyword arguments are
-        forwarded to ``xr.open_zarr`` (e.g. ``decode_times=False`` for raw
-        attribute inspection by structural validators).
+        accepted by this elevated session API. The helper always reads live metadata, so
+        a caller cannot pass ``consolidated``. Other keyword arguments go to ``xr.open_zarr``.
         """
         handle = self.create_store(uri, mode="r")
-        return xr.open_zarr(**handle.zarr_kwargs(), group=group, **xr_kwargs)
+        return xr.open_zarr(**handle.zarr_kwargs(), group=group, consolidated=False, **xr_kwargs)
 
     def write_dataset(
         self,
@@ -73,7 +72,8 @@ class ZarrIO:
         Store construction is centralized through ``create_store`` so local,
         remote, fsspec, and obstore targets follow the same session-bound driver
         configuration. ``zarr_format`` may be supplied for xarray-style callers;
-        only format 3 is supported by the underlying Firecube write helper.
+        only format 3 is supported by the underlying Firecube write helper. The write never
+        creates a consolidated snapshot, so a caller cannot pass ``consolidated``.
         """
         handle = self.create_store(uri, mode)
         zarr_format = kwargs.pop("zarr_format", 3)
@@ -84,5 +84,15 @@ class ZarrIO:
             group=group,
             mode=cast(Any, mode),
             zarr_format=zarr_format,
+            consolidated=False,
             **kwargs,
         )
+
+    def refresh_consolidated_metadata(self, uri: StorageUri) -> None:
+        """Rewrite the consolidated snapshot of each group under *uri* that already has one.
+
+        A group without a snapshot stays without it, so the call never creates one.
+        """
+        from firecube.core.zarr.coord_consolidation import _refresh_consolidated_metadata
+
+        _refresh_consolidated_metadata(self.open_group(uri, mode="r+"))

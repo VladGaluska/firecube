@@ -142,7 +142,7 @@ Current invariant suites include:
 - `tests/architecture/` — repository-wide architecture and storage-flow rules.
 - `tests/architecture/test_cli_boundary.py` — CLI boundary: no Click, `firecube.cli` or CLI command text below `cli/`, no private module imported by `cli/`, a 500-line ceiling per `cli/` module. Tagged allowlists; a stale row fails.
 - `tests/sdk/test_plugin_contract.py` — public plugin import-surface contract.
-- `tests/unit/test_no_raw_fsspec_usage.py` — write-domain storage boundary.
+- `tests/unit/test_no_raw_fsspec_usage.py` — write-domain storage boundary, and live metadata reads (`test_zarr_metadata_opens_read_live_metadata`: Zarr opens pass `use_consolidated=False` or `consolidated=False`; tagged rows, a stale row fails).
 - `tests/unit/test_observability_boundaries.py` — OpenTelemetry, Prometheus, and logging boundaries.
 
 Use `@pytest.mark.architecture` for new repository-boundary tests and

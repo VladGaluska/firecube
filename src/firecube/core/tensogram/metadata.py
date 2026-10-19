@@ -209,7 +209,7 @@ def extract_zarr_array_metadata(
     if group is not None:
         open_kwargs["path"] = group
 
-    zgroup = zarr.open_group(**open_kwargs)
+    zgroup = zarr.open_group(**open_kwargs, use_consolidated=False)
 
     result: dict[str, dict[str, Any]] = {}
     for name, item in zgroup.members():

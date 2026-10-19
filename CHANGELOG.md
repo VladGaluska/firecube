@@ -35,8 +35,7 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   2. Abandon its run with `firecube chunks runs abandon`.
   3. Run `firecube zarr preallocate` again.
 - Ingest reads the engine-owned markers from the array's own metadata, so
-  stale consolidated metadata does not hide them. Validation still reads
-  consolidated metadata and can see stale values. Append resume reads the
+  stale consolidated metadata does not hide them. Append resume reads the
   stored array metadata when it classifies slots, writes and fills.
 - `--archive-format [tensogram|zip]` option on `firecube archive create`.
   `--archive-format zip` packs a Zarr product into a single local
@@ -252,6 +251,43 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   stamp. The command now reads the live metadata of the root and of every group
   below it. Before, it could read consolidated metadata that predated the stamp
   and rewrite the coordinate.
+- `firecube archive restore` of a Tensogram archive no longer creates
+  consolidated metadata. `firecube zarr multires` no longer creates it either.
+  Before, both commands wrote it at the root of a store that had none.
+  - If the store already has consolidated metadata, both commands rewrite it
+    after the last write. The rewritten metadata lists every group and array
+    that they wrote.
+  - If you open a restored store with the xarray defaults, the open works.
+    xarray warns that it fell back to the slower read without consolidated
+    metadata. To silence the warning, pass `consolidated=False`.
+- These operations now read the own metadata of each array and each group. A
+  consolidated snapshot that is older than the store no longer decides what
+  they do. Append resume and `firecube archive create` have exceptions, which
+  the items below name:
+  - Append resume. It reads the live array metadata when it determines the
+    initial write cursor. An append into a store whose snapshot predates growth
+    no longer resumes at the old length and overwrites slots. Classification of
+    the slots can still use the own snapshot of a group.
+  - Staged resume. It no longer limits seeding to the length that a snapshot at
+    the root records. The own snapshot of a group no longer makes it skip
+    seeding. Before, a staged resume that skipped seeding could publish fill
+    values over target cells next to the new data.
+  - The state update of a span deletion.
+  - `firecube zarr validate` and `firecube zarr compare`.
+  - `firecube archive validate` on a zip archive. It now reports a child
+    document that does not parse.
+  - `firecube archive create`. A group whose arrays carry no dimension names
+    is still read through the own snapshot of that group, if it has one.
+  - The order of a new Tensogram archive. `firecube archive create` now writes
+    the groups in name order. In each group it writes the data variables in
+    name order, then the coordinates in name order. `firecube archive info` and
+    `firecube archive list` show the same order on every run. Archives made
+    before keep their order.
+  - `firecube advise compliance` and `firecube catalog intake`.
+
+  `firecube archive info` and `firecube archive list` of a zip archive show
+  the live metadata. Before, each of these operations could act on the
+  snapshot.
 - `firecube archive restore --overwrite` of a `.tgm` archive now checks the
   archive before it deletes anything. It reads the archive version and runs the
   quick structural check of every message. If the archive fails a check, the

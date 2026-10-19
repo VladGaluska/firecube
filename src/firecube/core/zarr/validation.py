@@ -472,8 +472,8 @@ def compare_zarr_stores(
 
     a_handle = create_zarr_store(uri=a_uri, storage_config=storage_config, mode="r")
     b_handle = create_zarr_store(uri=b_uri, storage_config=storage_config, mode="r")
-    a_root = zarr.open_group(**a_handle.zarr_kwargs(), mode="r")
-    b_root = zarr.open_group(**b_handle.zarr_kwargs(), mode="r")
+    a_root = zarr.open_group(**a_handle.zarr_kwargs(), mode="r", use_consolidated=False)
+    b_root = zarr.open_group(**b_handle.zarr_kwargs(), mode="r", use_consolidated=False)
 
     for path in sorted(a_paths & b_paths):
         left = cast(Any, a_root[path])
@@ -610,7 +610,7 @@ def read_chunk_grid_from_handle(
     """Read dimension names, shape, and chunk_shape via a driver-aware store handle."""
     import zarr
 
-    root = zarr.open_group(**handle.zarr_kwargs(), mode="r")
+    root = zarr.open_group(**handle.zarr_kwargs(), mode="r", use_consolidated=False)
     array = cast(Any, root[group.strip("/")])
     return _read_chunk_grid_from_zarr_array(array, group)
 
@@ -622,7 +622,7 @@ def read_chunk_grid_with_shards_from_handle(
     """Read chunk/shard grid via a driver-aware store handle."""
     import zarr
 
-    root = zarr.open_group(**handle.zarr_kwargs(), mode="r")
+    root = zarr.open_group(**handle.zarr_kwargs(), mode="r", use_consolidated=False)
     array = cast(Any, root[group.strip("/")])
     dim_names, shape, outer_chunk_shape = _read_chunk_grid_from_zarr_array(array, group)
 
@@ -792,7 +792,7 @@ def group_exists(
 
         # Fallback: try opening the store directly
         try:
-            zarr.open_group(store=store_target, mode="r")
+            zarr.open_group(store=store_target, mode="r", use_consolidated=False)
             return True
         except Exception:
             return False
@@ -928,6 +928,7 @@ def _open_zarr_root_from_fs(fs: StorageFilesystem, store_uri: StorageUri) -> Any
             store=_StorageFilesystemStore(fs, store_uri),
             mode="r",
             zarr_format=3,
+            use_consolidated=False,
         )
     except (FileNotFoundError, KeyError, ValueError) as exc:
         # Narrow on purpose: broader failures (RuntimeError, OSError, ...) must
