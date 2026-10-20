@@ -50,6 +50,7 @@ from firecube.core.errors import ConfigurationError, Message, Param, SchemaDrift
 from firecube.core.product.resolver import ProductResolver
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
+from firecube.core.time.convert import coord_to_datetime64
 from firecube.core.uris import local_path_from_target
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
 from firecube.core.zarr._coord_lifecycle import assert_coord_markers_consistent
@@ -58,7 +59,6 @@ from firecube.core.zarr._sealing_markers import (
     ATTR_COORD_MANAGED,
     ATTR_PREALLOCATED,
 )
-from firecube.core.zarr.coord_materialization import coord_to_datetime64
 from firecube.core.zarr.guard.engine_owned import exception_text
 
 if TYPE_CHECKING:

@@ -51,6 +51,7 @@ from firecube.core.zarr._coord_lifecycle import (
     raise_if_invalid,
     resolve_coord_lifecycle,
 )
+from firecube.core.zarr._fill import _fill_value_is_missing
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
 from firecube.core.zarr.guard._unit_locks import _store_identity
 from firecube.core.zarr.guard.chunk_geometry import Bounds
@@ -91,22 +92,6 @@ def _raise_time_capacity_error(
     )
 
 
-def _fill_value_is_missing(value: Any) -> bool:
-    """Return True when *value* is a not-a-value sentinel for its dtype.
-
-    Covers floating/complex ``NaN`` and datetime64/timedelta64 ``NaT`` — the fill
-    sentinels that are never equal to themselves under ``==``. Dispatch is by
-    numpy dtype kind so every such type is handled uniformly; all other kinds
-    (ints, bytes, object, ``None``) are never "missing".
-    """
-    arr = np.asarray(value)
-    if arr.dtype.kind in ("f", "c"):  # floating, complex
-        return bool(np.isnan(arr))
-    if arr.dtype.kind in ("M", "m"):  # datetime64, timedelta64
-        return bool(np.isnat(arr))
-    return False
-
-
 def _fill_values_equal(existing: Any, spec: Any) -> bool:
     # Missing-value fills (NaN, NaT) are never == themselves, so compare them by
     # "both missing" rather than by value; otherwise fall back to plain equality.
@@ -115,30 +100,6 @@ def _fill_values_equal(existing: Any, spec: Any) -> bool:
     if existing_missing or spec_missing:
         return existing_missing and spec_missing
     return bool(existing == spec)
-
-
-def _array_is_all_fill(arr: np.ndarray, fill_value: Any) -> bool:
-    """Return True iff every element of *arr* equals *fill_value* under
-    missing-aware equality.
-
-    Mirrors `_fill_value_is_missing` semantics:
-      - float / complex NaN fill: every element must be NaN
-      - datetime64 / timedelta64 NaT fill: every element must be NaT
-      - all other dtypes (int, bool, bytes/string): plain element-wise equality
-
-    Empty arrays return True (consistent with ``np.all([])`` semantics; an
-    empty static array trivially satisfies "all elements equal fill".
-
-    Out of contract: object dtype, structured/record dtypes. Callers MUST
-    not pass these.
-    """
-    if _fill_value_is_missing(fill_value):
-        kind = np.asarray(fill_value).dtype.kind
-        if kind in ("f", "c"):
-            return bool(np.all(np.isnan(arr)))
-        if kind in ("M", "m"):
-            return bool(np.all(np.isnat(arr)))
-    return bool(np.all(arr == fill_value))
 
 
 def _fill_value_attr_value(fill_value: Any, dtype: Any) -> Any:

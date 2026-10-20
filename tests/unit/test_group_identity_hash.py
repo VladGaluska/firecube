@@ -143,3 +143,41 @@ def test_regular_axis_end_date_and_slot_count_yield_same_hash_at_same_size() -> 
     assert _compute_group_identity_hash(a, 100, "datetime64[ns]") == (
         _compute_group_identity_hash(b, 100, "datetime64[ns]")
     )
+
+
+def test_gregorian_axis_hashes_keep_their_pinned_persisted_values() -> None:
+    # Persisted-format contract: a shift here invalidates every existing store.
+    # Migrate, do not regenerate the literals.
+    regular = _make_regular()
+    assert _compute_group_identity_hash(regular, 100, "datetime64[ns]") == (
+        "04e7861a55f053efca8b8fab188aec5a0cfd63ca130c844407d0d880237e775a"
+    )
+    numeric = IrregularTimeAxis(coordinate="time", values=(1, 2, 3))
+    assert _compute_group_identity_hash(numeric, 3, "int64") == (
+        "3efcac228fc838b66355fec2aebae37971fa710f80fff08410c58b9b30b861f9"
+    )
+    iso = IrregularTimeAxis(
+        coordinate="timestamp", values=["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"]
+    )
+    assert _compute_group_identity_hash(iso, 2, "datetime64[ns]") == (
+        "6e0646f7147f7bd8985f5f96e93b16a699535e34429ccf4f66fafef37e359ded"
+    )
+
+
+def test_calendar_enters_the_hash_of_a_non_gregorian_axis() -> None:
+    def hash_for(**kwargs: object) -> str:
+        axis = RegularTimeAxis(
+            coordinate="time",
+            epoch="2049-01-01T00:00:00Z",
+            cadence_s=86400,
+            slot_count=90,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        return _compute_group_identity_hash(axis, 90, "int64")
+
+    assert hash_for(calendar="360_day") != hash_for()
+    assert hash_for(calendar="360_day") != hash_for(calendar="noleap")
+    assert hash_for(calendar="360_day") == (
+        "105bacab35c891da511a2b5841869dff9b66c7f3a13fee6ff2bc7a485b2672f1"
+    )
+    assert hash_for(calendar="standard") == hash_for()

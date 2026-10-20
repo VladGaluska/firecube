@@ -62,9 +62,7 @@ from firecube.core.index_spec import (
     RegularTimeAxis,
     effective_regular_time_policy,
 )
-from firecube.core.index_spec import (
-    _canonical_coordinate_value as canonical_coordinate_value,
-)
+from firecube.core.time.convert import coord_to_datetime64
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
 from firecube.core.zarr._coord_lifecycle import assert_coord_markers_consistent
 from firecube.core.zarr._reserved_attrs import (
@@ -771,11 +769,3 @@ def build_regular_coord_attrs(spec: Any | None, axis: Any) -> dict[str, Any]:
     merged.pop("units", None)
     merged.pop("calendar", None)
     return merged
-
-
-def coord_to_datetime64(value: Any) -> np.datetime64:
-    canonical = canonical_coordinate_value(value)
-    if isinstance(canonical, str):
-        canonical = canonical.removesuffix("Z")
-        canonical = canonical.removesuffix("+00:00")
-    return np.datetime64(canonical, "ns")

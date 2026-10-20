@@ -436,7 +436,7 @@ def delete_span_via_region_nan_fill(
     import zarr
 
     from firecube.core.filesystem.store_factory import create_zarr_store
-    from firecube.core.zarr.region_writer import _array_is_all_fill
+    from firecube.core.zarr._fill import _array_is_all_fill
 
     ranges = _contiguous_ranges(time_indices)
     if not ranges:

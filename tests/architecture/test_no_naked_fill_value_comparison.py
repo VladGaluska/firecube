@@ -20,7 +20,7 @@ Naked equality against a Zarr ``fill_value`` is wrong when the fill is NaN
 and ingestion mis-classifies untouched slots as "real data" that diverged
 from the incoming write. The canonical NaN-aware comparator is
 ``_array_is_all_fill(arr, fill_value)`` in
-``firecube.core.zarr.region_writer``.
+``firecube.core.zarr._fill``.
 
 Scope: write-domain modules only (zarr maintenance + ingestor runtime).
 Detection: AST walk over each ``*.py`` file under the scan dirs. A
@@ -53,6 +53,7 @@ PERMANENT_ALLOWLIST: frozenset[str] = frozenset()
 # their internal ``arr == fill_value`` lines are the intended implementation.
 _EXEMPT_FUNCTION_NAMES: frozenset[str] = frozenset(
     {
+        "_fill_mask",
         "_array_is_all_fill",
         "_fill_value_is_missing",
         "_fill_values_equal",
@@ -113,7 +114,7 @@ def test_no_naked_equality_against_fill_value() -> None:
 
     Naked ``existing == fill_value`` returns False for NaN fills, mis-classifying
     fresh slots as "real data". Use ``_array_is_all_fill(arr, fill_value)`` from
-    ``firecube.core.zarr.region_writer`` instead — it is NaN-aware.
+    ``firecube.core.zarr._fill`` instead — it is NaN-aware.
     """
     all_violations: list[str] = []
     for scan_dir in SCAN_DIRS:
@@ -132,7 +133,7 @@ def test_no_naked_equality_against_fill_value() -> None:
                 all_violations.append(
                     f"{rel_path}:{lineno}: naked fill comparison `{expr}` — "
                     f"use `_array_is_all_fill(arr, fill_value)` from "
-                    f"firecube.core.zarr.region_writer instead"
+                    f"firecube.core.zarr._fill instead"
                 )
     assert not all_violations, "Naked `== fill_value` / `== fill` comparisons found:\n" + "\n".join(
         all_violations

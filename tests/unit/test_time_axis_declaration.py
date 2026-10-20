@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import cftime
 import pytest
 
 from firecube.core.api import (
@@ -153,3 +154,55 @@ class TestTimeAxisFacade:
     def test_serial_mode_declaration_needs_no_extent(self) -> None:
         axis = TimeAxis.observed(coordinate="time", epoch=_EPOCH, cadence_s=_CADENCE_S)
         assert axis.slot_count is None and axis.end_date is None
+
+
+_CALENDAR_GRID = {"coordinate": "time", "epoch": "2049-01-01T12:00:00Z", "cadence_s": 86400}
+
+
+class TestCalendarDeclaration:
+    def test_regular_calendar_axis_normalises_name_and_derives_units(self) -> None:
+        axis = RegularTimeAxis(**_CALENDAR_GRID, slot_count=90, calendar="360_Day")
+        assert axis.calendar == "360_day"
+        assert axis.encoded_units == "seconds since 2049-01-01 12:00:00"
+
+    @pytest.mark.parametrize(
+        ("overrides", "reason"),
+        [
+            ({"slot_count": 1, "mode": "floor"}, 'mode="exact"'),
+            ({"end_date": "2049-01-02T00:00:00Z"}, "use slot_count instead"),
+            ({}, "slot_count"),
+            ({"slot_count": 0}, "slot_count must be positive"),
+        ],
+        ids=["floor", "end_date", "no-slot-count", "zero-slot-count"],
+    )
+    def test_regular_calendar_axis_refuses_what_it_cannot_place(
+        self, overrides: dict, reason: str
+    ) -> None:
+        with pytest.raises(ValueError, match=reason):
+            RegularTimeAxis(**_CALENDAR_GRID, calendar="360_day", **overrides)
+
+    @pytest.mark.parametrize(
+        ("calendar", "units", "reason"),
+        [
+            ("360_day", None, "calendar requires units to also be set"),
+            ("standard", "seconds since 2049-01-01 00:00:00", "only used with a non-Gregorian"),
+            (None, "days since 1850-01-01", "only used with a non-Gregorian"),
+        ],
+    )
+    def test_irregular_axis_units_belong_to_non_gregorian_calendars_only(
+        self, calendar: str | None, units: str | None, reason: str
+    ) -> None:
+        kwargs = {k: v for k, v in {"calendar": calendar, "units": units}.items() if v}
+        with pytest.raises(ValueError, match=reason):
+            IrregularTimeAxis(
+                coordinate="time", values=[cftime.Datetime360Day(2049, 1, 1)], **kwargs
+            )
+
+    def test_explicit_calendar_values_are_encoded_in_declared_order(self) -> None:
+        axis = IrregularTimeAxis(
+            coordinate="time",
+            values=[cftime.Datetime360Day(2049, 2, 30, 12), cftime.Datetime360Day(2049, 1, 1, 12)],
+            calendar="360_day",
+            units="seconds since 2049-01-01 12:00:00",
+        )
+        assert axis.values == (5097600, 0)

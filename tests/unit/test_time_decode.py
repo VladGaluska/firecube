@@ -19,7 +19,11 @@
 import numpy as np
 import pytest
 
-from firecube.core.zarr.time_decode import decode_or_passthrough, decode_time_array
+from firecube.core.zarr.time_decode import (
+    decode_or_passthrough,
+    decode_time_array,
+    missing_time_mask,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -151,3 +155,30 @@ class TestDecodeOrPassthrough:
         values = np.array([1.0, 2.0], dtype="float64")
         with pytest.raises(ValueError):
             decode_or_passthrough(values, {"units": "days since not-a-real-date"})
+
+
+def test_360_day_values_decode_to_calendar_objects_including_february_30() -> None:
+    values = np.array([0, 86400, 59 * 86400], dtype="int64")
+
+    decoded = decode_time_array(
+        values, {"units": "seconds since 2049-01-01", "calendar": "360_day"}
+    )
+
+    assert decoded.dtype.kind == "O"
+    assert str(decoded[0]) == "2049-01-01 00:00:00"
+    # Day 59 (0-based) of a 360_day year is February 30.
+    assert decoded[2].calendar == "360_day"
+    assert decoded[2].isoformat() == "2049-02-30T00:00:00"
+
+
+def test_missing_time_mask_flags_nat_none_and_nan_in_every_decoded_shape() -> None:
+    nat = np.array(["2024-01-01", "NaT"], dtype="datetime64[s]")
+    calendar_values = decode_time_array(
+        np.array([0, 86400, 172800, 259200], dtype="int64"),
+        {"units": "seconds since 2049-01-01", "calendar": "360_day"},
+    )
+    mixed = np.array([calendar_values[0], None, float("nan"), calendar_values[3]], dtype=object)
+
+    assert missing_time_mask(nat).tolist() == [False, True]
+    assert missing_time_mask(mixed).tolist() == [False, True, True, False]
+    assert missing_time_mask(np.array([1, 2], dtype="int64")).tolist() == [False, False]
