@@ -24,9 +24,12 @@ double coverage during that window.
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
-from firecube.core.controlplane import ChunkManager, SpanCoverage
+from firecube.core.controlplane import ChunkManager, SpanCoverage, types
 from tests.helpers.storage import make_test_binding
 
 
@@ -226,3 +229,75 @@ class TestTimeCoverageSummaryDedupe:
         assert len(summary) == 2
         assert {entry["group"] for entry in summary} == {"F024", "F048"}
         assert all(entry["span_count"] == 1 for entry in summary)
+
+
+# A 360_day span can end on Feb 30, which is not a Gregorian date.
+FEB_30 = "2024-02-30T00:00:00"
+
+
+def _open_cal_manager(root: Path) -> ChunkManager:
+    (root / "ws").mkdir(exist_ok=True)
+    return ChunkManager(binding=make_test_binding(root, product="cal"), workspace=root / "ws")
+
+
+def record_feb_30_spans(
+    root: Path, bounds: tuple[str, str] = ("2024-02-28T00:00:00", FEB_30), recorded_at=None
+):
+    """Manager holding G_GOOD and a calendar span G_360 (record time ``recorded_at``)."""
+    manager = _open_cal_manager(root)
+    _record_active_span(manager, product="cal", run_id="r1", group="G_GOOD", batch_id="b")
+    with pytest.MonkeyPatch.context() as patch:
+        if recorded_at is not None:
+            patch.setattr(types, "time", SimpleNamespace(time=lambda: recorded_at))
+        _record_active_span(
+            manager,
+            product="cal",
+            run_id="r2",
+            group="G_360",
+            batch_id="b",
+            time_min=bounds[0],
+            time_max=bounds[1],
+        )
+    return manager
+
+
+def stored_span_groups(root: Path) -> set[str]:
+    manager = _open_cal_manager(root)
+    try:
+        spans = manager.list_chunks(product="cal", chunk_type="span")
+        return {(c.meta or {})["group"] for c in spans}
+    finally:
+        manager.close()
+
+
+def feb_30_cli_args(monkeypatch, root: Path, command: str, *args: str, recorded_at=None):
+    """Record the spans under a local config; return the `firecube chunks` argv."""
+    for name in ("FIRECUBE_STORAGE_TYPE", "FIRECUBE_TARGET_PATH", "FIRECUBE_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    record_feb_30_spans(root, recorded_at=recorded_at).close()
+    config = root / "cfg.toml"
+    config.write_text(f'[storage]\ntype = "local"\ntarget_path = "{root}"\n', encoding="utf-8")
+    base = ["--config-file", str(config), "chunks", f"--workspace={root}/ws"]
+    return [*base, command, *args, "--product-name=cal"]
+
+
+@pytest.mark.parametrize(
+    ("bounds", "query"),
+    [
+        (("2024-02-28T00:00:00", FEB_30), {"time_overlaps": ("2024-01-01", "2024-12-31")}),
+        (("2024-02-28T00:00:00", FEB_30), {"time_max_before": "2025-01-01"}),
+        ((FEB_30, "2024-03-01T00:00:00"), {"time_min_after": "2023-01-01"}),
+    ],
+)
+def test_time_filter_refuses_span_with_unparseable_bound(tmp_path: Path, bounds, query) -> None:
+    from firecube.core.controlplane.repo import UnparseableSpanBoundsError
+
+    manager = record_feb_30_spans(tmp_path, bounds)
+    with pytest.raises(UnparseableSpanBoundsError) as exc:
+        manager.list_chunks(product="cal", chunk_type="span", refuse_unparseable=True, **query)
+    default = manager.list_chunks(product="cal", chunk_type="span", **query)
+    manager.close()
+    assert [(tmin, tmax) for _key, tmin, tmax in exc.value.spans] == [bounds]
+    message = str(exc.value)
+    assert "G_360" in message and FEB_30 in message and "G_GOOD" not in message
+    assert {(c.meta or {})["group"] for c in default} == {"G_GOOD"}  # default leaves it out

@@ -164,8 +164,16 @@ class ManifestProjection:
         time_max_before: str | None = None,
         time_overlaps: tuple[str, str] | None = None,
         filter_fn: Callable[[ChunkInfo], bool] | None = None,
+        refuse_unparseable: bool = False,
     ) -> list[ChunkInfo]:
         chunks: list[ChunkInfo] = []
+        unparseable: list[tuple[str, str, str]] = []
+        time_fields = bool(time_min_after or time_max_before or time_overlaps)
+        time_args = {
+            "time_min_after": time_min_after,
+            "time_max_before": time_max_before,
+            "time_overlaps": time_overlaps,
+        }
         products = (
             [product]
             if product
@@ -197,21 +205,14 @@ class ManifestProjection:
                     or not all(chunk.meta.get(k) == v for k, v in meta.items())
                 ):
                     continue
-                if time_min_after:
-                    chunk_time_min = self._repo._parse_iso_dt((chunk.meta or {}).get("time_min"))
-                    requested_time_min = self._repo._parse_iso_dt(time_min_after)
-                    if chunk_time_min is None or requested_time_min is None:
-                        continue
-                    if chunk_time_min < requested_time_min:
-                        continue
-                if time_max_before:
-                    chunk_time_max = self._repo._parse_iso_dt((chunk.meta or {}).get("time_max"))
-                    requested_time_max = self._repo._parse_iso_dt(time_max_before)
-                    if chunk_time_max is None or requested_time_max is None:
-                        continue
-                    if chunk_time_max > requested_time_max:
-                        continue
-                if time_overlaps and not self._repo._meta_time_overlaps(chunk.meta, *time_overlaps):
+                # Without refusal the time filters run before ``filter_fn``, so the
+                # callback never sees a span they exclude. With refusal they run
+                # last, so an unparseable span outside the other filters is ignored.
+                if (
+                    time_fields
+                    and not refuse_unparseable
+                    and not self._passes_time_filters(chunk, **time_args, unparseable=None)
+                ):
                     continue
                 if filter_fn and not filter_fn(chunk):
                     continue
@@ -223,10 +224,60 @@ class ManifestProjection:
                     continue
                 if after and chunk.datetime <= after:
                     continue
+                if (
+                    time_fields
+                    and refuse_unparseable
+                    and not self._passes_time_filters(chunk, **time_args, unparseable=unparseable)
+                ):
+                    continue
                 chunks.append(chunk)
 
+        self._repo._refuse_unparseable_spans(unparseable)
         chunks.sort(key=lambda c: c.timestamp, reverse=True)
         return chunks
+
+    def _passes_time_filters(
+        self,
+        chunk: ChunkInfo,
+        *,
+        time_min_after: str | None,
+        time_max_before: str | None,
+        time_overlaps: tuple[str, str] | None,
+        unparseable: list[tuple[str, str, str]] | None,
+    ) -> bool:
+        """Apply the time filters.
+
+        With ``unparseable`` given, spans whose compared bounds do not parse are
+        collected there; otherwise they are excluded.
+        """
+        meta = chunk.meta or {}
+        compared: list[str] = []
+        if time_min_after:
+            compared.append("time_min")
+        if time_max_before:
+            compared.append("time_max")
+        if time_overlaps:
+            compared.extend(("time_min", "time_max"))
+        if unparseable is not None:
+            bounds = self._repo._unparseable_bounds(meta, tuple(compared))
+            if bounds is not None:
+                unparseable.append((chunk.key, *bounds))
+                return False
+        if time_min_after:
+            chunk_time_min = self._repo._parse_iso_dt(meta.get("time_min"))
+            requested_time_min = self._repo._parse_iso_dt(time_min_after)
+            if chunk_time_min is None or requested_time_min is None:
+                return False
+            if chunk_time_min < requested_time_min:
+                return False
+        if time_max_before:
+            chunk_time_max = self._repo._parse_iso_dt(meta.get("time_max"))
+            requested_time_max = self._repo._parse_iso_dt(time_max_before)
+            if chunk_time_max is None or requested_time_max is None:
+                return False
+            if chunk_time_max > requested_time_max:
+                return False
+        return not time_overlaps or self._repo._meta_time_overlaps(meta, *time_overlaps)
 
     def _load_current_state(self, product: str) -> dict[str, dict[str, Any]]:
         self._repo._ensure_bound()

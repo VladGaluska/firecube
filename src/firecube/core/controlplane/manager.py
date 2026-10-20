@@ -573,8 +573,13 @@ class ChunkManager:
         time_max_before: str | None = None,
         time_overlaps: tuple[str, str] | None = None,
         filter_fn: Callable[[ChunkInfo], bool] | None = None,
+        refuse_unparseable: bool = False,
     ) -> list[ChunkInfo]:
         """Return projected chunk records with optional filtering.
+
+        With ``refuse_unparseable`` a time filter raises
+        ``UnparseableSpanBoundsError`` when a span's compared bounds do not
+        parse; by default such spans are left out of the result.
 
         During a force-reingest run there is a brief window where both prior
         spans and new spans have ``status="active"`` (before
@@ -606,6 +611,7 @@ class ChunkManager:
             time_max_before=time_max_before,
             time_overlaps=time_overlaps,
             filter_fn=filter_fn,
+            refuse_unparseable=refuse_unparseable,
         )
         run_started_at_by_id = (
             self._build_run_started_at_lookup(chunks)

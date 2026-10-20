@@ -12,10 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import click
+import numpy as np
 import pytest
+import xarray as xr
+import zarr
 
 from firecube.cli._errors import wrap_user_facing_errors
+from firecube.core.filesystem.store_factory import ZarrStoreHandle
+from firecube.core.zarr.time_decode import decode_time_array
 from firecube.ingestor.errors import (
     AppendOverwriteRefused,
     DuplicateExistingTimestampsError,
@@ -24,6 +31,7 @@ from firecube.ingestor.errors import (
     ResumeConflictError,
     SchemaDriftReingestError,
 )
+from firecube.ingestor.runtime.zarr.append_order import AppendOrder
 
 
 def test_error_hierarchy() -> None:
@@ -75,3 +83,26 @@ def test_public_ingestor_error_subclasses_produce_user_facing_exit(
 
     assert excinfo.value.__cause__ is exc
     assert str(exc) == excinfo.value.message
+
+
+@pytest.mark.parametrize("incoming_day", [2, 1], ids=["equal-to-maximum", "before-maximum"])
+def test_append_order_refuses_calendar_value_at_or_before_stored_maximum(
+    tmp_path: Path, incoming_day: int
+) -> None:
+    attrs = {"units": "seconds since 2049-01-01", "calendar": "360_day"}
+    store_dir = tmp_path / "store.zarr"
+    group = zarr.open_group(store=str(store_dir), mode="w", zarr_format=3).create_group("grp")
+    stored = group.create_array("time", shape=(3,), dtype="int64", chunks=(3,))
+    stored[:] = np.arange(3) * 86400
+    stored.attrs.update(attrs)
+    handle = ZarrStoreHandle(
+        store=str(store_dir), storage_options=None, target_uri=f"file://{store_dir}"
+    )
+    incoming = xr.Dataset(
+        coords={"time": decode_time_array(np.array([incoming_day * 86400]), attrs)}
+    )
+    with pytest.raises(InsertRefusedError) as excinfo:
+        AppendOrder().assert_append(
+            incoming, group="grp", time_dim="time", write_store=handle, resume_store=None
+        )
+    assert excinfo.value.reason == "insert"

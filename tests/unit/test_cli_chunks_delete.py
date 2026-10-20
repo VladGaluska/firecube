@@ -14,10 +14,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
+
+import pytest
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
 from firecube.core.controlplane.types import ChunkInfo, DeletionPlan
+from tests.unit.test_chunk_manager_queries import feb_30_cli_args, stored_span_groups
 
 
 class _FakeDeleteManager:
@@ -209,3 +214,32 @@ def test_delete_all_products_dry_run_no_confirmation_needed(monkeypatch):
     assert "MissingScope" not in r.output
     assert "ConflictingScope" not in r.output
     assert "yes-i-really-mean-it" not in r.output.lower()
+
+
+@pytest.mark.parametrize(
+    ("window", "refused", "remaining"),
+    [
+        ("--end-date=2021-01-01", True, {"G_GOOD", "G_360"}),
+        ("--start-date=2021-01-01", False, {"G_360"}),
+    ],
+    ids=["span-inside-date-window", "span-outside-date-window"],
+)
+def test_delete_time_range_refuses_feb_30_span_only_inside_date_window(
+    monkeypatch, tmp_path: Path, window: str, refused: bool, remaining: set[str]
+) -> None:
+    # G_360 is recorded in 2020, G_GOOD now; the date window selects one of them.
+    argv = feb_30_cli_args(
+        monkeypatch,
+        tmp_path,
+        "delete",
+        "--time-range=2024-01-01:2024-12-31",
+        window,
+        "--yes-i-really-mean-it",
+        recorded_at=datetime(2020, 6, 1).timestamp(),
+    )
+    result = CliRunner().invoke(cli, argv)
+
+    assert (result.exit_code != 0) is refused, result.output
+    assert stored_span_groups(tmp_path) == remaining
+    if refused:
+        assert "G_360" in result.output and "02-30" in result.output, result.output

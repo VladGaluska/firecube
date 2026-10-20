@@ -21,7 +21,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,6 +78,36 @@ from firecube.core.storage.uri import StorageUri
 from firecube.core.uris import is_remote_target
 
 log = logging.getLogger(__name__)
+
+
+class UnparseableSpanBoundsError(ManifestError):
+    """A time-range filter met spans whose recorded bounds cannot be compared.
+
+    Such spans (for example a ``360_day`` span ending on Feb 30) cannot be
+    placed relative to a Gregorian time window, so the query refuses them
+    instead of silently leaving them out of the result.
+
+    Attributes:
+        spans: One `(span key, time_min, time_max)` entry per refused span, with the
+            bounds as recorded.
+    """
+
+    def __init__(self, spans: Iterable[tuple[str, str, str]]) -> None:
+        """Build the error and its sentence from the refused spans.
+
+        Args:
+            spans: `(span key, time_min, time_max)` for each refused span.
+        """
+        self.spans = tuple(spans)
+        rendered = "; ".join(
+            f"{key} (time_min={time_min!r}, time_max={time_max!r})"
+            for key, time_min, time_max in self.spans
+        )
+        super().__init__(
+            f"Cannot apply a time-range filter: {len(self.spans)} span(s) have recorded bounds "
+            f"that do not parse as dates in the proleptic Gregorian calendar: {rendered}. "
+            "Nothing was filtered or deleted."
+        )
 
 
 @dataclass(slots=True)
@@ -418,6 +448,7 @@ class ManifestRepository:
         time_max_before: str | None = None,
         time_overlaps: tuple[str, str] | None = None,
         filter_fn: Callable[[ChunkInfo], bool] | None = None,
+        refuse_unparseable: bool = False,
     ) -> list[ChunkInfo]:
         return self._projection.list_chunks(
             pattern=pattern,
@@ -432,6 +463,7 @@ class ManifestRepository:
             time_max_before=time_max_before,
             time_overlaps=time_overlaps,
             filter_fn=filter_fn,
+            refuse_unparseable=refuse_unparseable,
         )
 
     def mark_chunks_replaced(
@@ -811,6 +843,28 @@ class ManifestRepository:
         if parsed.tzinfo is None:
             return parsed
         return parsed.astimezone(UTC).replace(tzinfo=None)
+
+    def _unparseable_bounds(
+        self, meta: dict[str, Any] | None, fields: tuple[str, ...]
+    ) -> tuple[str, str] | None:
+        """Return the recorded `(time_min, time_max)` when any of ``fields`` is set but unparseable.
+
+        Absent (``None``) or blank bounds are not unparseable: such spans stay outside
+        time-range filters, as before.
+        """
+        if not isinstance(meta, dict):
+            return None
+        for field_name in fields:
+            raw = meta.get(field_name)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if self._parse_iso_dt(raw) is None:
+                return str(meta.get("time_min")), str(meta.get("time_max"))
+        return None
+
+    def _refuse_unparseable_spans(self, spans: list[tuple[str, str, str]]) -> None:
+        if spans:
+            raise UnparseableSpanBoundsError(spans)
 
     def _meta_time_overlaps(
         self,
