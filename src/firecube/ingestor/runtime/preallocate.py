@@ -40,13 +40,22 @@ from firecube.core.index_resolve import (
 )
 from firecube.core.observability.metrics import TelemetryService, emit_index_ensured_full
 from firecube.core.storage.session import StorageSession
-from firecube.core.zarr.coord_materialization import (
+from firecube.core.time.calendar import is_gregorian_axis
+from firecube.core.zarr._coord_common import (
     array_schema_mismatches,
+    existing_array,
+    open_existing_root_read_only,
+)
+from firecube.core.zarr.coord_materialization import (
     axis_has_resolvable_extent,
     discover_regular_observed_coord_values,
-    existing_array,
     materialize_irregular_coord_array,
     materialize_regular_coord_array,
+)
+from firecube.core.zarr.coord_rematerialization import (
+    RegularCoordTarget,
+    check_irregular_coord_rematerialization,
+    check_regular_coord_rematerialization,
 )
 from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
 from firecube.core.zarr.guard.engine_owned import (
@@ -98,6 +107,13 @@ class PreallocateDryRunGroup:
             preview reads no values.
         first: The first coordinate value in the window, or `None`.
         last: The last coordinate value in the window, or `None`.
+        calendar: The axis calendar when its coordinate is stored encoded (not
+            Gregorian-like); `None` otherwise. `first` and `last` are then the
+            encoded numbers, to be decoded with `units` and `calendar`.
+        units: The CF units the encoded coordinate is stored in; `None` unless
+            `calendar` is set.
+        window_applied: `False` when the run writes the whole calendar coordinate
+            although the window is narrower; `True` otherwise.
     """
 
     group: str
@@ -106,6 +122,9 @@ class PreallocateDryRunGroup:
     items_in_window: int | None = None
     first: Any = None
     last: Any = None
+    calendar: str | None = None
+    units: str | None = None
+    window_applied: bool = True
 
 
 def _ignore_line(line: str) -> None:
@@ -364,6 +383,35 @@ def preallocate_product(
             _preallocate_run_registered = True
             _preallocate_run_created = True
 
+        coord_names_by_group = {spec.group: spec.coord_names for spec in schema}
+
+        strategy = IndexedRegionStrategy(
+            store_uri=plugin_target,
+            schema=schema,
+            coord_names_by_group=coord_names_by_group,
+            storage_config=storage_config,
+            session=session,
+        )
+
+        zarr_store = None
+        if getattr(strategy, "_storage_config", None):
+            zarr_store = session.zarr.create_store(
+                uri=storage_uri_from_target(plugin_target),
+                mode="a",
+            ).store
+
+        store_writer = RegionZarrWriter(plugin_target, store=zarr_store)
+        # Refuse a coordinate relabel in any group before the first store write,
+        # and before ensure_resolved_index publishes the incoming index (its
+        # current.json and the root mirror), so a refusal leaves the store as
+        # it was and a retry with the original axis still succeeds.
+        regular_coord_targets = _preflight_coordinates(
+            schema=schema,
+            resolved_index=resolved_index,
+            global_expected=global_expected,
+            root=open_existing_root_read_only(store_writer),
+        )
+
         if skipped_unbounded:
             # Mixed bounded/unbounded specs skip the full IndexSpec
             # record persistence. Persisting the rebuilt (bounded-only)
@@ -406,24 +454,6 @@ def preallocate_product(
             )
             report(f"resolved index: {outcome}")
 
-        coord_names_by_group = {spec.group: spec.coord_names for spec in schema}
-
-        strategy = IndexedRegionStrategy(
-            store_uri=plugin_target,
-            schema=schema,
-            coord_names_by_group=coord_names_by_group,
-            storage_config=storage_config,
-            session=session,
-        )
-
-        zarr_store = None
-        if getattr(strategy, "_storage_config", None):
-            zarr_store = session.zarr.create_store(
-                uri=storage_uri_from_target(plugin_target),
-                mode="a",
-            ).store
-
-        store_writer = RegionZarrWriter(plugin_target, store=zarr_store)
         _ensure_ancestors(store_writer, _preallocate_claim_handle, global_expected)
         for group_spec in schema:
             group_name = group_spec.group
@@ -515,25 +545,23 @@ def preallocate_product(
 
                 axis = group_axis
                 if isinstance(axis, IrregularTimeAxis) and axis.values is not AUTO:
-                    coord_spec = _coord_spec(group_spec, axis)
                     materialize_irregular_coord_array(
                         writer=writer,
                         root=root,
                         group_name=group_name,
                         axis=axis,
-                        spec=coord_spec,
+                        spec=_coord_spec(group_spec, axis),
                         report=report,
                     )
                 elif isinstance(axis, RegularTimeAxis) and axis_has_resolvable_extent(
                     axis, resolved_index, group_name
                 ):
-                    coord_spec = _coord_spec(group_spec, axis)
                     materialize_regular_coord_array(
                         writer=writer,
                         root=root,
                         group_name=group_name,
                         axis=axis,
-                        spec=coord_spec,
+                        spec=_coord_spec(group_spec, axis),
                         resolved_index=resolved_index,
                         ingestor=ingestor,
                         plugin_ctx=plugin_ctx,
@@ -542,6 +570,7 @@ def preallocate_product(
                         has_input_data=input_data is not None,
                         input_data=input_data,
                         report=report,
+                        target=regular_coord_targets[group_name],
                     )
 
                 _materialize_engine_owned_arrays(
@@ -799,6 +828,50 @@ def _coord_spec(group_spec: Any, axis: Any) -> Any | None:
     )
 
 
+def _preflight_coordinates(
+    *,
+    schema: Any,
+    resolved_index: Any,
+    global_expected: dict[str, int],
+    root: Any | None,
+) -> dict[str, RegularCoordTarget]:
+    """Run each group's coordinate refusals before any group is written.
+
+    Visits the groups the materialization loop materializes, with the same axis
+    dispatch, on a read-only live *root* (`None` when the store does not exist).
+    It reads only 1-D time coordinate arrays and their attrs and writes nothing.
+
+    Returns:
+        Each regular group's `RegularCoordTarget`, for the loop to reuse.
+    """
+    from firecube.core.index_spec import AUTO, IrregularTimeAxis, RegularTimeAxis
+
+    targets: dict[str, RegularCoordTarget] = {}
+    for group_spec in schema:
+        group_name = group_spec.group
+        if global_expected.get(group_name, 0) <= 0:
+            continue  # the loop skips or refuses it
+        axis = resolved_index.axis_for(group_name)
+        if isinstance(axis, IrregularTimeAxis) and axis.values is not AUTO:
+            check_irregular_coord_rematerialization(
+                root=root,
+                group_name=group_name,
+                axis=axis,
+                spec=_coord_spec(group_spec, axis),
+            )
+        elif isinstance(axis, RegularTimeAxis) and axis_has_resolvable_extent(
+            axis, resolved_index, group_name
+        ):
+            targets[group_name] = check_regular_coord_rematerialization(
+                root=root,
+                group_name=group_name,
+                axis=axis,
+                spec=_coord_spec(group_spec, axis),
+                resolved_index=resolved_index,
+            )
+    return targets
+
+
 def _materialize_engine_owned_arrays(
     root: Any,
     authority: MetadataAuthority,
@@ -890,6 +963,8 @@ def _resolve_preallocate_windows(
     slot_group: str | None = None,
 ) -> dict[str, tuple[int, int]]:
     """Return the half-open slot window of every bounded group, or raise `SlotWindowError`."""
+    from firecube.core.index_spec import RegularTimeAxis
+
     if slot_group is not None:
         available = tuple(resolved_index.groups)
         if slot_group not in available:
@@ -950,7 +1025,11 @@ def _resolve_preallocate_windows(
                     slot_window=(start, end),
                 )
             )
-        if start >= end:
+        # A calendar coordinate is always written whole, so an empty data window
+        # is a valid "materialize the calendar, no data slots" call there. Every
+        # other axis needs start < end: there is nothing to preallocate.
+        is_calendar_axis = isinstance(axis, RegularTimeAxis) and not is_gregorian_axis(axis)
+        if start > end or (start == end and not is_calendar_axis):
             raise SlotWindowError(
                 Message(
                     "{slot_start} must be < {slot_end}, got [{slot_window[0]}, {slot_window[1]})",
@@ -1003,8 +1082,10 @@ def _preview_dry_run(
             continue
         policy = effective_regular_time_policy(axis)
         if policy == "grid":
-            first = resolved_index.coordinate(group_name, start)
-            last = resolved_index.coordinate(group_name, end - 1)
+            is_calendar_axis = not is_gregorian_axis(axis)
+            # An empty window (calendar axes only) has no first or last value.
+            first = resolved_index.coordinate(group_name, start) if end > start else None
+            last = resolved_index.coordinate(group_name, end - 1) if end > start else None
             emit(
                 PreallocateDryRunGroup(
                     group=group_name,
@@ -1013,6 +1094,13 @@ def _preview_dry_run(
                     items_in_window=end - start,
                     first=first,
                     last=last,
+                    calendar=axis.calendar if is_calendar_axis else None,
+                    units=axis.encoded_units if is_calendar_axis else None,
+                    # A calendar coordinate is written whole, whatever the window.
+                    window_applied=not (
+                        is_calendar_axis
+                        and (start, end) != (0, int(resolved_index.size(group_name)))
+                    ),
                 )
             )
             continue

@@ -279,6 +279,22 @@ class TestZarrToTgm:
         assert result["variables"] == ["val"]
         assert result["skipped"] == ["label"]
 
+    def test_refuses_a_360_day_time_coordinate_instead_of_dropping_it(self, tmp_path):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import CalendarArchiveError, zarr_to_tgm
+
+        src = str(tmp_path / "cal.zarr")
+        times = xr.date_range(
+            "2020-01-01", periods=5, freq="D", calendar="360_day", use_cftime=True
+        )
+        xr.Dataset({"X": (["time"], np.arange(5.0))}, coords={"time": times}).to_zarr(src)
+
+        with pytest.raises(CalendarArchiveError) as excinfo:
+            zarr_to_tgm(src, str(tmp_path / "cal.tgm"))
+
+        assert (excinfo.value.coordinate, excinfo.value.calendar) == ("time", "360_day")
+
 
 class TestTgmToZarr:
     """tgm_to_zarr restores Tensogram archives to Zarr stores."""

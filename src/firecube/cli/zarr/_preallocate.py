@@ -278,11 +278,25 @@ def _echo_dry_run_group(preview: PreallocateDryRunGroup) -> None:
             f"group {group_name}: window [{start}, {end}); non-regular axis; no dry-run coords"
         )
     elif preview.policy == "grid":
+        first, last = preview.first, preview.last
+        if preview.calendar is not None and preview.units is not None and end > start:
+            # The same decoder `index show --derived` uses, so the two surfaces
+            # print a calendar date identically.
+            from firecube.cli.index import _decoded_calendar_isoformats
+
+            iso_first, iso_last = _decoded_calendar_isoformats(
+                [first, last], units=preview.units, calendar=preview.calendar
+            )
+            first = f"{iso_first} ({preview.calendar})"
+            last = f"{iso_last} ({preview.calendar})"
+        window_suffix = (
+            "" if preview.window_applied else "; window not applied to calendar coordinate"
+        )
         _echo_err(
             f"group {group_name}: window [{start}, {end}); policy=grid; "
-            f"items_in_window={preview.items_in_window}; first={preview.first}; "
-            f"last={preview.last}; "
-            f"would write nominal grid values and stamp {ATTR_PREALLOCATED}"
+            f"items_in_window={preview.items_in_window}; first={first}; "
+            f"last={last}; "
+            f"would write nominal grid values and stamp {ATTR_PREALLOCATED}{window_suffix}"
         )
     elif preview.items_in_window is None:
         _echo_err(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime as dt
 import logging
 import math
 import operator
@@ -45,14 +46,18 @@ from zarr.errors import GroupNotFoundError, NodeNotFoundError
 from zarr.storage import FsspecStore, LocalStore
 
 from firecube.core.errors import Message, Placeholder, SchemaDriftError
+from firecube.core.time.calendar import is_calendar_valued
+from firecube.core.time.gregorian import gregorian_to_datetime64_ns
+from firecube.core.time.guard import reject_non_gregorian_calendar_value
 from firecube.core.uris import is_remote_target, local_path_from_target
 from firecube.core.zarr._coord_lifecycle import (
     CoordLifecycleState,
     raise_if_invalid,
     resolve_coord_lifecycle,
 )
-from firecube.core.zarr._fill import _fill_value_is_missing
+from firecube.core.zarr._fill import _array_is_all_fill, _fill_value_is_missing
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
+from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED
 from firecube.core.zarr.guard._unit_locks import _store_identity
 from firecube.core.zarr.guard.chunk_geometry import Bounds
 from firecube.core.zarr.guard.engine_owned import preallocate_operation
@@ -596,7 +601,12 @@ class RegionZarrWriter:
 
     @staticmethod
     def _normalize_timestamp_value(timestamp_val: Any) -> np.datetime64:
-        """Normalize timestamp-like values to ``datetime64[s]``."""
+        """Normalize timestamp-like values to ``datetime64[s]``.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+        """
+        reject_non_gregorian_calendar_value(timestamp_val)
         if isinstance(timestamp_val, np.datetime64):
             return timestamp_val.astype("datetime64[s]")
         if hasattr(timestamp_val, "isoformat"):
@@ -605,12 +615,14 @@ class RegionZarrWriter:
 
     @staticmethod
     def _normalize_timestamp_value_ns(timestamp_val: Any) -> np.datetime64:
-        """Normalize timestamp-like values to ``datetime64[ns]`` for equality checks."""
-        if isinstance(timestamp_val, np.datetime64):
-            return timestamp_val.astype("datetime64[ns]")
-        if hasattr(timestamp_val, "isoformat"):
-            return np.datetime64(str(timestamp_val.isoformat()), "ns")
-        return np.datetime64(str(timestamp_val), "ns")
+        """Normalize timestamp-like values to ``datetime64[ns]`` for equality checks.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+            Datetime64RangeError: *timestamp_val* lies outside the ``datetime64[ns]`` range.
+        """
+        reject_non_gregorian_calendar_value(timestamp_val)
+        return gregorian_to_datetime64_ns(timestamp_val)
 
     @staticmethod
     def _normalize_for_coord_compare(
@@ -657,6 +669,11 @@ class RegionZarrWriter:
                 "_normalize_for_coord_compare requires a datetime64 target dtype; "
                 f"got {target_dtype!r}"
             )
+        if np.datetime_data(target_dtype) == ("ns", 1) and (
+            isinstance(value, str | dt.datetime | np.datetime64) or is_calendar_valued(value)
+        ):
+            # NumPy wraps a value outside the ns range; this conversion refuses it.
+            return gregorian_to_datetime64_ns(value)
         arr = np.asarray(value)
         if arr.dtype.kind == "M" and bool(np.isnat(arr)):
             return cast(np.datetime64, np.array(np.datetime64("NaT", "ns"), dtype=target_dtype)[()])
@@ -1250,18 +1267,30 @@ class RegionZarrWriter:
         If a matching timestamp already exists in the ``timestamp`` array,
         its index is returned (idempotent).  Otherwise the next available
         slot (== current length) is returned.
+
+        An encoded (calendar) coordinate encodes *timestamp_val* with the
+        array's own ``units`` and ``calendar`` before the lookup.
         """
         root = self._open_root()
         self.ensure_group(group)
         path = f"{group}/{self._time_coord_name}"
-        normalized = self._normalize_timestamp_value(timestamp_val)
 
-        if path not in root:
+        if path not in root or root[path].shape[0] == 0:
+            # No coordinate to dispatch on: validate as a datetime64 value, so a
+            # malformed or non-Gregorian value fails instead of resolving to slot 0.
+            self._normalize_timestamp_value(timestamp_val)
             return 0
 
         timestamp_arr = root[path]
-        if timestamp_arr.shape[0] == 0:
-            return 0
+        # Imported here: firecube.core.time.encoding imports firecube.core.zarr.
+        from firecube.core.time.encoding import coordinate_encoding_from_array
+
+        encoding = coordinate_encoding_from_array(timestamp_arr.dtype, dict(timestamp_arr.attrs))
+        normalized: Any = (
+            encoding.encode_scalar(timestamp_val)
+            if encoding.extra_attrs
+            else self._normalize_timestamp_value(timestamp_val)
+        )
 
         existing = np.asarray(timestamp_arr[:])
         matches = np.nonzero(existing == normalized)[0]
@@ -1293,6 +1322,10 @@ class RegionZarrWriter:
         - ``INVALID_BOTH_MARKERS``: the two lifecycles are mutually exclusive;
           combined presence is a corrupted state surfaced by
           ``raise_if_invalid`` before any read or write.
+
+        An encoded (calendar) coordinate is checked before these branches: a
+        ``PREALLOCATED`` one is verified and never written, and any other
+        state is refused.
         """
         root = self._open_root()
         timestamp_path = f"{group}/{self._time_coord_name}"
@@ -1304,6 +1337,27 @@ class RegionZarrWriter:
         attrs: dict[str, Any] = dict(timestamp_arr.attrs) if timestamp_arr is not None else {}
         state = resolve_coord_lifecycle(attrs)
         raise_if_invalid(state, timestamp_path)
+
+        if timestamp_arr is not None:
+            # Imported here: firecube.core.time.encoding imports firecube.core.zarr.
+            from firecube.core.time.encoding import coordinate_encoding_from_array
+
+            encoding = coordinate_encoding_from_array(timestamp_arr.dtype, attrs)
+            if encoding.extra_attrs:
+                if state is not CoordLifecycleState.PREALLOCATED:
+                    self._raise_encoded_unreachable_state(
+                        timestamp_path=timestamp_path, attrs=attrs, state=state
+                    )
+                self._verify_preallocated_encoded_slot(
+                    group=group,
+                    ts_index=ts_index,
+                    timestamp_val=timestamp_val,
+                    timestamp_arr=timestamp_arr,
+                    timestamp_path=timestamp_path,
+                    encoding=encoding,
+                    attrs=attrs,
+                )
+                return
 
         if state is CoordLifecycleState.PREALLOCATED and timestamp_arr is not None:
             current_ns = self._normalize_timestamp_value_ns(timestamp_arr[ts_index])
@@ -1346,7 +1400,22 @@ class RegionZarrWriter:
             self._write_legacy_timestamp(group, ts_index, timestamp_val)
 
     def _write_legacy_timestamp(self, group: str, ts_index: int, timestamp_val: Any) -> None:
+        """Create or grow the unmarked time coordinate and write one slot.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+            Datetime64RangeError: The stored coordinate is ``datetime64[ns]`` and the
+                value lies outside its range; nothing is written.
+        """
         normalized = self._normalize_timestamp_value(timestamp_val)
+        try:
+            stored = self._open_root()[f"{group}/{self._time_coord_name}"]
+        except KeyError:
+            stored = None
+        if getattr(stored, "dtype", None) == np.dtype("datetime64[ns]"):
+            # The element write casts to ns, and NumPy wraps a value outside that range.
+            gregorian_to_datetime64_ns(timestamp_val)
+            gregorian_to_datetime64_ns(normalized)
         timestamp_arr = self.ensure_group(
             f"{group}/{self._time_coord_name}",
             shape=(ts_index + 1,),
@@ -1374,6 +1443,98 @@ class RegionZarrWriter:
                 slot,
                 normalized,
             )
+
+    def _raise_encoded_unreachable_state(
+        self, *, timestamp_path: str, attrs: dict[str, Any], state: CoordLifecycleState
+    ) -> None:
+        """Refuse an encoded (calendar) coordinate that preallocate did not mark.
+
+        Only preallocate writes a calendar coordinate, so any other lifecycle state
+        means an out-of-band edit or a skipped preallocate.
+
+        Raises:
+            SchemaDriftError: Always; the message names the path, units, calendar and state.
+        """
+        marker = (
+            ATTR_COORD_MANAGED
+            if state is CoordLifecycleState.COORD_MANAGED
+            else "no sealing marker (legacy)"
+        )
+        raise SchemaDriftError(
+            Message(
+                "coordinate array {array_path!r} carries encoded time attrs "
+                "(units={units!r}, calendar={calendar!r}) but its lifecycle state is "
+                "{marker}; this should be unreachable because calendar axes only "
+                "support the preallocated (grid) regime. Preallocate it first: {preallocate}",
+                array_path=timestamp_path,
+                units=str(attrs["units"]),
+                calendar=str(attrs["calendar"]),
+                marker=marker,
+                preallocate=preallocate_operation(),
+            )
+        )
+
+    def _verify_preallocated_encoded_slot(
+        self,
+        *,
+        group: str,
+        ts_index: int,
+        timestamp_val: Any,
+        timestamp_arr: Any,
+        timestamp_path: str,
+        encoding: Any,
+        attrs: dict[str, Any],
+    ) -> None:
+        """Compare one slot of a preallocated encoded coordinate with the incoming value.
+
+        A match returns and writes nothing.
+
+        Args:
+            group: Data group path.
+            ts_index: Slot to verify.
+            timestamp_val: Incoming value: a calendar-valued object or an encoded number.
+            timestamp_arr: The opened coordinate array.
+            timestamp_path: The coordinate's path, for messages.
+            encoding: The array's ``CoordinateEncoding``.
+            attrs: The array's attributes, carrying ``units`` and ``calendar``.
+
+        Raises:
+            SchemaDriftError: The slot holds the fill sentinel, or another value.
+            ValueError: *timestamp_val* is on another calendar.
+            TypeError: *timestamp_val* is a Gregorian-typed value.
+        """
+        units = str(attrs["units"])
+        calendar = str(attrs["calendar"])
+        incoming = encoding.encode_scalar(timestamp_val)
+        stored_raw = timestamp_arr[ts_index]
+        stored = stored_raw.item() if isinstance(stored_raw, np.generic) else stored_raw
+        if stored == incoming:
+            return
+        fill_value = timestamp_arr.fill_value
+        if _array_is_all_fill(np.atleast_1d(np.asarray(stored_raw)), fill_value):
+            # A marked coordinate that still holds the fill sentinel was never filled:
+            # report the missing preallocate, not a drift.
+            raise SchemaDriftError(
+                Message(
+                    "Preallocated encoded timestamp coordinate {array_path!r} in group "
+                    "{group!r} slot {ts_index}: preallocation incomplete (unwritten slot); "
+                    "stored value equals the encoded fill sentinel {fill_value!r} "
+                    "(units={units!r}, calendar={calendar!r}). Preallocate the coord array "
+                    "first: {preallocate}",
+                    array_path=timestamp_path,
+                    group=group,
+                    ts_index=ts_index,
+                    fill_value=fill_value,
+                    units=units,
+                    calendar=calendar,
+                    preallocate=preallocate_operation(),
+                )
+            )
+        raise SchemaDriftError(
+            f"Preallocated encoded timestamp coordinate {timestamp_path!r} in group "
+            f"{group!r} slot {ts_index} diverged: stored={stored!r} incoming={incoming!r} "
+            f"(units={units!r}, calendar={calendar!r})."
+        )
 
     def write_static(
         self,

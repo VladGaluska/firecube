@@ -28,7 +28,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -46,6 +46,7 @@ from firecube.core.filesystem.ops import (
 from firecube.core.filesystem.protocol import StorageFilesystem
 from firecube.core.filesystem.store_factory import create_zarr_store
 from firecube.core.storage.uri import StorageUri
+from firecube.core.time.calendar import is_gregorian_like
 from firecube.core.zarr._reserved_attrs import FIRECUBE_STATIC_WRITTEN_ATTR
 
 if TYPE_CHECKING:
@@ -991,16 +992,41 @@ def _read_flat_array(array: Any, path: str) -> np.ndarray[Any, Any]:
         raise RuntimeError(f"Failed to read Zarr array {path!r}: {exc}") from exc
 
 
+def _is_encoded_calendar_coord(
+    coord_values: np.ndarray[Any, Any], attrs: Mapping[str, Any]
+) -> bool:
+    """Return True for a CF-encoded calendar coordinate.
+
+    That is a non-``datetime64`` array carrying ``units`` and a non-Gregorian
+    ``calendar`` attribute, the layout ``firecube zarr preallocate`` writes for a
+    calendar axis. A Gregorian calendar attribute does not qualify: Gregorian
+    integer time keeps ordinary fill handling.
+    """
+    if coord_values.dtype.kind == "M" or "units" not in attrs:
+        return False
+    calendar = attrs.get("calendar")
+    return isinstance(calendar, str) and bool(calendar.strip()) and not is_gregorian_like(calendar)
+
+
 def _validate_coord_values(
     *,
     coord_path: str,
     coord_values: np.ndarray[Any, Any],
     validity_issues: list[str],
+    fill_value: Any = None,
+    attrs: Mapping[str, Any] | None = None,
 ) -> None:
+    from firecube.core.zarr._fill import _fill_mask
+
     filled = np.asarray(coord_values)
-    # Dense DirectZarr coordinates carry NaT (or NaN) for slots that were never
-    # written; those slots are absent, not out of order, so only filled values
-    # take part in the uniqueness and monotonicity checks.
+    # Unwritten slots are absent, not out of order. An encoded calendar
+    # coordinate marks them with its declared fill value (the int64 minimum),
+    # which is not a valid time, so those slots are dropped. On any other
+    # coordinate the fill value is an ordinary value (0 is a legitimate epoch
+    # second), so only the NaT/NaN sentinels are dropped and a repeated value
+    # equal to the fill is still reported.
+    if fill_value is not None and _is_encoded_calendar_coord(filled, attrs or {}):
+        filled = filled[~_fill_mask(filled, fill_value)]
     if filled.dtype.kind == "M":
         filled = filled[~np.isnat(filled)]
     elif filled.dtype.kind == "f":
@@ -1292,6 +1318,8 @@ def validate_group_with_fs(
                     coord_path=coord_path,
                     coord_values=coord_values,
                     validity_issues=validity_issues,
+                    fill_value=getattr(coord_info.array, "fill_value", None),
+                    attrs=dict(getattr(coord_info.array, "attrs", {}) or {}),
                 )
 
             state_path = _join_path(parent, _STATE_ARRAY_NAME)

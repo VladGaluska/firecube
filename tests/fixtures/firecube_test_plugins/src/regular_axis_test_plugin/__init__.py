@@ -46,14 +46,17 @@ compare like with like.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import cftime
 import numpy as np
 
-from firecube.core.api import IndexSpec, ItemInfo, RegularTimeAxis
+from firecube.core.api import IndexedWrite, IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.api import (
     DirectZarrIngestor,
     PipelineBatch,
+    PluginConfig,
     PluginContext,
     WriteIntent,
     ZarrArraySpec,
@@ -341,3 +344,70 @@ class RegularAxisEndDateIngestor(DirectZarrIngestor):
 
     def build_write_intents(self, batch: PipelineBatch, ctx: PluginContext) -> list[WriteIntent]:
         return []
+
+
+@dataclass
+class RegularAxisCalendarConfig(PluginConfig):
+    calendar: str = "360_day"
+    slot_count: int = 90
+
+
+@register_ingestor("regular_axis_calendar")
+class RegularAxisCalendarIngestor(DirectZarrIngestor):
+    """Daily axis on a CF calendar (90 ``360_day`` slots span Feb 30); item ``i`` writes ``i``."""
+
+    PRODUCT_NAME: ClassVar[str] = "regular_axis_calendar"
+    time_dim_name: ClassVar[str] = _COORD
+    plugin_config_class = RegularAxisCalendarConfig
+
+    def _slot_count(self) -> int:
+        assert isinstance(self.plugin_config, RegularAxisCalendarConfig)
+        return self.plugin_config.slot_count
+
+    def _coordinate(self, item: int) -> Any:
+        assert isinstance(self.plugin_config, RegularAxisCalendarConfig)
+        units, calendar = "seconds since 2049-01-01 00:00:00", self.plugin_config.calendar
+        return cftime.num2date(item * 86400, units, calendar=calendar)
+
+    def discover_source_files(self, ctx: PluginContext) -> list[int]:
+        return list(range(self._slot_count()))
+
+    def index_spec(self, ctx: PluginContext) -> IndexSpec:
+        assert isinstance(self.plugin_config, RegularAxisCalendarConfig)
+        axis = RegularTimeAxis(
+            coordinate=_COORD,
+            epoch="2049-01-01T00:00:00Z",
+            cadence_s=86400,
+            slot_count=self._slot_count(),
+            calendar=self.plugin_config.calendar,
+        )
+        return IndexSpec(name="regular_axis_calendar_v1", groups={_GROUP: axis})
+
+    def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo | None:
+        return ItemInfo(coordinate=self._coordinate(item))
+
+    def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+        n = self._slot_count()
+        spec = ZarrArraySpec(
+            name="values",
+            shape=(n, 1, 1),
+            dtype="float32",
+            chunks=(1, 1, 1),
+            time_indexed=True,
+            dimension_names=(_COORD, "y", "x"),
+        )
+        return [ZarrGroupSpec(group=_GROUP, arrays=[spec])]
+
+    def build_write_intents(
+        self, batch: PipelineBatch, ctx: PluginContext
+    ) -> list[WriteIntent | IndexedWrite]:
+        return [
+            IndexedWrite.region(
+                group=_GROUP,
+                array="values",
+                coordinate=self._coordinate(item),
+                data=np.array([[float(item)]], dtype=np.float32),
+                y_slice=slice(0, 1),
+            )
+            for item in batch.items
+        ]

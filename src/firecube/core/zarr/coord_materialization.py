@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from typing import Any
 
@@ -58,18 +58,20 @@ from firecube.core.index_resolve import (
 from firecube.core.index_resolve import (
     _compute_group_identity_hash as compute_group_identity_hash,
 )
-from firecube.core.index_spec import (
-    RegularTimeAxis,
-    effective_regular_time_policy,
-)
+from firecube.core.index_spec import RegularTimeAxis
 from firecube.core.time.convert import coord_to_datetime64
+from firecube.core.time.encoding import CoordinateEncoding, coordinate_encoding_for
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
-from firecube.core.zarr._coord_lifecycle import assert_coord_markers_consistent
-from firecube.core.zarr._reserved_attrs import (
-    FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
-    RESERVED_ARRAY_ATTRS,
-)
+from firecube.core.zarr._coord_common import build_irregular_coord_attrs, existing_array
+from firecube.core.zarr._reserved_attrs import FIRECUBE_GROUP_IDENTITY_HASH_ATTR
 from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
+from firecube.core.zarr.coord_rematerialization import (
+    RegularCoordTarget,
+    _check_existing_irregular_coord,
+    _check_existing_regular_coord,
+    _plan_encoded_grid_fill,
+    _resolve_regular_coord_target,
+)
 from firecube.core.zarr.guard._unit_locks import _store_identity
 from firecube.core.zarr.guard.engine_owned import exception_text
 from firecube.core.zarr.guard.guarded_write import (
@@ -139,45 +141,6 @@ def _write_coord(arr: Any, hold: ArrayHold, selection: Any, payload: Any) -> Non
     )
 
 
-def existing_array(root: Any, array_path: str) -> Any | None:
-    path_parts = [part for part in array_path.split("/") if part]
-    current = root
-    for part in path_parts[:-1]:
-        if part not in current:
-            return None
-        current = current[part]
-    arr_name = path_parts[-1]
-    if arr_name not in current:
-        return None
-    return current[arr_name]
-
-
-def array_schema_mismatches(
-    *,
-    existing: Any,
-    expected_shape: tuple[int, ...],
-    expected_dtype: Any,
-    expected_chunks: tuple[int, ...] | None,
-) -> list[str]:
-    mismatches: list[str] = []
-
-    found_shape = tuple(existing.shape)
-    if found_shape != tuple(expected_shape):
-        mismatches.append(f"shape: expected {tuple(expected_shape)}, found {found_shape}")
-
-    expected_dtype_str = str(np.dtype(expected_dtype))
-    found_dtype_str = str(np.dtype(existing.dtype))
-    if found_dtype_str != expected_dtype_str:
-        mismatches.append(f"dtype: expected {expected_dtype_str}, found {found_dtype_str}")
-
-    if expected_chunks is not None:
-        found_chunks = tuple(existing.chunks) if existing.chunks is not None else None
-        if found_chunks != tuple(expected_chunks):
-            mismatches.append(f"chunks: expected {tuple(expected_chunks)}, found {found_chunks}")
-
-    return mismatches
-
-
 def materialize_irregular_coord_array(
     *,
     writer: Any,
@@ -189,37 +152,44 @@ def materialize_irregular_coord_array(
 ) -> None:
     """Write ``axis.values`` densely at ``{group_name}/{axis.coordinate}``.
 
-    Dtype defaults to ``datetime64[ns]``; when *spec* is provided and carries
-    a dtype, that dtype is honored. Shape ``(len(axis.values),)``.
+    Storage follows the axis's `CoordinateEncoding` (see
+    `coordinate_encoding_for`). A Gregorian axis (``axis.calendar`` unset)
+    stores ``datetime64``, ``datetime64[ns]`` unless *spec* declares a dtype.
+    A calendar axis stores its canonical encoded numbers as ``int64`` or
+    ``float64``, with ``units`` and ``calendar`` attrs. Shape is
+    ``(len(axis.values),)`` either way.
 
     Behavior on existing array:
 
     * Values match the resolved axis → idempotent no-op; the
       ``ATTR_PREALLOCATED`` marker is stamped if not already present so
       subsequent ``write_timestamp`` calls take the marker-aware path.
-    * Values differ and the existing array is entirely NaT (spec-loop
+    * Values differ and the existing array is entirely fill (NaT for
+      Gregorian, the encoding's fill sentinel otherwise: a spec-loop
       pre-allocated shell) → fill values, merge attrs, stamp marker.
-    * Values differ and the existing array holds non-NaT content → drift
+    * Values differ and the existing array holds non-fill content → drift
       error via ``SchemaDriftError`` so the operator sees the conflict
       before any downstream write.
+    * Either side is encoded, the existing array is established (sealed,
+      coord-managed, identity-stamped, or holding a non-fill value), and its
+      ``units``, ``calendar``, storage kind or identity hash differ →
+      `CoordinateRelabelError`, nothing written. Equal stored numbers do not
+      excuse it: the same number under another epoch or calendar is another instant.
 
-    Attrs mirror ``build_regular_coord_attrs``: minimal defaults
-    ``{"standard_name": "time", "axis": "T"}`` merged with ``spec.attrs``
-    (with reserved firecube keys and CF-encoding-owned ``units``/``calendar``
-    keys stripped). ``spec.dimension_names`` is honored when provided; the
-    default is ``(axis.coordinate,)``.
+    A calendar coordinate gets its ``units`` and ``calendar`` attrs before its
+    values, and its markers last. Attrs mirror ``build_regular_coord_attrs``:
+    minimal defaults ``{"standard_name": "time", "axis": "T"}`` merged with
+    ``spec.attrs`` (with reserved firecube keys and CF-encoding-owned
+    ``units``/``calendar`` keys stripped). ``spec.dimension_names`` is honored
+    when provided; the default is ``(axis.coordinate,)``.
     """
     values = axis.values
     slot_count = len(values)
-    target_dtype = (
-        np.dtype(spec.dtype)
-        if spec is not None and getattr(spec, "dtype", None) is not None
-        else np.dtype("datetime64[ns]")
-    )
-    coord_data = np.array(
-        [coord_to_datetime64(value) for value in values], dtype="datetime64[ns]"
-    ).astype(target_dtype)
     coord_path = f"{group_name}/{axis.coordinate}"
+    encoding = coordinate_encoding_for(axis, spec, coord_path=coord_path)
+    encoded = bool(encoding.extra_attrs)
+    target_dtype = encoding.dtype
+    coord_data = encoding.encode_values(values)
     attrs = build_irregular_coord_attrs(spec, axis)
     group_identity_hash = compute_group_identity_hash(axis, int(slot_count), target_dtype)
     dim_names = (
@@ -230,39 +200,23 @@ def materialize_irregular_coord_array(
 
     existing = existing_array(root, coord_path)
     if existing is not None:
-        mismatches = array_schema_mismatches(
-            existing=existing,
-            expected_shape=(slot_count,),
-            expected_dtype=target_dtype,
-            expected_chunks=None,
-        )
-        if mismatches:
-            diff = "; ".join(mismatches)
-            raise SchemaDriftError(
-                f"Existing coord array mismatch: '{coord_path}' has mismatches.\n"
-                f"Mismatch: {diff}\n"
-                "Either delete it or update the plugin's IrregularTimeAxis to match."
-            )
-        assert_coord_markers_consistent(dict(existing.attrs), coord_path)
-        if bool(existing.attrs.get(ATTR_COORD_MANAGED, False)):
-            raise SchemaDriftError(
-                f"Existing coord array '{coord_path}' carries {ATTR_COORD_MANAGED}; "
-                "refusing to seal engine-managed observed coordinates as an irregular axis."
-            )
         stamps = {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash}
         with _hold_coord(writer, coord_path) as hold:
-            existing_values = np.asarray(existing[:])
-            if np.array_equal(existing_values, coord_data):
+            values_match = _check_existing_irregular_coord(
+                coord_path,
+                existing,
+                encoding=encoding,
+                coord_data=coord_data,
+                group_identity_hash=group_identity_hash,
+            )
+            if values_match:
                 writer.update_array_attrs(coord_path, stamps)
                 report(f"array {coord_path}: existing irregular coord array matches; no-op")
                 return
-            if not values_all_nat(existing_values):
-                raise SchemaDriftError(
-                    f"Existing coord array '{coord_path}' has values that differ from the "
-                    "resolved IrregularTimeAxis. Delete it or align the plugin's axis values."
-                )
+            if encoded:
+                existing = writer.update_array_attrs(coord_path, attrs)
             _write_coord(existing, hold, ..., coord_data)
-        writer.update_array_attrs(coord_path, {**attrs, **stamps})
+        writer.update_array_attrs(coord_path, stamps if encoded else {**attrs, **stamps})
         report(f"array {coord_path}: filled existing irregular coord array")
         return
 
@@ -270,7 +224,7 @@ def materialize_irregular_coord_array(
         coord_path,
         shape=(slot_count,),
         dtype=target_dtype,
-        fill_value=np.array(np.datetime64("NaT", "ns"), dtype=target_dtype)[()],
+        fill_value=encoding.fill_value,
         chunks=resolve_coord_chunks(spec, slot_count),
         attrs=attrs,
         dimension_names=dim_names,
@@ -282,31 +236,6 @@ def materialize_irregular_coord_array(
         {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
     )
     report(f"array {coord_path}: created (irregular coord materialization)")
-
-
-def build_irregular_coord_attrs(spec: Any | None, axis: Any) -> dict[str, Any]:
-    """Build irregular coord attrs, mirroring ``build_regular_coord_attrs``.
-
-    Minimal defaults (``standard_name="time"``, ``axis="T"``) merged with
-    ``spec.attrs`` (when provided) after stripping reserved firecube keys and
-    the xarray-CF-encoding-owned keys ``units`` and ``calendar``.
-    """
-    del axis  # unused; symmetry with `build_regular_coord_attrs`
-    minimal: dict[str, Any] = {"standard_name": "time", "axis": "T"}
-    if spec is None or getattr(spec, "attrs", None) is None:
-        return minimal
-    merged = dict(minimal)
-    merged.update({k: v for k, v in spec.attrs.items() if k not in RESERVED_ARRAY_ATTRS})
-    merged.pop("units", None)
-    merged.pop("calendar", None)
-    return merged
-
-
-def values_all_nat(values: np.ndarray) -> bool:
-    """True when *values* is a datetime64 array with every element NaT."""
-    if values.dtype.kind != "M":
-        return False
-    return bool(np.all(np.isnat(values)))
 
 
 def axis_has_resolvable_extent(axis: Any, resolved_index: Any, group: str) -> bool:
@@ -497,6 +426,52 @@ def _legacy_shell_refusal(
     )
 
 
+def _fill_existing_regular_grid_encoded(
+    *,
+    writer: Any,
+    coord_path: str,
+    existing: Any,
+    encoding: CoordinateEncoding,
+    values: np.ndarray,
+    slot_count: int,
+    window_suffix: str,
+    attrs: Mapping[str, Any],
+    group_identity_hash: str,
+    report: Callable[[str], None],
+) -> None:
+    """Fill the fill-sentinel slots of an existing encoded grid coordinate, the whole array.
+
+    Every refusal in `_plan_encoded_grid_fill` runs before the first write.
+    Then *attrs* (``units`` and ``calendar`` among them) are written, then the
+    values through `guarded_write`, then the markers.
+    """
+    with _hold_coord(writer, coord_path) as hold:
+        stored_full, filled = _plan_encoded_grid_fill(
+            coord_path=coord_path,
+            existing=existing,
+            encoding=encoding,
+            values=values,
+            group_identity_hash=group_identity_hash,
+        )
+        existing = writer.update_array_attrs(coord_path, attrs)
+        if filled:
+            _write_coord(existing, hold, ..., stored_full)
+    writer.update_array_attrs(
+        coord_path,
+        {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
+    )
+    if filled == slot_count:
+        report(f"array {coord_path}: filled existing regular coord array{window_suffix}")
+    elif filled:
+        log.log(NOTICE_LEVEL, "reconciled %s fill grid coord slot(s) in %s", filled, coord_path)
+        report(
+            f"array {coord_path}: filled {filled} fill slot(s) with nominal grid "
+            f"values{window_suffix}"
+        )
+    else:
+        report(f"array {coord_path}: no-op (matches nominal grid){window_suffix}")
+
+
 def materialize_regular_coord_array(
     *,
     writer: Any,
@@ -512,6 +487,7 @@ def materialize_regular_coord_array(
     has_input_data: bool = False,
     input_data: str | None = None,
     report: Callable[[str], None] = _noop_report,
+    target: RegularCoordTarget | None = None,
 ) -> None:
     """Materialize a dense regular time coordinate at ``{group_name}/{axis.coordinate}``.
 
@@ -522,31 +498,47 @@ def materialize_regular_coord_array(
     ``"observed"`` means the stored values are real observation times
     unknowable before ingest, so the array is created at the dense chunk
     shape but left NaT and unsealed.
+
+    With ``axis.calendar`` set, the coordinate stores encoded ``int64`` or
+    ``float64`` numbers (slot ``n`` holds ``n * cadence_s`` in the axis's
+    derived ``units``), not ``datetime64``. A calendar axis resolves only to
+    the ``"grid"`` policy. Its coordinate is always written whole, whatever
+    ``slot_start`` and ``slot_end`` say: an unwritten slot would hold the fill
+    sentinel, which xarray cannot decode. The window still labels the report.
+    A calendar coordinate gets ``units`` and ``calendar`` before its values,
+    and ``firecube_preallocated`` and the identity hash last.
+
+    *target*, when given, is the `RegularCoordTarget` that
+    `check_regular_coord_rematerialization` returned for the same group, axis
+    and spec; it replaces resolving the encoding and nominal values again.
+
+    Raises:
+        ValueError: If ``axis.slot_count`` is ``None`` and *resolved_index*
+            is also ``None``, or an existing array's shape does not match.
+        ConfigurationError: If a calendar axis resolves to a policy other
+            than ``"grid"``, or *spec* and *axis* disagree on dtype, ``units``
+            or ``calendar``.
+        SchemaDriftError: If an existing coordinate array's markers or stored
+            values conflict with this materialization.
+        CoordinateRelabelError: If either side is encoded and an established
+            existing array differs from the axis in storage kind, ``units``,
+            ``calendar`` or identity hash. Raised before any write.
     """
-    slot_count = axis.slot_count
-    if slot_count is None:
-        if resolved_index is None:
-            raise ValueError(
-                f"Cannot materialize RegularTimeAxis '{axis.coordinate}': slot_count is None. "
-                "Declare either slot_count or end_date in the plugin's index_spec."
-            )
-        slot_count = int(resolved_index.size(group_name))
-    effective_slot_end = int(slot_count) if slot_end is None else slot_end
+    if target is None:
+        target = _resolve_regular_coord_target(
+            group_name=group_name, axis=axis, spec=spec, resolved_index=resolved_index
+        )
+    coord_path = target.coord_path
+    slot_count = target.slot_count
+    is_calendar_axis = target.is_calendar_axis
+    coordinate_policy = target.policy
+    encoding = target.encoding
+    target_dtype = encoding.dtype
+    values = target.values
+    attrs = target.attrs
+    group_identity_hash = target.group_identity_hash
+    effective_slot_end = slot_count if slot_end is None else slot_end
 
-    epoch = coord_to_datetime64(axis.epoch)
-    cadence = np.timedelta64(int(axis.cadence_s * 1e9), "ns")
-    values = epoch + np.arange(slot_count, dtype=np.int64) * cadence
-    target_dtype = (
-        np.dtype(spec.dtype)
-        if spec is not None and getattr(spec, "dtype", None) is not None
-        else np.dtype("datetime64[ns]")
-    )
-    values = values.astype(target_dtype)
-    coord_path = f"{group_name}/{axis.coordinate}"
-    attrs = build_regular_coord_attrs(spec, axis)
-    group_identity_hash = compute_group_identity_hash(axis, int(slot_count), target_dtype)
-
-    coordinate_policy = effective_regular_time_policy(axis)
     # Only grid-valued coordinates are computable without source inspection.
     # Observed-values floor axes are materialized from inspect_item() below when
     # the operator supplies --input-data; otherwise they keep the legacy NaT shell.
@@ -589,22 +581,29 @@ def materialize_regular_coord_array(
                 )
             )
 
+    is_full_grid = slot_start == 0 and effective_slot_end == slot_count
+    window_label = "" if is_full_grid else f" in window [{slot_start}, {effective_slot_end})"
+    window_suffix = "" if is_full_grid else "; window not applied to calendar coordinate"
+
     existing = existing_array(root, coord_path)
     if existing is not None:
-        expected_shape = (slot_count,)
-        if tuple(existing.shape) != expected_shape:
-            raise ValueError(
-                f"Preallocated coord array {coord_path!r} has shape {existing.shape}, "
-                f"expected {expected_shape}. Refuse to resize silently."
+        _check_existing_regular_coord(existing, target)
+        if prefill and is_calendar_axis:
+            _fill_existing_regular_grid_encoded(
+                writer=writer,
+                coord_path=coord_path,
+                existing=existing,
+                encoding=encoding,
+                values=values,
+                slot_count=slot_count,
+                window_suffix=window_suffix,
+                attrs=attrs,
+                group_identity_hash=group_identity_hash,
+                report=report,
             )
-        assert_coord_markers_consistent(dict(existing.attrs), coord_path)
+            return
         existing = writer.update_array_attrs(coord_path, attrs)
         window_slice = slice(slot_start, effective_slot_end)
-        window_label = (
-            ""
-            if slot_start == 0 and effective_slot_end == slot_count
-            else (f" in window [{slot_start}, {effective_slot_end})")
-        )
         if prefill:
             if bool(existing.attrs.get(ATTR_COORD_MANAGED, False)):
                 raise SchemaDriftError(
@@ -708,14 +707,14 @@ def materialize_regular_coord_array(
         coord_path,
         shape=(slot_count,),
         dtype=target_dtype,
-        fill_value=np.array(np.datetime64("NaT", "ns"), dtype=target_dtype)[()],
+        fill_value=encoding.fill_value,
         chunks=resolve_coord_chunks(spec, slot_count),
         attrs=attrs,
         dimension_names=(axis.coordinate,),
     )
     if prefill:
         with _hold_coord(writer, coord_path) as hold:
-            if slot_start == 0 and effective_slot_end == slot_count:
+            if is_calendar_axis or is_full_grid:
                 _write_coord(arr, hold, ..., values)
             else:
                 window = slice(slot_start, effective_slot_end)
@@ -724,13 +723,8 @@ def materialize_regular_coord_array(
             coord_path,
             {ATTR_PREALLOCATED: True, FIRECUBE_GROUP_IDENTITY_HASH_ATTR: group_identity_hash},
         )
-        if slot_start == 0 and effective_slot_end == slot_count:
-            report(f"array {coord_path}: created (regular coord materialization)")
-        else:
-            report(
-                f"array {coord_path}: created (regular coord materialization) in window "
-                f"[{slot_start}, {effective_slot_end})"
-            )
+        label = window_suffix if is_calendar_axis else window_label
+        report(f"array {coord_path}: created (regular coord materialization){label}")
     elif manage_observed:
         arr = stamp_coord_managed_marker(writer, coord_path)
         with _hold_coord(writer, coord_path) as hold:
@@ -757,15 +751,3 @@ def materialize_regular_coord_array(
             f"array {coord_path}: created (dense chunking, coord-managed; values "
             "written at ingest under observed-value reconciliation)"
         )
-
-
-def build_regular_coord_attrs(spec: Any | None, axis: Any) -> dict[str, Any]:
-    """Build coord attrs without injecting xarray-owned CF encoding attrs."""
-    minimal: dict[str, Any] = {"standard_name": "time", "axis": "T"}
-    if spec is None or getattr(spec, "attrs", None) is None:
-        return minimal
-    merged = dict(minimal)
-    merged.update({k: v for k, v in spec.attrs.items() if k not in RESERVED_ARRAY_ATTRS})
-    merged.pop("units", None)
-    merged.pop("calendar", None)
-    return merged

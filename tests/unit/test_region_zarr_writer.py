@@ -19,6 +19,7 @@ import threading
 import warnings
 from datetime import UTC, datetime
 
+import cftime
 import numpy as np
 import pytest
 import zarr
@@ -26,6 +27,8 @@ import zarr.core.array as zarr_array
 from zarr.core.sync import sync
 from zarr.storage import LocalStore
 
+from firecube.core.errors import SchemaDriftError
+from firecube.core.zarr._sealing_markers import ATTR_PREALLOCATED
 from firecube.core.zarr.guard.guarded_write import WriteResult, unit_store_key
 from firecube.core.zarr.guard.metadata_authority import (
     AuthorityBasis,
@@ -769,3 +772,99 @@ class TestMetadataAuthority:
             pass
 
         assert "was released" in _refusal(lambda: writer.ensure_group("", authority=auth))
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2500-01-01", "2262-04-11T23:47:16.854775808", np.datetime64("1600-01-01", "D")],
+)
+def test_legacy_timestamp_write_outside_ns_range_is_refused_and_array_unchanged(writer, value):
+    arr = writer.ensure_group(
+        "grp/timestamp",
+        shape=(1,),
+        dtype=np.dtype("datetime64[ns]"),
+        fill_value=np.datetime64("NaT", "ns"),
+        chunks=(1,),
+        dimension_names=("timestamp",),
+    )
+    arr[0] = np.datetime64("2024-01-01T00:00:00", "ns")
+
+    with pytest.raises(ValueError, match=r"datetime64\[ns\] range"):
+        writer.write_timestamp("grp", ts_index=0, timestamp_val=value)
+
+    assert arr[0] == np.datetime64("2024-01-01T00:00:00", "ns")
+
+
+def test_gregorian_coordinate_refuses_a_360_day_value_and_creates_nothing(writer):
+    with pytest.raises(ValueError, match="360_day"):
+        writer.write_timestamp("grp", ts_index=0, timestamp_val=cftime.Datetime360Day(2049, 2, 30))
+
+    assert "grp/timestamp" not in writer._open_root()
+
+
+_UNITS = "seconds since 2049-01-01 00:00:00"
+_DAY_S = 86400
+_INT64_FILL = np.iinfo(np.int64).min
+
+
+def _encoded_timestamp(writer, slots, *, preallocated):
+    arr = writer.ensure_group(
+        "grp/timestamp",
+        shape=(slots,),
+        dtype=np.dtype("int64"),
+        fill_value=_INT64_FILL,
+        chunks=(slots,),
+        attrs={"units": _UNITS, "calendar": "360_day"},
+        dimension_names=("timestamp",),
+    )
+    if preallocated:
+        arr[...] = np.arange(slots, dtype=np.int64) * _DAY_S
+        arr.attrs[ATTR_PREALLOCATED] = True
+    return arr
+
+
+class TestWriteTimestampEncoded:
+    """write_timestamp on an encoded (calendar) coordinate verifies the slot and never writes."""
+
+    def test_matching_value_is_a_noop(self, writer):
+        arr = _encoded_timestamp(writer, 10, preallocated=True)
+
+        writer.write_timestamp("grp", ts_index=3, timestamp_val=cftime.Datetime360Day(2049, 1, 4))
+
+        assert arr[...].tolist() == [i * _DAY_S for i in range(10)]
+
+    def test_off_by_one_cadence_raises_schema_drift(self, writer):
+        _encoded_timestamp(writer, 10, preallocated=True)
+
+        with pytest.raises(SchemaDriftError, match="diverged") as excinfo:
+            writer.write_timestamp(
+                "grp", ts_index=3, timestamp_val=cftime.Datetime360Day(2049, 1, 5)
+            )
+
+        assert "360_day" in str(excinfo.value)
+
+    def test_unwritten_slot_reports_preallocation_incomplete_not_drift(self, writer):
+        arr = _encoded_timestamp(writer, 3, preallocated=True)
+        arr[1] = _INT64_FILL
+
+        with pytest.raises(SchemaDriftError, match="preallocation incomplete") as excinfo:
+            writer.write_timestamp(
+                "grp", ts_index=1, timestamp_val=cftime.Datetime360Day(2049, 1, 2)
+            )
+
+        message = str(excinfo.value)
+        assert "grp/timestamp" in message
+        assert "360_day" in message
+
+    def test_unpreallocated_encoded_array_is_refused_and_left_unwritten(self, writer):
+        arr = _encoded_timestamp(writer, 3, preallocated=False)
+
+        with pytest.raises(SchemaDriftError) as excinfo:
+            writer.write_timestamp(
+                "grp", ts_index=0, timestamp_val=cftime.Datetime360Day(2049, 1, 1)
+            )
+
+        message = str(excinfo.value)
+        assert "grp/timestamp" in message
+        assert _UNITS in message
+        assert int(arr[0]) == _INT64_FILL

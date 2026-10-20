@@ -311,8 +311,9 @@ def create_archive(
         ValueError: `archive_format` is unknown, or a zip archive gets a group, a
             variable list or a date; the call reads and writes nothing.
         ArchiveClaimError: The product's claims refuse the archive; the call records no run.
-        ArchiveConversionError: The conversion raises `FileExistsError`, `ValueError` or
-            `ImportError`; for a product, the call first tries to record the run as failed.
+        ArchiveConversionError: The conversion raises `FileExistsError`, `ValueError`,
+            `ImportError` or `CalendarArchiveError`; for a product, the call first tries to
+            record the run as failed.
         ArchiveRecordError: The call writes the archive, then fails to record the run.
     """
     if archive_format not in _ARCHIVE_FORMATS:
@@ -321,7 +322,7 @@ def create_archive(
         raise ValueError("Zip archive does not support group, start_date, end_date, or variables")
     # Call-time imports, here and in the zip branch: callers and tests replace the
     # converters on their modules.
-    from firecube.core.tensogram.converter import zarr_to_tgm
+    from firecube.core.tensogram.converter import CalendarArchiveError, zarr_to_tgm
 
     run_id = f"archive-create-{uuid.uuid4()}"
     product_name = session.product.product_name
@@ -380,7 +381,7 @@ def create_archive(
                 )
                 result_target = tgm_result["target"]
                 result_file_size_bytes = tgm_result["file_size_bytes"]
-        except (FileExistsError, ValueError, ImportError) as exc:
+        except (FileExistsError, ValueError, ImportError, CalendarArchiveError) as exc:
             if manager is not None:
                 _record_archive_create_failure(
                     manager=manager,

@@ -50,6 +50,7 @@ from firecube.core.errors import ConfigurationError, Message, Param, SchemaDrift
 from firecube.core.product.resolver import ProductResolver
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
+from firecube.core.time.calendar import is_gregorian_like
 from firecube.core.time.convert import coord_to_datetime64
 from firecube.core.uris import local_path_from_target
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
@@ -279,6 +280,22 @@ def _display_group_name(group: Any) -> str:
     return path if path.startswith("/") else f"/{path}"
 
 
+def _is_encoded_time_coord(arr: Any) -> bool:
+    """Return whether *arr* is a time coordinate stored as encoded numbers.
+
+    A calendar-declared time axis is stored as a numeric array that carries both
+    ``units`` attr and a non-Gregorian ``calendar`` attr. Discovery must recognise it
+    as the group's time coordinate, otherwise the command reports that the group has
+    none. A Gregorian calendar attr does not qualify: Gregorian time stays ``datetime64``.
+    """
+
+    attrs = arr.attrs
+    if arr.dtype.kind not in "iuf" or "units" not in attrs:
+        return False
+    calendar = attrs.get("calendar")
+    return isinstance(calendar, str) and bool(calendar.strip()) and not is_gregorian_like(calendar)
+
+
 def _resolve_time_dim_for_group(
     group: Any,
     *,
@@ -320,7 +337,7 @@ def _resolve_time_dim_for_group(
             arr = group[name]
         except KeyError:
             continue
-        if arr.dtype.kind != "M":
+        if arr.dtype.kind != "M" and not _is_encoded_time_coord(arr):
             continue
         if getattr(arr, "ndim", None) != 1:
             continue

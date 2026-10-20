@@ -21,7 +21,9 @@ from typing import Any, ClassVar, cast
 
 import numpy as np
 import pytest
+import zarr
 
+from firecube.core.index_resolve import resolve_index_spec
 from firecube.core.index_spec import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.runtime.parallel_execution_state import _ParallelExecutionState
@@ -187,3 +189,32 @@ def test_pod_startup_hard_fail_message_actionable(
     assert "phantom" in message
     assert "zarr_schema" in message
     assert "capability gate" in message
+
+
+def test_startup_refuses_calendar_group_whose_coordinate_is_not_preallocated(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "cube.zarr"
+    zarr.open_group(store=str(store), mode="w", zarr_format=3).create_group("data").create_array(
+        "timestamp", shape=(10,), dtype=np.int64, fill_value=np.iinfo(np.int64).min
+    )
+    axis = RegularTimeAxis(
+        coordinate="timestamp",
+        epoch="2049-01-01T00:00:00Z",
+        cadence_s=86400,
+        slot_count=10,
+        calendar="360_day",
+    )
+    resolved = resolve_index_spec(
+        IndexSpec(name="calendar_startup_v1", groups={"data": axis}), time_dim_name="timestamp"
+    )
+    monkeypatch.setattr(
+        _PodStartupIngestor, "resolve_output_uri", lambda self, ctx, write_mode="staged": str(store)
+    )
+    ingestor = _PodStartupIngestor(chunk_manager=_ChunkManager())
+    with pytest.raises(ConfigurationError) as excinfo:
+        ingestor._verify_calendar_axes_preallocated_at_startup(cast(Any, _ctx()), resolved)
+
+    message = str(excinfo.value)
+    assert "data/timestamp" in message
+    assert "360_day" in message

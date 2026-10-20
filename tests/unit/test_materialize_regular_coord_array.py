@@ -22,9 +22,11 @@ import pytest
 import zarr
 
 from firecube.core.errors import SchemaDriftError
+from firecube.core.index_spec import RegularTimeAxis
 from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
 from firecube.core.zarr.coord_materialization import materialize_regular_coord_array
 from firecube.core.zarr.region_writer import RegionZarrWriter
+from firecube.core.zarr.time_decode import decode_time_array
 from firecube.ingestor.templates.direct_zarr import ZarrArraySpec
 
 
@@ -265,3 +267,57 @@ def test_existing_shape_mismatch_raises(writer_and_root: tuple[RegionZarrWriter,
             axis=axis(100),
             spec=coord_spec(chunks=(1,)),
         )
+
+
+def test_360_day_axis_stores_units_and_calendar_and_decodes_february_30(
+    writer_and_root: tuple[RegionZarrWriter, Any],
+) -> None:
+    writer, root = writer_and_root
+    attrs = {"units": "seconds since 2049-01-01 00:00:00", "calendar": "360_day"}
+    spec = ZarrArraySpec(
+        name="time",
+        shape=(0,),
+        dtype=np.dtype("int64"),
+        fill_value=np.iinfo(np.int64).min,
+        attrs=attrs,
+    )
+    calendar_axis = RegularTimeAxis(
+        coordinate="time",
+        epoch="2049-01-01T00:00:00Z",
+        cadence_s=86400,
+        slot_count=90,
+        calendar="360_day",
+    )
+    materialize_regular_coord_array(
+        writer=writer, root=root, group_name="data", axis=calendar_axis, spec=spec
+    )
+    arr = root["data/time"]
+    assert {key: arr.attrs[key] for key in attrs} == attrs
+    decoded = decode_time_array(np.asarray(arr[:]), dict(arr.attrs))[59]
+    assert decoded.isoformat().startswith("2049-02-30")
+
+
+def test_unmarked_all_fill_shell_under_other_units_is_filled_not_refused(
+    writer_and_root: tuple[RegionZarrWriter, Any],
+) -> None:
+    writer, root = writer_and_root
+    attrs = {"units": "seconds since 2048-01-01 00:00:00", "calendar": "noleap"}
+    writer.ensure_group(
+        "data/time", shape=(5,), dtype=np.int64, fill_value=np.iinfo(np.int64).min,
+        chunks=(5,), attrs=attrs, dimension_names=("time",),
+    )  # fmt: skip
+    axis = RegularTimeAxis(
+        coordinate="time",
+        epoch="2049-01-01T00:00:00Z",
+        cadence_s=86400,
+        slot_count=5,
+        calendar="360_day",
+    )
+    materialize_regular_coord_array(
+        writer=writer, root=root, group_name="data", axis=axis, spec=None
+    )
+    arr = root["data/time"]
+    assert np.array_equal(arr[:], np.arange(5, dtype=np.int64) * 86400)
+    assert arr.attrs["units"] == "seconds since 2049-01-01 00:00:00"
+    assert arr.attrs["calendar"] == "360_day"
+    assert arr.attrs[ATTR_PREALLOCATED] is True

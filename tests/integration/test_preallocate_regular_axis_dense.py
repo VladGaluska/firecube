@@ -47,15 +47,18 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import math
+import re
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
+import cftime
 import irregular_axis_test_plugin as _irregular_plugin_module
 import numpy as np
 import pytest
 import regular_axis_test_plugin as _regular_plugin_module
+import xarray as xr
 import zarr
 from click.testing import CliRunner
 
@@ -566,3 +569,132 @@ def test_auto_irregular_axis_preallocate_stamps_marker_and_allows_matching_write
         f"removed={set(before) - set(after)!r} "
         f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
     )
+
+
+def _calendar_run(
+    command: str, target: Path, *extra: str, calendar: str = "360_day", mode: str = "direct"
+) -> Any:
+    head = ["zarr", "preallocate"] if command == "preallocate" else ["ingest"]
+    args = [*head, "regular_axis_calendar", "--target", f"file://{target}"]
+    args += ["--product-name", "regular_axis_calendar", "--storage-type", "local"]
+    args += ["--storage-driver", "fsspec", "--write-mode", mode]
+    args += ["--option", "no_progress=true", "--option", f"calendar={calendar}"]
+    args += ["--option", "slot_count=90", *extra]
+    return CliRunner().invoke(cli, args)
+
+
+def _product_files(target: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(target).as_posix(): p.read_bytes()
+        for p in sorted(target.rglob("*"))
+        if p.is_file() and ".firecube" not in p.relative_to(target).parts
+    }
+
+
+def _assert_calendar_store(target: Path) -> None:
+    units = "seconds since 2049-01-01 00:00:00"
+    coord = _root(target)["data/time"]
+    attrs = (coord.dtype, coord.attrs["calendar"], coord.attrs["units"])
+    assert attrs == (np.dtype("int64"), "360_day", units)
+    assert coord.attrs[ATTR_PREALLOCATED] is True
+    ds = xr.open_zarr(str(target), group="data", consolidated=False, zarr_format=3)
+    expected = cftime.num2date(np.arange(90) * 86400, units, calendar="360_day")
+    assert [v.isoformat() for v in ds["time"].values] == [v.isoformat() for v in expected]
+    assert list(np.asarray(_root(target)["data/values"][:]).reshape(-1)) == list(range(90))
+
+
+def test_calendar_axis_preallocate_and_ingest_decode_to_declared_dates(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    assert _calendar_run("preallocate", target).exit_code == 0
+    result = _calendar_run("ingest", target)
+    assert result.exit_code == 0, result.output
+    _assert_calendar_store(target)
+
+
+def test_refused_calendar_relabel_leaves_store_and_earlier_partial_group_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unbounded "aux" group means no resolved-index record, so the coordinate's own
+    # attrs are the only record of its calendar and the relabel check must refuse.
+    base = _regular_plugin_module.RegularAxisCalendarIngestor
+
+    class _Mixed(base):
+        PRODUCT_NAME: ClassVar[str] = "regular_axis_calendar"
+
+        def index_spec(self, ctx: PluginContext) -> IndexSpec:
+            greg = RegularTimeAxis(
+                coordinate="time", epoch="2049-01-01T00:00:00Z", cadence_s=86400, slot_count=90
+            )
+            aux = RegularTimeAxis(coordinate="time", epoch="2049-01-01T00:00:00Z", cadence_s=86400)
+            groups = {"greg": greg, **super().index_spec(ctx).groups, "aux": aux}
+            return IndexSpec(name="mixed_v1", groups=groups)
+
+        def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+            (data,) = super().zarr_schema(ctx)
+            return [
+                ZarrGroupSpec(group="greg", arrays=data.arrays),
+                data,
+                ZarrGroupSpec(group="aux", arrays=data.arrays),
+            ]
+
+    _loader.discover_ingestors()
+    monkeypatch.setitem(_loader.AVAILABLE_INGESTORS, "regular_axis_calendar", _Mixed)
+    target = tmp_path / "cube.zarr"
+    assert (
+        _calendar_run("preallocate", target, "--slot-start", "0", "--slot-end", "1").exit_code == 0
+    )
+    assert int(np.isnat(np.asarray(_root(target)["greg/time"][:])).sum()) == 89
+    before = _product_files(target)
+    # The plugin now declares only the bounded group, so a resolved-index record is negotiated.
+    monkeypatch.setitem(_loader.AVAILABLE_INGESTORS, "regular_axis_calendar", base)
+
+    result = _calendar_run("preallocate", target, calendar="noleap")
+
+    assert result.exit_code != 0, result.output
+    assert "360_day" in f"{result.output}\n{result.exception}"
+    assert _product_files(target) == before  # includes the root zarr.json
+    retry = _calendar_run("preallocate", target)  # the original 360_day, after the refusal
+    assert retry.exit_code == 0, f"{retry.output}\n{retry.exception}"
+
+
+def test_staged_ingest_needs_calendar_preallocate_and_names_the_command(tmp_path: Path) -> None:
+    refused = _calendar_run("ingest", tmp_path / "a.zarr", mode="staged")
+    assert refused.exit_code != 0
+    assert "firecube zarr preallocate" in f"{refused.output}\n{refused.exception}"
+
+    target = tmp_path / "b.zarr"
+    assert _calendar_run("preallocate", target, mode="staged").exit_code == 0
+    result = _calendar_run("ingest", target, mode="staged")
+    assert result.exit_code == 0, f"{result.output}\n{result.exception}"
+    _assert_calendar_store(target)
+
+
+def test_calendar_dry_run_prints_calendar_dates(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    result = _calendar_run("preallocate", target, "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "first=2049-01-01T00:00:00 (360_day);" in result.output
+    assert "last=2049-03-30T00:00:00 (360_day);" in result.output
+    assert not target.exists()
+
+
+def test_gregorian_dry_run_carries_no_calendar_suffix(tmp_path: Path) -> None:
+    target = tmp_path / "g.zarr"
+    result = CliRunner().invoke(
+        cli, _preallocate_args("regular_axis_dense_coord", "p", target, dry_run=True)
+    )
+    assert result.exit_code == 0, result.output
+    assert not re.search(
+        r"\((?:360_day|noleap|gregorian|standard|julian|all_leap)\)", result.output
+    )
+    assert "first=2024-01-01T00:00:00;" in result.output
+    assert not target.exists()
+
+
+def test_calendar_slot_window_still_writes_the_whole_grid(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    result = _calendar_run("preallocate", target, "--slot-start", "10", "--slot-end", "20")
+    assert result.exit_code == 0, result.output
+    assert "window not applied to calendar coordinate" in result.output
+    coord = np.asarray(_root(target)["data/time"][:])
+    assert np.array_equal(coord, np.arange(90, dtype=np.int64) * 86400)

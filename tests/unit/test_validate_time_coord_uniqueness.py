@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -133,3 +134,63 @@ def test_duplicate_filled_values_beside_nat_slots_are_still_invalid(tmp_path: Pa
 
     assert report.is_valid is False
     assert any("duplicate" in issue.lower() for issue in report.validity_issues)
+
+
+_FILL = int(np.iinfo(np.int64).min)
+_CALENDAR_ATTRS = {"units": "seconds since 1850-01-01 00:00:00", "calendar": "360_day"}
+
+
+@pytest.mark.parametrize(
+    ("values", "fill_value", "attributes", "diagnostic"),
+    [
+        pytest.param(
+            [0, 86400, _FILL, _FILL, 345600], _FILL, _CALENDAR_ATTRS, None, id="fill-slots"
+        ),
+        pytest.param(
+            [0, 86400, _FILL, 86400, 345600],
+            _FILL,
+            _CALENDAR_ATTRS,
+            "duplicate",
+            id="duplicate-beside-fill",
+        ),
+        pytest.param(
+            [-1, -1, 3, 4, 5],
+            -1,
+            {"units": _CALENDAR_ATTRS["units"]},
+            "duplicate",
+            id="fill-is-an-ordinary-value-without-calendar",
+        ),
+        *[
+            pytest.param(v, 0, {**_CALENDAR_ATTRS, "calendar": c}, d, id=f"{c}-{v}")
+            for c, v, d in (
+                ("gregorian", [0, 0, 1], "duplicate"),
+                ("standard", [0, 0, 1], "duplicate"),
+                ("gregorian", [1, 0, 2], "monotonic"),
+            )
+        ],
+    ],
+)
+def test_only_encoded_calendar_fill_slots_are_absent_not_duplicates(
+    tmp_path: Path,
+    values: list[int],
+    fill_value: int,
+    attributes: dict[str, Any],
+    diagnostic: str | None,
+) -> None:
+    store_path = tmp_path / "encoded.zarr"
+    group = zarr.open_group(store=str(store_path), mode="w", zarr_format=3).require_group("G")
+    coord = group.create_array(
+        "timestamp",
+        shape=(len(values),),
+        chunks=(2,),
+        dtype=np.int64,
+        fill_value=fill_value,
+        dimension_names=("timestamp",),
+        attributes=attributes,
+    )
+    coord[:] = np.array(values, dtype=np.int64)
+
+    report = _validate(store_path)
+
+    assert report.is_valid is (diagnostic is None), report.validity_issues
+    assert diagnostic is None or any(diagnostic in i.lower() for i in report.validity_issues)

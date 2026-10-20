@@ -41,6 +41,7 @@ def _seed_regular_time_record(
     cadence_s: int = 600,
     slot_count: int = 3,
     product_name: str = "test_product",
+    calendar: str | None = None,
 ) -> ResolvedIndexRecord:
     index: dict = {
         "schema_version": "v1",
@@ -53,6 +54,7 @@ def _seed_regular_time_record(
                     "epoch": epoch,
                     "cadence_s": cadence_s,
                     "mode": "exact",
+                    **({"calendar": calendar} if calendar else {}),
                 },
             }
         },
@@ -231,6 +233,19 @@ def test_derived_missing_epoch_fails_with_actionable_error(tmp_path: Path) -> No
 
     assert result.exit_code != 0, f"Expected failure; stdout={result.stdout!r}"
     assert "epoch" in result.output or "epoch" in (result.stderr or "")
+
+
+def test_derived_calendar_group_prints_calendar_dates(tmp_path: Path) -> None:
+    cube = tmp_path / "cube"
+    cube.mkdir()
+    _seed_regular_time_record(
+        cube, epoch="2049-01-01T12:00:00Z", cadence_s=86400, slot_count=90, calendar="360_day"
+    )
+
+    result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
+
+    assert result.exit_code == 0, result.output
+    assert "2049-02-30T12:00:00" in result.stdout
 
 
 def test_no_derived_flag_output_unchanged(tmp_path: Path) -> None:

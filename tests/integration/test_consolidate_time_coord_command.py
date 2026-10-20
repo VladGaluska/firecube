@@ -516,3 +516,24 @@ def test_library_two_time_coordinate_candidates_carry_group_and_time_dim_option(
         )
 
     assert (refused.value.context.group, refused.value.context.options) == ("/data", ("time_dim",))
+
+
+def test_consolidate_time_coord_on_calendar_store_is_a_safe_noop(tmp_path: Path) -> None:
+    """A preallocated calendar coordinate is found by discovery, reported sealed, and left alone."""
+    cube = tmp_path / "cube.zarr"
+    group = zarr.open_group(str(cube), mode="w", zarr_format=3).require_group("data")
+    fill = int(np.iinfo(np.int64).min)
+    coord = group.create_array(
+        "time", shape=(4,), chunks=(4,), dtype=np.int64, fill_value=fill,
+        dimension_names=("time",),
+        attributes={"units": "seconds since 2049-01-01 00:00:00", "calendar": "360_day"},
+    )  # fmt: skip
+    coord[:] = np.arange(4, dtype=np.int64) * 86400
+    coord.attrs[ATTR_PREALLOCATED] = True
+    before = _md5_of_files(cube / "data")
+
+    result = CliRunner().invoke(cli, _consolidate_args(cube))
+
+    assert result.exit_code == 0, result.output
+    assert "Group /data: already sealed, skipping" in result.output
+    assert _md5_of_files(cube / "data") == before

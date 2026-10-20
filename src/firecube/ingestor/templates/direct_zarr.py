@@ -45,7 +45,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from firecube.core.api import (
+    ATTR_PREALLOCATED,
     FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
+    AxisSpec,
     ExtentUnknownError,
     IndexSpec,
     IntegerAxis,
@@ -64,8 +66,9 @@ from firecube.core.errors import (
     Placeholder,
 )
 from firecube.core.indexed_write import IndexedWrite
+from firecube.core.time.calendar import is_gregorian_axis
 from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
-from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec, preallocate_operation
 from firecube.core.zarr.guard.metadata_authority import MetadataAuthority, hold_authority
 from firecube.ingestor.api import (
     BaseIngestor,
@@ -937,14 +940,18 @@ def _compile_indexed_write(iw: IndexedWrite, resolved_index: ResolvedIndex) -> l
         IndexedWriteCompilationError: If ``iw.coordinate`` cannot be resolved
             to a slot in ``iw.group`` (unknown group, coordinate not present,
             out-of-range integer, misaligned timestamp, wrong coordinate
-            type). The original resolver error is chained via ``__cause__``.
+            type). The original resolver error is chained via ``__cause__``,
+            and ``reason`` ends with its type and message.
     """
     try:
         slot = resolved_index.position(iw.group, iw.coordinate)
     except (KeyError, ValueError, IndexError, TypeError) as exc:
         raise IndexedWriteCompilationError(
             coordinate=iw.coordinate,
-            reason=f"coordinate not in resolved index for group '{iw.group}'",
+            reason=(
+                f"coordinate not in resolved index for group '{iw.group}': "
+                f"{type(exc).__name__}: {exc}"
+            ),
             iw_repr=repr(iw)[:200],
         ) from exc
 
@@ -1313,6 +1320,8 @@ class DirectZarrIngestor(BaseIngestor):
         if getattr(self, "_resolved_index_stamped", False):
             return
 
+        self._verify_calendar_axes_preallocated_at_startup(ctx, binding.resolved)
+
         product = _ctx_product_name(ctx, self.name)
         self._check_legacy_index_record_at_startup(product=product, plugin_name=self.name)
         run_id = str(ctx.run_id or ctx.option("run_id", "unknown"))
@@ -1339,6 +1348,64 @@ class DirectZarrIngestor(BaseIngestor):
             outcome=outcome,
         )
         self._resolved_index_stamped = True
+
+    def _verify_calendar_axes_preallocated_at_startup(
+        self, ctx: PluginContext, resolved: ResolvedIndex
+    ) -> None:
+        """Refuse ingest into a calendar group whose time coordinate preallocate has not marked.
+
+        Pods never create or fill a calendar coordinate; without this check the legacy
+        timestamp write would create it as Gregorian ``datetime64``. Runs before any batch,
+        for every run that binds an index.
+
+        The check reads the final target in every write mode, because preallocate writes
+        there and a staged workspace is not seeded yet. It reads each coordinate by its
+        full path from a live root.
+
+        Raises:
+            ConfigurationError: A calendar group's coordinate is absent or lacks
+                ``firecube_preallocated``.
+        """
+        calendar_groups: list[tuple[str, AxisSpec, str]] = []
+        for group_name in resolved.groups:
+            axis = resolved.axis_for(group_name)
+            if axis is not None and not is_gregorian_axis(axis):
+                calendar = getattr(axis, "calendar", None)
+                assert calendar is not None  # is_gregorian_axis is True without one
+                calendar_groups.append((group_name, axis, calendar))
+        if not calendar_groups:
+            return
+
+        try:
+            store_uri = self.resolve_output_uri(ctx, write_mode="direct")
+        except ConfigurationError:
+            # No resolvable output yet (e.g. a fresh in-memory context): nothing to
+            # verify. Any other exception propagates; swallowing it would disable the check.
+            return
+
+        root = _open_zarr_root_for_read(store_uri, self._chunk_manager.storage_config)
+        for group_name, axis, calendar in calendar_groups:
+            coord_name = _axis_coordinate_name(axis)
+            if coord_name is None:
+                continue
+            coord_array_path = f"{group_name}/{coord_name}"
+            coord_arr = None if root is None else open_zarr_array(root, coord_array_path)
+            if coord_arr is not None and bool(coord_arr.attrs.get(ATTR_PREALLOCATED, False)):
+                continue
+            raise ConfigurationError(
+                Message(
+                    "group {group!r} declares calendar={calendar!r} on its time axis; "
+                    "its coordinate array {array_path!r} at target {product_uri} must be "
+                    "preallocated before ingest. Calendar coordinates are single-writer: "
+                    "the engine will not create or fill them on first ingest write. "
+                    "Run: {preallocate}",
+                    group=group_name,
+                    calendar=calendar,
+                    array_path=coord_array_path,
+                    product_uri=store_uri,
+                    preallocate=preallocate_operation(),
+                )
+            )
 
     def _verify_per_group_identity_at_startup(
         self, ctx: PluginContext, resolved: ResolvedIndex

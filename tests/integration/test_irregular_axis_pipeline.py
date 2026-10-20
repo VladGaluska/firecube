@@ -58,6 +58,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
+import xarray as xr
 import zarr
 from click.testing import CliRunner
 
@@ -457,3 +458,29 @@ def test_index_show_derived_flag_on_irregular_axis_is_a_documented_noop(
     assert np.array_equal(coord_values, _EXPECTED_TIMESTAMPS), (
         "--derived on IrregularTimeAxis must not touch the persisted coord array"
     )
+
+
+def test_noleap_irregular_axis_preallocates_and_ingests_declared_dates(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    args = ["--target", f"file://{target}", "--product-name", "irregular_axis_calendar"]
+    args += ["--storage-type", "local", "--storage-driver", "fsspec", "--write-mode", "direct"]
+    args += ["--option", "no_progress=true", "--option", "calendar=noleap"]
+    pre = CliRunner().invoke(cli, ["zarr", "preallocate", "irregular_axis_calendar", *args])
+    assert pre.exit_code == 0, f"{pre.output}\n{pre.exception}"
+    ing = CliRunner().invoke(cli, ["ingest", "irregular_axis_calendar", *args])
+    assert ing.exit_code == 0, f"{ing.output}\n{ing.exception}"
+
+    root = zarr.open_group(store=str(target), mode="r", zarr_format=3)
+    coord = cast(Any, root["data/time"])
+    assert coord.attrs["calendar"] == "noleap"
+    assert coord.attrs["units"] == "days since 2049-01-01 00:00:00"
+    assert list(np.asarray(coord[:])) == [0, 29, 30, 59, 60]
+    ds = xr.open_zarr(str(target), group="data", consolidated=False, zarr_format=3)
+    assert [v.isoformat() for v in ds["time"].values] == [
+        "2049-01-01T00:00:00",
+        "2049-01-30T00:00:00",
+        "2049-01-31T00:00:00",
+        "2049-03-01T00:00:00",
+        "2049-03-02T00:00:00",
+    ]
+    assert list(np.asarray(cast(Any, root["data/values"])[:]).reshape(-1)) == [0, 1, 2, 3, 4]
