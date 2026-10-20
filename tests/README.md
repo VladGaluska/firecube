@@ -54,6 +54,34 @@ uv run pytest -q
 uv run pytest tests/unit/test_chunk_manager.py -q
 ```
 
+## Calendar Time Axes
+
+Non-Gregorian calendar behavior (360_day, noleap) has no test directory of
+its own. Each test lives with the unit it exercises:
+
+- `unit/`, calendar names and axis declaration: `test_time_encode.py`,
+  `test_time_axis_declaration.py`.
+- `unit/`, resolution: `test_index_resolve_irregular.py`.
+- `unit/`, coordinate materialization: `test_materialize_regular_coord_array.py`.
+- `unit/`, relabel refusals: `test_coord_rematerialization.py`.
+- `unit/`, `chunks list` and `chunks delete` refusals: `test_chunks_list_cli.py`,
+  `test_cli_chunks_delete.py`.
+- `unit/`, also: hashes, persisted payload, decode, writer, startup, archive,
+  append order and coverage, chunk queries.
+- `integration/`: preallocate and ingest round trips
+  (`test_preallocate_regular_axis_dense.py`, `test_irregular_axis_pipeline.py`)
+  and append over a February 30 span (`test_cf_time_dim_value_dedup.py`).
+- `cli/`: the `archive create` refusal (`test_archive_create_contract.py`).
+
+Three fixture plugins in `tests/fixtures/firecube_test_plugins` drive them.
+Pass the calendar as an option:
+
+| plugin name | options |
+|---|---|
+| `regular_axis_calendar` | `--option calendar=360_day`, `--option slot_count=90` |
+| `irregular_axis_calendar` | `--option calendar=360_day` (five fixed values) |
+| `cf_time_dim_calendar` | `--option x_calendar=360_day`, `--option x_start=2049-01-29` |
+
 ## Markers
 
 Markers are defined in `pyproject.toml`; use only registered markers.

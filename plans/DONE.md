@@ -1,5 +1,31 @@
 # Done
 
+## 2026-10-20 — CF calendar time axes land on the guarded layers (fix/parallel-chunk-ownership)
+
+**Decision.** The CF-calendar work of branch `feat/77-cf-calendars` (9a309ca, 42 commits on c160535) lands on `fix/parallel-chunk-ownership` (932a610) in four signed commits. Nothing is pushed. The full lane runs on the exact tree of each commit before the commit. Calendar writes use the guarded layers of this branch: payload through `guarded_write`, `zarr.json` through `MetadataAuthority`, live metadata reads. The entries of 2026-09-23 and 2026-10-10 hold the design.
+
+- k1 `52d2e8d` `feat(time): add encoded time axes for CF calendars`. The `core/time/` package, `core/zarr/_fill.py`, and the calendar changes to `index_resolve.py`, `index_spec.py`, `time_decode.py` and `index_binding.py`.
+- k2 `6a0895b` `feat(zarr): write CF-calendar time coordinates`. Coordinate materialization, re-materialization checks, region writer, DirectZarr startup check, preallocate, validation, consolidation and the tensogram refusal.
+- k3 `673b3f2 feat(append,chunks): calendar append order and time-range refusals`.
+- k4 `docs(calendar): document CF calendar time axes`. Hash pending. This entry belongs to it.
+- Neo's choices. D1: four commits in this order, each green at its own position. D2: a pre-registered performance allowance. D3: one recorder allowance, the traceback of `test_indexed_write_error_fails_ingest_with_compilation_error#0`, for line numbers and the new reason suffix of `IndexedWriteCompilationError`. D4: at most 1,500 added test lines.
+- Planner choice P2. The branch keeps a curated test set. The 45 test paths of 77 add 7,689 lines. A scratch worktree runs every test that 77 added or changed against the landed source before each commit. So the assertions of 77 stay checked as evidence.
+- Planner choices on code. P3: the refusals carry fields (`Datetime64RangeError`, `DuplicateAxisInstantError`, `CoordinateRelabelError`, `UnparseableSpanBoundsError.spans`, `CalendarArchiveError`). Nothing is exported from a facade.
+- P4: read-only checks and pure helpers are in new modules. Every write stays in `coord_materialization.py`.
+- P6: a moved name leaves no alias. P7: only `CalendarArchiveError` joins the conversion errors of `create_archive`. P8: the preflight and the dry-run facts. P9: the legacy nanosecond check reads the stored coordinate before `ensure_group`.
+- Performance prediction (D2). The same job on the base of 77 measured these extra calls. S0 open +12, S0 `os.listdir` +1, W1 open +18, W1 `os.listdir` +2, W2 open +92, W2 open at root +2, W2 `os.listdir` +10, W3 open +18, W3 `os.listdir` +2. Every other row is 0.
+- The noise allowance is 5 for W2 open, 2 for W2 open at root and 1 for each other row. A row outside its allowance stops the run for Neo.
+
+**Coverage.**
+
+- Acceptance evidence is kept in a local folder that Git excludes.
+- Done now: `a1` (family 1) ran 200 ids, and 200 passed. `a2` (families 1 and 2) ran 392 ids. 389 passed, 2 are class B, and 1 is the strict xfail.
+- Scheduled: `a3` (all families) and the tip checks. The plan records them in the same folder when it finishes.
+- The `kept.md` file of each tester node maps every kept test to its behaviour. It maps every dropped test of 77 to a replacement or to "acceptance only".
+- Tests added: 1,494 lines against a budget of 1,500 (measured, `ultron tdd budget`).
+- The branch does not keep the byte-parity test of 77 or its 405-line manifest (D4). At 932a610 the three Gregorian scenarios of that manifest rebuild byte for byte (ran, 2026-10-20). The scratch acceptance run includes that test.
+- Not in this entry: the recorder replay and the performance judge at the tip, which node v2 runs after the commits.
+
 ## 2026-10-20 — Cleanup after the CLI-creep sequence (fix/parallel-chunk-ownership)
 
 **Decision.** Two signed commits, nothing pushed, each revertable alone. Commit 1 is `ffcaa85` `refactor(cleanup): delete dead code and duplicate tests`. Commit 2 is the commit that holds this entry. CLI output is unchanged.
@@ -327,6 +353,20 @@ The plan records the causes of the remaining deltas against v0.1.7 and does not 
 
 **Coverage.** `tests/integration/test_engine_owned_arrays.py` (preallocate then ingest, refusals, partial stored units, staged promotion), `tests/integration/test_chunk_ownership_races.py` (forced interleavings, no timing) and `tests/unit/test_index_spec.py` lock the behavior. Finer cases are not tested.
 
+## 2026-10-10 — Calendar time code lives in `core/time/` (#77)
+
+**Decision.** The calendar vocabulary, the Gregorian fast path, the coordinate-encoding selection and the calendar value guard are in the package `firecube/core/time/`. The fill helpers are in `core/zarr/_fill.py`. The shared coordinate helpers and the re-materialization checks are in `core/zarr/_coord_common.py` and `core/zarr/coord_rematerialization.py`. `core/time/encoding.py` is the only place that derives the storage encoding. Nothing is added to `firecube.core.api` or `firecube.ingestor.api`. A moved name leaves no alias.
+
+- A module of `core/time/` imports only the modules before it in this list: `_codecs`, `calendar`, `guard`, `gregorian`, `encode`, `canonical`, `convert`, `encoding`.
+- `coord_to_datetime64` moved from `coord_materialization.py` to `core/time/convert.py`. `_fill_value_is_missing` and `_array_is_all_fill` moved from `region_writer.py` to `core/zarr/_fill.py`.
+- The refusals that carry fields are `Datetime64RangeError` (`value`), `DuplicateAxisInstantError` (`coordinate`, `slots`), `CoordinateRelabelError` (`coord_path`, `stored`, `incoming`, `differs_in`), `UnparseableSpanBoundsError` (`spans`) and `CalendarArchiveError` (`coordinate`, `calendar`).
+
+**Coverage.**
+
+- `tests/unit/test_time_encode.py`, `tests/unit/test_zarr_fill.py`, `tests/unit/test_epoch_parse_helper.py` and `tests/unit/test_coord_rematerialization.py` cover the moved code.
+- `tests/unit/test_group_identity_hash.py` and `tests/unit/test_time_axis_declaration.py` keep Gregorian hashes and declarations unchanged.
+- The landing of 2026-10-20 records the gates and the acceptance evidence.
+
 ## 2026-10-05 — `delete-span` on cubes with static data variables (#83)
 
 **Decision.** `GenericZarrIngestor` span records list time-indexed data variables only; static variables such as `lat_bnds` and `lon_bnds` are written once and have no time slots to cover. Records already written with static arrays in `span.arrays` stay valid: `delete-span` skips arrays whose known dimension names lack the span's time dimension and reports them as one warning per span. It does not rewrite old records.
@@ -336,6 +376,50 @@ The plan records the causes of the remaining deltas against v0.1.7 and does not 
 **Decision.** CF-encoded numeric time arrays (`units` containing `since`) are filled with NaT chosen by dtype, not through `encode_time_array`, which raises for all-NaT input with the `standard`/`gregorian` calendars. The sentinel is the declared `_FillValue` if present, else the `int64` minimum, else NaN for floats; an integer dtype other than `int64` without a declared `_FillValue` is refused. The Zarr fill value (`0`) decodes to the reference epoch and is a valid date. `chunks delete-span` exits 1 when it reports errors.
 
 **Coverage.** `tests/integration/test_generic_zarr_static_vars_span.py`, `tests/integration/test_delete_span_region_nan_fill.py`, `tests/unit/test_deletion_fill_value.py`, `tests/unit/test_cli_chunks_delete.py`, `tests/unit/test_deletion_missing_key_not_error.py`, and `tests/unit/test_append_stale_consolidated_metadata.py` lock the behavior.
+
+## 2026-09-23 — Calendar as a property of every time axis
+
+**Context.** A time axis on the direct write path always resolved and stored coordinates in the Gregorian calendar. A source on another day-counting calendar was read again as Gregorian. The store held plausible but wrong dates, and no error was raised. A staged time coordinate on such a calendar crashed the second ingest run. A first design added the calendar as an optional extra with no default. That left "declared Gregorian" and "undeclared" as two states for one behaviour. Also, `firecube archive` had no defined behaviour for a non-Gregorian time coordinate, and `firecube zarr validate` did not treat the fill value of an encoded coordinate as missing.
+
+**Decision.** Every time axis has a calendar. `calendar` defaults to `proleptic_gregorian`. `standard` and `gregorian` are aliases of it. A date before 1582-10-15 on a Gregorian axis follows the proleptic rule. An alias and an unset `calendar` resolve to the same declaration.
+
+- One function, `encode_coordinate`, places every value on its axis for every calendar. A Gregorian value takes a fast path that needs no time-coding library. The engine has no calendar arithmetic of its own. It delegates calendar-shaped values to the existing time-coding dependency.
+- One descriptor, `CoordinateEncoding`, selects the on-disk form. A Gregorian axis keeps the date type it always had. A non-Gregorian axis stores a CF-encoded count of a fixed unit since a reference point, with `units` and `calendar` attrs.
+- The coordinate of a non-Gregorian axis must be complete before any ingest run. `firecube zarr preallocate` writes it. Ingest verifies incoming values against it. Ingest never creates or fills it.
+- A non-Gregorian calendar with observed (`floor`) placement or an open-ended `end_date` raises at declaration time. The message names the supported alternative.
+- A value on a calendar that the axis does not declare is refused. A Gregorian value given to a non-Gregorian axis is refused.
+- The persisted index record and the group identity include the calendar only when it is not Gregorian-like. Every existing store, index record and identity hash stays byte-identical.
+- `firecube archive create --archive-format tensogram` refuses a store whose time coordinate is on a non-Gregorian calendar. The message names the coordinate. The run is recorded failed. `--archive-format zip` copies the store, so it keeps `units`, `calendar` and values. `archive restore` restores a `.zip` or a `.tgm`. A restore of a `.tgm` does not restore the CF encoding (see `plans/TODO.md`).
+- `firecube zarr validate` treats the fill value of an encoded calendar coordinate as missing. It keeps duplicate detection for every other coordinate.
+
+**Decision (2026-10-10, review fixes).**
+
+- A bare number on a Gregorian regular axis stays a `TypeError`, as in 0.1.7.
+- The `datetime64[ns]` range check is at the shared Gregorian conversion. `gregorian_to_datetime64_ns` refuses an instant outside 1677-09-21 to 2262-04-11 and raises `Datetime64RangeError`. The conversion of plugin coordinate values to `datetime64[ns]` goes through it. The legacy timestamp writer applies it only when the stored coordinate dtype is `datetime64[ns]`. Conversions to epoch seconds, `encode_coordinate` and slot position accept later dates.
+- Re-materialization of a stored coordinate is refused before any write when its epoch, `units` or calendar would change. The coordinate checks raise `CoordinateRelabelError`. The preflight runs for all groups before the first group is written.
+- `chunks list --time-range` and `chunks delete --time-range` refuse spans whose bounds cannot be compared, for example a `360_day` 30 February. They delete nothing. The refusal is opt-in on the control-plane filter, so force-reingest and resume keep working on a `360_day` store.
+- A consolidated snapshot of a child group does not hide a calendar coordinate from the relabel check. The check reads the array by its full path from a live root.
+- `firecube zarr validate` and `consolidate-time-coord` treat an integer coordinate as a calendar coordinate only when its `calendar` attr is not Gregorian-like. A Gregorian integer coordinate that carries `units` and `calendar` keeps ordinary handling.
+
+**Consequences.**
+
+- A plugin author declares the data calendar, or writes `calendar="standard"` for clarity. A Gregorian declaration gives the same store as before.
+- A staged time coordinate on a non-Gregorian calendar no longer crashes the second ingest run and no longer records empty coverage bounds.
+- A coordinate-resolution error names the calendar of the value and of the axis.
+- `firecube zarr index show --derived` and the preallocate dry run render calendar dates on the axis calendar.
+- `firecube zarr consolidate-time-coord` changes nothing on a calendar store, because preallocate left the coordinate complete.
+- The startup check that refuses a non-Gregorian group with an unpreallocated coordinate always resolves the final target. A staged ingest is not refused by mistake.
+
+**Coverage.** Landed test homes, by behaviour:
+
+- Axis declaration, calendar names, encoding, identity hash and resolution: `tests/unit/test_time_encode.py`, `tests/unit/test_time_axis_declaration.py`, `tests/unit/test_group_identity_hash.py`, `tests/unit/test_index_resolve_irregular.py`, `tests/unit/test_index_binding.py`, `tests/unit/test_as_resolved_index_record.py`.
+- Decode and range guard: `tests/unit/test_time_decode.py`, `tests/unit/test_epoch_parse_helper.py`, `tests/unit/test_zarr_fill.py`.
+- Coordinate materialization and relabel refusal: `tests/unit/test_materialize_regular_coord_array.py`, `tests/unit/test_materialize_irregular_coord_array.py`, `tests/unit/test_coord_rematerialization.py`.
+- Writer, startup and compile error: `tests/unit/test_region_zarr_writer.py`, `tests/unit/test_pod_startup_phantom_group.py`, `tests/unit/test_indexed_write_compile.py`, `tests/unit/test_indexed_write_exception.py`.
+- Preallocate and ingest through the CLI: `tests/unit/test_cli_zarr_preallocate.py`, `tests/integration/test_preallocate_regular_axis_dense.py`, `tests/integration/test_irregular_axis_pipeline.py`, `tests/integration/test_zarr_index_show_derived.py`.
+- Append, coverage and time-range refusal: `tests/integration/test_cf_time_dim_value_dedup.py`, `tests/unit/test_append_coverage_builder_time_decode.py`, `tests/unit/test_append_overwrite_errors.py`, `tests/unit/test_chunk_manager_queries.py`, `tests/unit/test_chunks_list_cli.py`, `tests/unit/test_cli_chunks_delete.py`.
+- Validate, consolidate and archive: `tests/unit/test_validate_time_coord_uniqueness.py`, `tests/integration/test_consolidate_time_coord_command.py`, `tests/unit/test_tensogram_core.py`, `tests/cli/test_archive_create_contract.py`.
+- The branch keeps no byte-parity manifest test. The Gregorian layout is unchanged. The landing of 2026-10-20 records that 932a610 rebuilds the three Gregorian scenarios of that manifest byte for byte.
 
 ## 2026-09-18 — Ingest hot-path scan fixes
 

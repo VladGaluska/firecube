@@ -83,6 +83,47 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   `None` on success and for any other exception. If the error carries a
   structured message, read its `context` and `recovery`. Otherwise read
   `PipelineResult.error`.
+- `TimeAxis.grid`, `TimeAxis.explicit` and `TimeAxis.discovered` accept a
+  `calendar` for a source that is not on the Gregorian calendar.
+  - The accepted names are `360_day`, `noleap` (alias `365_day`), `all_leap`
+    (alias `366_day`) and `julian`.
+  - An irregular axis on such a calendar also needs `units`.
+  - A regular axis on such a calendar needs `slot_count`. It does not accept
+    `mode="floor"` or `end_date`.
+  - A monthly `360_day` axis is a grid with `cadence_s=2592000`.
+- Firecube stores the time coordinate of a calendar axis as CF-encoded numbers
+  with `units` and `calendar` attributes. A reader decodes the numbers in that
+  calendar. Firecube refuses a value on any other calendar. It does not
+  relabel the value.
+- `calendar` defaults to `"proleptic_gregorian"`. The names `"standard"` and
+  `"gregorian"` are aliases of it. A Gregorian axis stores `datetime64` with
+  no `units` or `calendar` attribute, as before.
+- `firecube zarr preallocate` writes the whole coordinate of a calendar axis.
+  Run `firecube zarr preallocate` before the first ingest into a calendar
+  group.
+  - An ingest that runs earlier fails, in direct and in staged mode. The
+    error names the command.
+  - A new preallocate run that changes the epoch, `units` or calendar of a
+    stored coordinate fails. No Zarr data or metadata outside `.firecube/`
+    changes. Firecube records the failed run.
+  - On a regular calendar axis with a non-empty window, the dry run prints
+    `first` and `last` as calendar dates, followed by the calendar name in
+    parentheses.
+  - An irregular calendar axis prints no `first` or `last` date in the dry
+    run. An empty window on a regular calendar axis prints `None` for
+    `first` and for `last`.
+  - A slot window does not limit the grid of a regular calendar coordinate.
+    The dry run adds `; window not applied to calendar coordinate` to the
+    line.
+  - A regular calendar axis accepts an empty slot window.
+- `firecube zarr index show --derived` prints the first and last values of a
+  calendar axis as calendar dates. It decodes the dates in the same way as
+  the `firecube zarr preallocate` dry run.
+- `firecube chunks list --time-range` and `firecube chunks delete
+  --time-range` exit with a non-zero code if a recorded span bound does not
+  parse as a Gregorian date. An example is 30 February on a `360_day`
+  calendar. The error names each span, and `delete` deletes nothing. Spans
+  with ordinary bounds filter as before.
 
 ### Changed
 - The refusal for a legacy index record now names the library function that
@@ -254,6 +295,9 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   another writer holds. The intermediate retries of the schema setup skip the
   detail. Its final attempt still builds it, even if the setup then converges
   (#86).
+- The reason of `IndexedWriteCompilationError` now names the type and the
+  message of the underlying error when a coordinate does not resolve. Update
+  any code that matches the old reason text.
 
 ### Fixed
 
@@ -513,6 +557,22 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   after this process had listed the store. The check now lists each group
   again and reads the `zarr.json` file of each array directly. No action is
   required.
+- Firecube now refuses a Gregorian time value outside the `datetime64[ns]`
+  range, about 1677-09-21 to 2262-04-11. Before, a value handed to a Gregorian
+  axis or written to a Gregorian coordinate wrapped to a wrong date without an
+  error. For example, 2500-01-01 became 1915-06-14. The error names the range.
+- `firecube archive create --archive-format tensogram` now refuses a store
+  with a non-Gregorian time coordinate. The error names the coordinate.
+  For a plain Zarr store, the command records nothing. For a Firecube
+  product, it attempts to record the run as failed. Before, the command
+  dropped the coordinate and wrote an archive without a time axis.
+- A second ingest run into a store that holds calendar-valued time objects no
+  longer crashes. Before, the run failed and recorded null coverage bounds.
+- `firecube zarr consolidate-time-coord` now leaves a preallocated
+  calendar time coordinate unchanged.
+- `firecube zarr validate` no longer reports the unwritten slots of an encoded
+  calendar coordinate as duplicates. It still reports a repeated value on every
+  other coordinate.
 
 ## [0.1.7] - 2026-09-19
 

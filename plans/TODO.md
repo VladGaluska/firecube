@@ -5,6 +5,40 @@ New decisions are recorded in [DONE.md](DONE.md) with a date.
 
 ## Active Work
 
+### Calendar-declared time axes - follow-ups (2026-10-20)
+
+**Status**: OPEN. None started.
+
+The design is in [DONE.md](DONE.md), 2026-09-23. These cases are refused with a clear error. They are not half-supported:
+
+- `mode="floor"` (observed placement) with a non-Gregorian calendar.
+- `end_date` with a non-Gregorian calendar. Use `slot_count`.
+- Units other than the derived ones on a regular axis.
+- A non-Gregorian calendar on a serial-mode `DirectZarrIngestor` that declares no `index_spec`.
+
+Open items:
+
+- **`mode="floor"` with a non-Gregorian calendar.** Blocked. xarray decodes a fill value in a `float64` non-Gregorian coordinate to a valid-looking date. An `int64` fill value fails to open the store. Both defeat the rule that a non-Gregorian coordinate is complete before a reader opens it. This needs an upstream fill-masking fix.
+- **`end_date` with a non-Gregorian calendar.** Small. Parse an `end_date` string on the axis calendar. For a fixed cadence it is equal to `slot_count`, and it keeps the rule that the coordinate is complete up front.
+- **Serial-mode `DirectZarrIngestor` with a non-Gregorian calendar.** Not supported. A serial plugin has no axis to carry the calendar. The loud refusal stays. The documented path is to declare an `index_spec`.
+- An optional encoding unit that matches the source, on a fixed-cadence non-Gregorian axis. Today the unit is always derived from the reference point.
+- Consolidation of a complete encoded coordinate into a denser chunk layout. The command changes nothing on a calendar store today. A real use case, for example a legacy sparse layout, needs its own encode-aware path.
+- **Encoded storage for every calendar, Gregorian included.** See IDEAS.md §44. The stored `firecube_group_identity_hash` already includes the dtype string, so it needs no new field. The change moves the stored value of every existing Gregorian group. That needs a migration of the stored attribute and dual acceptance of the old and new value. The resolved-index record holds no dtype and no group hash. Adding the encoding identity to it is a proposed schema change and would need a version bump.
+- **Archive and restore lose the CF encoding of a time coordinate.** Folded into the Tensogram entry in this file ("Archive restore loses time-coordinate encoding").
+- **In-calendar comparison of control-plane time bounds.** A `360_day` span can record a bound such as 2049-02-30 that has no Gregorian date. `chunks list --time-range` and `chunks delete --time-range` refuse such a span with `UnparseableSpanBoundsError` and delete nothing. A comparison on the span calendar would let these queries select the span. It needs the calendar recorded with the bounds, and a filter in `_projection.py` that compares through it. The refusal is opt-in (`refuse_unparseable`) because force-reingest and resume record spans through the same filter.
+- **Appending a Gregorian batch to a `360_day` store fails without a clear refusal.** The batch fails and the run is recorded failed. The message is a library comparison error (`cannot compare cftime...`, or a numpy `isnan` error for numeric CF batches). It does not name both calendars. Add a check where the append batch decodes its time coordinate.
+- **Review items on encoded coordinates.** Found in the review of 77. Not fixed.
+    - `months since` units pass axis construction and fail at encode time. Refuse them at declaration, because a month has no fixed length in seconds.
+    - A numeric CF-encoded batch appended to a calendar append store fails with a `TypeError`. Decode it, or refuse it with a message that names the calendar.
+    - The minimum `int64`, the missing-value sentinel of an encoded coordinate, is accepted as an explicit coordinate value. Refuse it, so that a written slot cannot read as missing.
+    - A `float64` coordinate spec collapses values that differ by microseconds. The collapse is silent. It needs an explicit `float64` array spec.
+- **Archive of a region-written (DirectZarr) Zarr cube fails.** `firecube archive create` fails with `cannot convert datetime64 to CBOR` on a cube whose time coordinate the region writer materialized. The converter copies the raw zarr fill value of the coordinate (a `datetime64` NaT) into the archive metadata, and the archive encoder cannot serialise it. Cubes from the append template are not affected. xarray CF-encodes their time coordinate to integers with an integer fill value. It reproduces on v0.1.7. Fix: write a `NaT` or `NaN` fill value in a serialisable form in the archive metadata. Map it back on restore. Add a region-written cube to the archive tests. A strict xfail test, `test_archive_create_gregorian_direct_zarr_store`, pins this in the tree of 77 only. It is not in this branch, so no test pins the defect here. owner: unassigned
+- **The discovery of a Gregorian integer array in consolidation has no repository test.** `consolidate_time_coords` treats an integer array as a calendar coordinate only when its `calendar` attr is not Gregorian-like (`_is_encoded_time_coord` in `src/firecube/core/zarr/coord_consolidation.py`). No test in `tests/integration/test_consolidate_time_coord_command.py` runs a Gregorian integer array that carries `units` and `calendar`. A later change of the predicate is not guarded. Add a row to that test home.
+- **A marked group at a calendar coordinate path passes pod startup, then fails with `AttributeError`.** `_verify_calendar_axes_preallocated_at_startup` in `src/firecube/ingestor/templates/direct_zarr.py` accepts a group that carries `firecube_preallocated`. `write_timestamp` then reads `dtype` from the group and raises `AttributeError`. The case came from 77 and was not introduced by the landing. No supported producer makes such a group. Fix: require an array before the startup check accepts its marker.
+- **Eager `xarray` import on every plugin import path.** The core Zarr I/O module imports `xarray` when the module loads. The time-decode helper imports it lazily. Every plugin pays that cost, even when it never uses Zarr I/O. Fold it into a pass that makes imports lazy.
+
+---
+
 ### Generic numeric flag helpers (2026-09-12)
 
 **Status**: FUTURE; no implementation in the current core-readiness work.
@@ -310,6 +344,8 @@ power in the default test loop.
 **Verified broken today (evidence for Phase 1, confirmed identical on tensogram 0.17 and 0.21 — pre-existing, not upgrade regressions):**
 - `firecube ingest <plugin> --output-format tensogram --target file://.../out.tgm` fails with `[Errno 21] Is a directory`: the control-plane root (`.firecube/`) is created *inside* the `.tgm` target path before the strategy writes, turning the target into a directory. The synthesized-class path inherits zarr-oriented target preparation that is wrong for a single-file format.
 - Archive restore loses time-coordinate encoding: CF `units`/`calendar` live in xarray `.encoding` and are never serialized by the converter, so restored cubes get a raw float64 ns-epoch time coord that xarray cannot decode back to datetime64. Restored variables also receive the raw base-entry dict (`name`, `zarr_chunks`, `zarr_compressor`, `zarr_fill_value`, nested `attrs`) as variable attrs — metadata pollution. Fix: serialize variable `.encoding` (at least time units/calendar) into the firecube message metadata and reapply on restore; map only real attrs onto restored variables. **Ownership: this is a firecube bug, not a tensogram one** — the metadata frame is free-form (room to store encoding), the engine's base-entry passthrough is fed by keys we put there, and our restore path already post-processes the decoded dataset. No upstream change required; optional upstream nice-to-haves (a variable-attrs convention in tensogram-xarray base entries, a logical datetime64 dtype hint in tensogram descriptors) are tracked in IDEAS.md, not blockers.
+  - The same loss makes `archive create --archive-format tensogram` refuse a store with a non-Gregorian time coordinate. `zarr_to_tgm` raises `CalendarArchiveError`, because the archive carries no CF time encoding. The fix above must also lift that refusal.
+  - The zip format keeps the encoding. `archive restore` accepts a `.zip` or a `.tgm`.
 
 **Phase 1 — DONE (2026-06-11):** `DatasetProducer` protocol defined in `ingestor/contracts/`; CLI `type()` synthesis removed; direct `GenericTensogramIngestor` subclasses are now CLI-routable via protocol-checked strategy selection. `_GenericBatchIngestor` dissolved; `GenericZarrIngestor` and `GenericTensogramIngestor` re-parented directly onto `BaseIngestor`. Evidence: `tests/unit/test_tensogram_routing.py`, `tests/unit/test_template_hierarchy.py`. See DONE.md 2026-06-11 audit dispositions C3, C4.
 
