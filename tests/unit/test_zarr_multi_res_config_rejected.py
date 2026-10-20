@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from firecube.cli._errors import render
 from firecube.core.errors import ConfigurationError
 from firecube.ingestor.runtime.base import BaseIngestor
 from firecube.ingestor.templates.config import ZarrTemplateConfig
@@ -26,7 +27,7 @@ from tests.helpers.rows import table_row
 
 REMOVED_MESSAGE = (
     "zarr_multi_res during ingest has been removed; "
-    "run 'firecube zarr multires <target>' after ingestion instead."
+    "run 'ZarrMultiresBuilder.build <target>' after ingestion instead."
 )
 
 
@@ -38,6 +39,7 @@ def test_zarr_multi_res_list_raises_config_error() -> None:
     ) as exc_info:
         ZarrTemplateConfig.from_options({"zarr_multi_res": [1.0, 0.5]})
     assert str(exc_info.value) == REMOVED_MESSAGE
+    assert "run 'firecube zarr multires <target>' after" in render(exc_info.value)
 
 
 def test_zarr_multi_res_rejected_by_presence_not_value(subtests, tmp_path) -> None:

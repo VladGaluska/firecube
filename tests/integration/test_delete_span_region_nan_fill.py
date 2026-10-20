@@ -32,12 +32,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import click
 import numpy as np
 import pytest
 import xarray as xr
 import zarr
 from click.testing import CliRunner, Result
 
+from firecube.cli._errors import render
 from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkManager, SpanCoverage
 from tests.helpers.storage import make_test_binding
@@ -594,7 +596,9 @@ def test_chunk_key_delete_of_only_static_arrays_is_refused(tmp_path: Path) -> No
     message = str(excinfo.value)
     assert span_key in message
     assert f"no array in this span carries time dimension '{TIME_DIM}'" in message
-    assert "--time-dim" in message
+    assert "time_dim" in message and "--time-dim" not in message
+    delete_span = cli.commands["chunks"].commands["delete-span"]  # type: ignore[attr-defined]
+    assert "--time-dim" in render(excinfo.value, click.Context(delete_span))
     assert _hash_files(_group_dir(tmp_path)) == before
     assert [(key, status) for key, status, _meta in _span_history(tmp_path)] == [
         (span_key, "active")
@@ -905,3 +909,12 @@ def test_region_fill_refusal_mutates_nothing(
     if seed_kwargs.get("extra_arrays"):
         unknown = np.asarray(_open_group(tmp_path)[UNKNOWN_DIMS][:])
         assert unknown.tolist() == (np.arange(N_TIMES) + 10.0).tolist()
+
+
+def test_repro_replaced_span_skip_warning_names_the_force_flag(tmp_path: Path) -> None:
+    _seed_append_store(tmp_path)
+    _delete_run_with_cli(tmp_path, "run-b")
+    skipped = _delete_run_with_cli(tmp_path, "run-b", force=False, include_replaced=True)
+    assert "already replaced by an in-place fill" in skipped.output
+    assert "Rerun with --force to fill it again." in skipped.output
+    assert "force=True" not in skipped.output

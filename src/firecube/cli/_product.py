@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import click
 
+from firecube.cli._errors import render
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.product.resolver import ProductResolver
 
@@ -40,8 +41,4 @@ def resolve_product_identity(
     try:
         return ProductResolver.resolve(value, format=format, product_name=product_name)
     except ValueError as exc:
-        raise click.UsageError(str(exc)) from exc
-
-
-def resolve_product_name(value: str, *, format: str = "zarr", product_name: str) -> str:
-    return resolve_product_identity(value, format=format, product_name=product_name).product_name
+        raise click.UsageError(render(exc)) from exc

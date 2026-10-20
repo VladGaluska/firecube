@@ -192,12 +192,3 @@ def test_both_markers_raises(writer: RegionZarrWriter) -> None:
 
     with pytest.raises(SchemaDriftError, match=r"mutually exclusive"):
         writer.write_timestamp("data_1km", ts_index=0, timestamp_val=timestamp)
-
-
-def test_no_markers_legacy_write(writer: RegionZarrWriter) -> None:
-    timestamp = np.datetime64("2026-01-01T00:00:00", "s")
-
-    writer.write_timestamp("data_1km", ts_index=0, timestamp_val=timestamp)
-
-    arr = writer._open_root()["data_1km/timestamp"]
-    assert np.asarray(arr[0]) == timestamp

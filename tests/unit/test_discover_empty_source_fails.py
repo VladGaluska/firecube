@@ -85,7 +85,7 @@ _EMPTY_REFUSED: tuple[tuple[str, type[BaseIngestor], EngineConfig | None, str], 
         "test_empty_discovery_with_explicit_pattern_raises",
         _MinimalIngestor,
         EngineConfig(allow_empty_source=False, input_filters=["*.nc"]),
-        "input-filters",
+        "pass input_filters=",
     ),
     (
         "test_empty_discovery_without_explicit_pattern_raises",

@@ -31,6 +31,7 @@ from firecube.ingestor.api import IndexSpec, RegularTimeAxis, ZarrArraySpec, Zar
 from firecube.ingestor.errors import SchemaSizeMismatchError
 from firecube.ingestor.registry import loader as _loader
 from firecube.ingestor.templates.direct_zarr import _setup_global_zarr_schema
+from tests.helpers.cli_hints import parse_hint
 
 pytestmark = pytest.mark.integration
 
@@ -131,8 +132,7 @@ def test_setup_global_zarr_schema_rejects_existing_smaller_horizon(tmp_path: Pat
     message = str(exc_info.value)
     assert (
         message == "Schema drift for group data: existing array shape[0]=10 < global_expected=20. "
-        "Run `firecube zarr preallocate` (from Python: "
-        "`firecube.ingestor.runtime.preallocate.preallocate_product`) first."
+        "Run `firecube.ingestor.runtime.preallocate.preallocate_product` first."
     )
     arr = cast(Any, zarr.open_group(store=str(store_path), mode="r", zarr_format=3)["data/data"])
     assert arr.shape == (SMALL_HORIZON, 10)
@@ -184,3 +184,14 @@ def test_cli_preallocate_rejects_existing_smaller_horizon(
     assert arr.shape == (SMALL_HORIZON, 10)
     assert np.asarray(arr[0]).tolist() == np.arange(10, dtype=np.float32).tolist()
     assert np.asarray(arr[9]).tolist() == np.full((10,), 9, dtype=np.float32).tolist()
+
+
+def test_repro_ingest_shape_drift_refusal_prints_runnable_preallocate_command(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "ingest-growth.zarr"
+    _preallocate_small_store_and_write_slots(store_path)
+    args = ["ingest", *_cli_args(f"file://{store_path}")[2:]]
+    args += ["--option", "no_progress=true", "--slot-start", "0", "--slot-end", "100"]
+    result = CliRunner().invoke(cli, args, prog_name="firecube")
+    assert parse_hint(result.output, "firecube zarr preallocate", samples={"mode": "direct"})

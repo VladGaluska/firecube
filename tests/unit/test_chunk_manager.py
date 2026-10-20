@@ -16,16 +16,21 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import time
 from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from firecube.cli._errors import render
+from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkInfo, ChunkManager, SpanCoverage, build_span_entry
+from firecube.core.controlplane.manager import maintenance_refusal_message
 from firecube.core.controlplane.types import WriteDomain
 from firecube.core.errors import ClaimConflictError, ManifestError
-from firecube.core.hints import maintenance_refusal_message
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
@@ -717,12 +722,14 @@ def test_claim_conflict_names_owner_run_and_clear_command(temp_workspace):
         with pytest.raises(ClaimConflictError) as excinfo:
             _claim(manager, stack, "grp:slot=0", "other")
         message, root = str(excinfo.value), manager.get_product_root(product)
-        clear = f"firecube chunks claims clear --product-name {root} --domain {domain} --force"
-        assert clear in message
+        printed = render(excinfo.value)
+        clear = f"firecube chunks claims clear --product-name {root} --domain {domain}"
+        assert f"{clear} --force" in printed
         assert message.startswith(f"Write-domain claim conflict for {domain}")
         assert "run-r" in message and "started" in message
         assert "which releases the claims it alone owns" in message
-        run_hint(message, "firecube chunks claims clear", "--yes-i-really-mean-it")
+        assert "ChunkManager.clear_claim" in message and "firecube chunks" not in message
+        run_hint(printed, "firecube chunks claims clear", "--yes-i-really-mean-it")
         assert manager.list_claims(product=product) == []
 
 
@@ -741,11 +748,12 @@ def test_maintenance_refusal_resolves_a_shared_owner_once(temp_workspace):
                 repo=manager.repo, product=product, operation="scrub", detail="busy", claims=batch
             )
             ls_calls.append(fs.counts["ls"])
-            unnamed += [c.domain for c in batch if f"--domain {c.domain}" not in message]
+            unnamed += [c.domain for c in batch if f"--domain {c.domain}" not in render(message)]
         assert unnamed == []
         assert ls_calls[0] == ls_calls[1], f"owner resolved once per claim: {ls_calls}"
 
 
+@pytest.mark.contract
 def test_abandon_refuses_when_claims_cannot_be_listed(temp_workspace):
     class _Unlistable(CountingFilesystem):
         broken = True
@@ -761,8 +769,30 @@ def test_abandon_refuses_when_claims_cannot_be_listed(temp_workspace):
     with closing(manager), ExitStack() as stack:
         _record_started_run(manager, product=product, run_id="run-r")
         _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
-        with pytest.raises(ManifestError, match=r"(?s)run-r.*again"):
+        with pytest.raises(ManifestError, match=r"(?s)run-r.*again") as excinfo:
             manager.abandon_run(product=product, run_id="run-r", reason="killed writer")
+        assert excinfo.value.context.product_uri == manager.get_product_root(product)
+        assert excinfo.value.context.run_id == "run-r"
+        (abandon,) = excinfo.value.recovery
+        assert (abandon.name, abandon.arguments["run_id"]) == ("abandon_run", "run-r")
         assert [run.status for run in manager.list_runs(product=product)] == ["abandoned"]
         fs.broken = False
         assert [c.owner_id for c in manager.list_claims(product=product)] == ["run-r:grp:slot=0"]
+
+
+def test_repro_stale_snapshot_warning_names_only_options_snapshots_rebuild_has(
+    temp_workspace, monkeypatch, caplog
+):
+    with closing(_chunk_manager(temp_workspace)) as manager:
+        _record_completed_span_run(manager, product="p", run_id="run-1", group="g", batch_id="b")
+        manager.rebuild_snapshot("p")
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now + 2 * 86400)
+
+    with closing(_chunk_manager(temp_workspace)) as manager, caplog.at_level(logging.WARNING):
+        manager.list_chunks(product="p", chunk_type="span")
+
+    command = cli.commands["chunks"].commands["snapshots"].commands["rebuild"]  # type: ignore[attr-defined]
+    known = {opt for param in command.params for opt in param.opts} | {"--help"}
+    printed = set(re.findall(r"--[a-z][\w-]*", caplog.text))
+    assert "hours old" in caplog.text and printed <= known, (caplog.text, printed - known)

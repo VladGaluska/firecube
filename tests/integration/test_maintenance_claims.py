@@ -29,6 +29,7 @@ import xarray as xr
 import zarr
 from click.testing import CliRunner
 
+from firecube.cli._errors import render
 from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkInfo, ChunkManager
 from firecube.core.controlplane.claims import FilesystemClaimService
@@ -122,6 +123,19 @@ def _assert_owner_abandon_hint_runs(message: str, root: str) -> None:
     run_hint(message, "firecube chunks runs abandon", "--dry-run")
 
 
+def _assert_claim_facts(
+    error: ArchiveClaimError, root: Path, *, owner: str, recovery: list[str], run_id: str = ""
+):
+    context, domain = error.context, _claim_domain(error.product).identifier
+    assert (context.product_uri, context.claim_domain, context.claim_owner) == (
+        root.as_uri(), domain, owner,
+    )  # fmt: skip
+    assert [op.name for op in error.recovery] == recovery
+    assert {op.arguments["product_name"] for op in error.recovery} == {root.as_uri()}
+    assert error.recovery[0].arguments["domain_id"] == domain
+    assert all(op.arguments["run_id"] == run_id for op in error.recovery[1:])
+
+
 def test_execute_deletion_aborts_when_product_has_active_writer_claim(tmp_path: Path) -> None:
     product = "product.zarr"
     manager = _claiming_manager(tmp_path)
@@ -148,7 +162,8 @@ def test_execute_deletion_aborts_when_product_has_active_writer_claim(tmp_path: 
 
         claims = manager.list_claims(product=product)
         assert [info.domain for info in claims] == [_claim_domain(product).identifier]
-        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
+        assert "ChunkManager.clear_claim" in str(excinfo.value)
+        _assert_clear_hint_runs_without_abandon(render(excinfo.value))
     finally:
         claim.release()
         manager.close()
@@ -169,7 +184,8 @@ def test_execute_deletion_names_abandon_for_a_recorded_owner(tmp_path: Path) -> 
             manager.execute_deletion(
                 plan, delete_storage=True, delete_manifest=False, dry_run=False
             )
-        _assert_owner_abandon_hint_runs(str(excinfo.value), manager.get_product_root(product))
+        assert "ChunkManager.abandon_run" in str(excinfo.value)
+        _assert_owner_abandon_hint_runs(render(excinfo.value), manager.get_product_root(product))
     finally:
         claim.release()
         manager.close()
@@ -189,7 +205,7 @@ def test_delete_spans_aborts_when_product_has_active_writer_claim(tmp_path: Path
 
         claims = manager.list_claims(product=product)
         assert [info.domain for info in claims] == [_claim_domain(product).identifier]
-        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
+        _assert_clear_hint_runs_without_abandon(render(excinfo.value))
     finally:
         claim.release()
         manager.close()
@@ -221,7 +237,7 @@ def test_scrub_aborts_when_product_has_active_writer_claim(
     try:
         with pytest.raises(ManifestError) as excinfo:
             run_scrub(session, "F024")
-        _assert_clear_hint_runs_without_abandon(str(excinfo.value))
+        _assert_clear_hint_runs_without_abandon(render(excinfo.value))
     finally:
         claim.release()
         manager.close()
@@ -469,8 +485,36 @@ def test_create_archive_refuses_an_active_writer_claim_and_records_no_run(tmp_pa
         claim.release()
         manager.close()
     assert (refused.value.product, refused.value.operation) == ("s.zarr", "archive_create")
+    _assert_claim_facts(refused.value, tmp_path / "s.zarr", owner="w", recovery=["clear_claim"])
     assert not out.exists()
     assert [r.run_id for r in runs if r.run_id.startswith("archive-create-")] == []
+
+
+@pytest.mark.contract
+def test_restore_archive_refusal_carries_claim_facts_and_recovery(tmp_path):
+    manager = _claiming_manager(tmp_path, product="r.zarr")
+    manager.record_run_started(
+        product="r.zarr", run_id="running-ingest", output_path="", output_format="zarr",
+        size=0, meta={},
+    )  # fmt: skip
+    owner = "running-ingest:F024"
+    claim = manager.acquire_claim(product="r.zarr", domain=_claim_domain("r.zarr"), owner_id=owner)
+    try:
+        with pytest.raises(ArchiveClaimError) as refused:
+            restore_archive(
+                session=make_test_session(tmp_path, product="r.zarr"),
+                archive=(tmp_path / "a.zip").as_uri(),
+                archive_path=str(tmp_path / "a.zip"),
+                archive_format="zip",
+                target=(tmp_path / "r.zarr").as_uri(),
+            )
+    finally:
+        claim.release()
+        manager.close()
+    _assert_claim_facts(
+        refused.value, tmp_path / "r.zarr", owner=owner, run_id="running-ingest",
+        recovery=["clear_claim", "abandon_run"],
+    )  # fmt: skip
 
 
 @pytest.mark.contract

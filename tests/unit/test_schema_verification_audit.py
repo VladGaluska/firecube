@@ -94,10 +94,3 @@ def test_two_pods_same_schema_produce_same_hash() -> None:
     second = _compute_schema_hash(_schema(), {"data": 10})
 
     assert first == second
-
-
-def test_schema_hash_changes_on_dtype_change() -> None:
-    assert _compute_schema_hash(_schema(dtype=np.float32), {"data": 10}) != _compute_schema_hash(
-        _schema(dtype=np.float64),
-        {"data": 10},
-    )

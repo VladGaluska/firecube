@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from firecube.core.filesystem.ops import open_source_filesystem
-from firecube.core.formats._input_filters import split_input_filters
 from firecube.core.formats.hdf5 import looks_like_hdf5
+from firecube.core.formats.input_filters import split_input_filters
 from firecube.core.uris import is_remote_target, parse_uri
 
 # All file extensions recognised by the firecube ecosystem. See

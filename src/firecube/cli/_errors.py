@@ -20,11 +20,15 @@ from collections.abc import Callable
 
 import click
 
-from firecube.core.errors import FirecubeError
+from firecube.core.errors import ConfigFileError, FirecubeError
+from firecube.ingestor.errors import RemovedConfigKeyError
+
+# Config refusals that mean a wrong invocation: the CLI reports them as usage errors (exit 2).
+USAGE_ERRORS: tuple[type[FirecubeError], ...] = (ConfigFileError, RemovedConfigKeyError)
 
 # Explicit membership for user-facing exceptions that are NOT part of the
-# ``FirecubeError`` hierarchy (built-in OS errors, third-party library errors,
-# and ingestor-runtime ``RuntimeError`` subclasses). ``FirecubeError`` and its
+# ``FirecubeError`` hierarchy (built-in OS errors and third-party library
+# errors). ``FirecubeError`` and its
 # subclasses are covered by the ``isinstance`` branch in ``_is_known_user_error``
 # and must NOT be added here — reparent them under ``FirecubeError`` instead.
 _KNOWN_NON_FIRECUBE_USER_ERRORS: frozenset[str] = frozenset(
@@ -35,9 +39,24 @@ _KNOWN_NON_FIRECUBE_USER_ERRORS: frozenset[str] = frozenset(
         "NotADirectoryError",
         "PathNotFoundError",
         "PermissionError",
-        "PipelineFailedBatchesError",
     }
 )
+
+
+def render(value: BaseException | str, ctx: click.Context | None = None) -> str:
+    """Return the operator text of an exception, a library `Message` or a string.
+
+    The renderer module loads on the first call, so start-up loads nothing new.
+    `ctx` defaults to the current Click context.
+    """
+    from firecube.cli._recovery import render as render_recovery
+
+    return render_recovery(value, ctx)
+
+
+def echo_rendered(line: str, *, err: bool = False) -> None:
+    """Print one library line, rendered for the running command; pass `err=True` for stderr."""
+    click.echo(render(line), err=err)
 
 
 def _is_known_user_error(exc: BaseException) -> bool:
@@ -57,9 +76,10 @@ def wrap_user_facing_errors[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     Exceptions that are ``FirecubeError`` subclasses are wrapped via the
     ``isinstance`` branch in ``_is_known_user_error``. Non-Firecube user
     errors whose class name appears in ``_KNOWN_NON_FIRECUBE_USER_ERRORS``
-    are also wrapped. ``click.ClickException`` and ``click.exceptions.Exit``
-    pass through unchanged, and any other exception propagates so operators
-    see the real traceback.
+    are also wrapped. The wrapped text is ``render(exc)``. ``ConfigFileError`` and
+    ``RemovedConfigKeyError`` become ``click.UsageError`` (exit 2). ``click.ClickException``
+    and ``click.exceptions.Exit`` pass through unchanged, and any other exception
+    propagates so operators see the real traceback.
     """
 
     @functools.wraps(func)
@@ -71,8 +91,10 @@ def wrap_user_facing_errors[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except click.ClickException:
             raise
         except Exception as exc:
+            if isinstance(exc, USAGE_ERRORS):
+                raise click.UsageError(render(exc)) from exc
             if _is_known_user_error(exc) or _is_known_user_oserror(exc):
-                raise click.ClickException(str(exc)) from exc
+                raise click.ClickException(render(exc)) from exc
             raise
 
     return wrapper

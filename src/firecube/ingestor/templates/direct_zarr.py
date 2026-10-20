@@ -55,7 +55,14 @@ from firecube.core.api import (
     ResolvedIndex,
     compute_group_identity_hash,
 )
-from firecube.core.errors import ClaimConflictError, IndexedWriteCompilationError
+from firecube.core.errors import (
+    ClaimConflictError,
+    FirecubeError,
+    IndexedWriteCompilationError,
+    Message,
+    Operation,
+    Placeholder,
+)
 from firecube.core.indexed_write import IndexedWrite
 from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
 from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec
@@ -432,9 +439,24 @@ def _setup_global_zarr_schema(
                                     and arr.shape[0] < expected_time_count
                                 ):
                                     raise SchemaSizeMismatchError(
-                                        f"Schema drift for group {group_name}: existing array shape[0]={arr.shape[0]} "
-                                        f"< global_expected={expected_time_count}. Run `firecube zarr preallocate` "
-                                        "(from Python: `firecube.ingestor.runtime.preallocate.preallocate_product`) first."
+                                        Message(
+                                            "Schema drift for group {group}: existing array "
+                                            "shape[0]={existing} < global_expected={expected}. "
+                                            "Run `{preallocate}` first.",
+                                            group=group_name,
+                                            existing=arr.shape[0],
+                                            expected=expected_time_count,
+                                            preallocate=Operation(
+                                                "preallocate",
+                                                plugin=Placeholder("<plugin>"),
+                                                target=Placeholder("<uri>"),
+                                                product_name=Placeholder("<name>"),
+                                                write_mode=Placeholder("<mode>"),
+                                            ),
+                                            product=product,
+                                            run_id=run_id,
+                                            array_path=group_path,
+                                        )
                                     ) from exc
                                 raise
                     writer.set_group_attrs(
@@ -1792,7 +1814,11 @@ class DirectZarrIngestor(BaseIngestor):
         except Exception as exc:
             self._log.exception("Direct Zarr batch processing failed")
             return PipelineResult(
-                batch=batch, outputs=OutputPaths(primary=""), success=False, error=str(exc)
+                batch=batch,
+                outputs=OutputPaths(primary=""),
+                success=False,
+                error=str(exc),
+                failure=exc if isinstance(exc, FirecubeError) else None,
             )
 
         finally:

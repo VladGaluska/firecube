@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 
 from firecube.cli._ctx import get_storage_config
+from firecube.cli._errors import render
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
 from firecube.cli._product import require_full_uri, resolve_product_identity
 from firecube.cli._shared_options import (
@@ -42,6 +43,7 @@ from firecube.cli._uri_policy import (
 )
 from firecube.cli.zarr._common import _configure_ingestor_for_cli
 from firecube.core.controlplane import ChunkManager
+from firecube.core.errors import Message, Operation, Placeholder
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.ingestor.registry import loader as ingestor_loader
@@ -66,7 +68,7 @@ PLAN_RANGE_HINT = 100_000
 
 def _warn_stderr(message: str) -> None:
     """Write an operator warning to stderr without contaminating Click stdout capture."""
-    os.write(2, f"{message}\n".encode())
+    os.write(2, f"{render(message)}\n".encode())
 
 
 class _WarnFilter(logging.Filter):
@@ -319,11 +321,11 @@ def slots(
             warn=_warn_stderr,
         )
     except slot_plan.SlotPlanBlockedError as exc:
-        raise click.ClickException(_blocked_refusal(exc)) from exc
+        raise click.ClickException(render(_blocked_refusal(exc, target))) from exc
     except slot_plan.SlotPlanCeilingError as exc:
-        raise click.ClickException(_ceiling_refusal(exc)) from exc
+        raise click.ClickException(render(_ceiling_refusal(exc))) from exc
     except slot_plan.SlotPlanError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     range_count = sum(plan.range_count for plan in plans)
     if range_count > PLAN_RANGE_HINT:
@@ -356,19 +358,30 @@ def _group_summary(plan: GroupSlotPlan) -> dict[str, Any]:
     }
 
 
-def _blocked_refusal(exc: SlotPlanBlockedError) -> str:
-    """Build the refusal for a plan with blocked ranges, naming the recovery commands."""
+def _blocked_refusal(exc: SlotPlanBlockedError, target: str) -> Message:
+    """Build the refusal for a plan with blocked ranges, naming the recovery commands.
+
+    The `delete-span` preview carries `target` as its product name.
+    """
     details = "; ".join(
         f"group '{name}' has blocked ranges {[[s, e] for s, e in intervals]}"
         for name, intervals in exc.blocked.items()
     )
-    return (
+    return Message(
         "firecube zarr slots: cannot emit executable slots — chunk-alignment coverage would silently drop work. "
-        f"Blocked: {details}. "
+        "Blocked: {details}. "
         "Remediation: preview with "
-        "`firecube chunks delete-span --product-name <product-name> --run-id <id> --force --dry-run`, "
+        "`{preview}`, "
         "then commit with `--yes-i-really-mean-it` and re-ingest using `firecube ingest ... --option force_reingest=true`. "
-        "See docs/operations/parallel-zarr-writes.md#recover-a-blocked-plan."
+        "See docs/operations/parallel-zarr-writes.md#recover-a-blocked-plan.",
+        details=details,
+        preview=Operation(
+            "delete_span",
+            product_name=target,
+            run_id=Placeholder("<id>"),
+            dry_run=True,
+            force=True,
+        ),
     )
 
 

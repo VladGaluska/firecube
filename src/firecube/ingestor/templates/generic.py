@@ -29,6 +29,7 @@ from firecube.core.api import (
     is_remote_target,
     local_path_from_target,
 )
+from firecube.core.errors import FirecubeError, Message, Param
 from firecube.core.filesystem import fs_kwargs_for_uri
 from firecube.ingestor.api import (
     BaseIngestor,
@@ -445,6 +446,7 @@ class GenericZarrIngestor(BaseIngestor):
                 },
                 success=False,
                 error=str(exc),
+                failure=exc if isinstance(exc, FirecubeError) else None,
             )
 
         except Exception as exc:
@@ -454,6 +456,7 @@ class GenericZarrIngestor(BaseIngestor):
                 outputs=OutputPaths(primary=Path("")),
                 success=False,
                 error=str(exc),
+                failure=exc if isinstance(exc, FirecubeError) else None,
             )
 
         finally:
@@ -576,7 +579,12 @@ class GenericParquetIngestor(BaseIngestor):
                 )
             else:
                 raise ConfigurationError(
-                    "storage_config is required for remote parquet writes; pass --storage-type and --storage-driver"
+                    Message(
+                        "storage_config is required for remote parquet writes; "
+                        "pass {storage_type} and {storage_driver}",
+                        storage_type=Param("storage_type"),
+                        storage_driver=Param("storage_driver"),
+                    )
                 )
             with fs.open(fs_path, "wb") as f:  # pyright: ignore[reportArgumentType]
                 pq.write_table(table, f)
@@ -677,6 +685,7 @@ class GenericParquetIngestor(BaseIngestor):
                 outputs=OutputPaths(primary=Path("")),
                 success=False,
                 error=str(exc),
+                failure=exc if isinstance(exc, FirecubeError) else None,
             )
         finally:
             try:

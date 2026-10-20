@@ -79,24 +79,54 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   - Each call resolves the index again.
   - If the `index_spec` of a `DirectZarrIngestor` plugin returns `None`, the plugin has no binding.
   - Call the method. Do not override it.
+- `PipelineResult.failure` holds the `FirecubeError` that failed a batch. It is
+  `None` on success and for any other exception. If the error carries a
+  structured message, read its `context` and `recovery`. Otherwise read
+  `PipelineResult.error`.
 
 ### Changed
-- The refusal for a legacy index record now names the function that rebuilds
-  the index: `firecube.ingestor.runtime.index_record.rebuild_index_record`. The
-  `firecube zarr slots` warning about a legacy index record names it too. If
-  you work from Python, call that function instead of the command
-  `firecube zarr index rebuild`. The exception type stays the same.
-- A refusal that asks you to run `firecube zarr preallocate` now also names
-  the Python function that does the same:
-  `firecube.ingestor.runtime.preallocate.preallocate_product`. If you start
-  ingest from Python, call that function instead of the command. Four
-  refusals change:
+- The refusal for a legacy index record now names the library function that
+  rebuilds the index. A Python caller reads that name in the message. The CLI
+  prints the command `firecube zarr index rebuild` instead. The
+  `firecube zarr slots` warning about a legacy index record follows the same
+  rule. The exception type stays the same.
+- A refusal that asks you to run `firecube zarr preallocate` now names the
+  library function that does the same for a Python caller. The CLI prints the
+  command. Four refusals change:
   - An engine-owned array is not materialized.
   - An engine-owned slot holds no value.
   - A managed time coordinate slot holds no value.
   - A target array is shorter than the declared time axis.
 
   The exception types stay the same.
+- Refusals now carry their facts and their recovery steps as data.
+  - A refusal printed by the CLI names only the command. The "from Python"
+    note is gone.
+  - A refusal raised to a Python caller names parameters and library
+    functions. It names no flag and no command. Text that you match on
+    changes.
+  - `FirecubeError.recovery` lists the operations that the message suggests.
+    `FirecubeError.message` holds the message. `FirecubeError.context` holds
+    its facts.
+  - These three hold data only for an error that carries a structured
+    message. For an error built from plain text, `message` is `None`, and
+    `context` and `recovery` are empty. The text stays in `str(error)`. Keep
+    reading `str(error)` as the fallback.
+  - The CLI quotes values that hold spaces in the commands that it prints.
+    This holds for the `firecube zarr preallocate` and `firecube ingest` hints.
+  - A run error that Firecube records, and `PipelineResult.error`, keep the
+    Python wording.
+  - If `firecube zarr preallocate` cannot record the end of a run or cannot
+    release its claim, it also prints the recovery command on stderr. The log
+    line names the library function.
+- Two config errors now raise `ConfigurationError` subclasses:
+  `ConfigFileError` and `RemovedConfigKeyError`. Before, they raised
+  `click.UsageError`. If you catch
+  `click.UsageError` around library code, catch `ConfigurationError` instead.
+  The CLI still prints the same text and exits with code 2.
+- `PipelineFailedBatchesError` and `AppendBatchFailed` are now subclasses of
+  `FirecubeError`. A handler for `FirecubeError` now catches them. They are
+  still subclasses of `RuntimeError`.
 - `firecube zarr slots` refuses a plan of more than 1,000,000 ranges. The
   refusal names the range count, and the range count and slot size of each
   group. It also names the smallest `--slot-size` that gives an executable plan
@@ -216,9 +246,10 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   status of that run and the abandon command for that run (#86).
 - The claim that `firecube zarr preallocate` takes while it sets up the schema
   now carries the id of the preallocate run. Its conflict error names that run.
-  If the run cannot record its terminal state, the log prints the command that
-  abandons the run. If the run cannot release the claim, the log prints the
-  command that clears the claim (#86).
+  If the run cannot record its terminal state, the log names the library
+  function that abandons the run, and stderr shows the command. If the run
+  cannot release the claim, the log names the library function that clears the
+  claim, and stderr shows the command (#86).
 - Ingest no longer builds the conflict detail when it retries a claim that
   another writer holds. The intermediate retries of the schema setup skip the
   detail. Its final attempt still builds it, even if the setup then converges
@@ -226,6 +257,27 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Fixed
 
+- Refusals no longer print a recovery command that fails to run. Each command
+  now carries the options that it needs and names only options that the
+  command has.
+  - The refusal for a legacy index record names a working
+    `firecube zarr index rebuild` command. The `firecube zarr slots` warning
+    for a legacy index record does the same.
+  - The refusal of `firecube ingest` for a store shorter than the plugin
+    expects names a working `firecube zarr preallocate` command.
+  - The advice for an unsorted existing coordinate names a working
+    `firecube zarr validate` command.
+  - The force advice of `firecube chunks delete-span` names the options that
+    the command has.
+  - The slot group refusal of `firecube zarr preallocate` no longer names
+    `--slot-group`. That command has no such option.
+  - The advice of `firecube zarr index verify` names the `firecube zarr index
+    rebuild` command with the target, plugin and product name.
+  - The advice for a blocked range in `firecube zarr slots` names a working
+    `firecube chunks delete-span` command.
+- `firecube zarr index rebuild` now prints an error line and exits with code 1
+  for an index whose root attrs and record disagree. Before, it printed a
+  traceback.
 - `firecube zarr index verify` and `firecube zarr slots` now print a recovery
   that works. Before, they told you to run `firecube zarr index rebuild`, and
   that command refuses these states. Each state now has its own text.

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from firecube.core import observability
 from firecube.core.controlplane import ChunkManager, WriteDomain
+from firecube.core.errors import Message, Operation, Param, Placeholder
 from firecube.core.index_resolve import (
     ExtentUnknownError,
     resolve_index_spec,
@@ -53,6 +54,7 @@ from firecube.core.zarr.guard.engine_owned import (
     engine_owned_adoption_error,
     engine_owned_creation_attrs,
     engine_owned_names_by_group,
+    exception_text,
     is_engine_owned_reserved,
     is_engine_owned_spec,
     materialize_engine_owned_array,
@@ -73,6 +75,11 @@ if TYPE_CHECKING:
     from firecube.ingestor.types.context import PluginContext
 
 _log = logging.getLogger(__name__)
+
+# The slot-window parameters a refusal names.
+_SLOT_START = Param("slot_start")
+_SLOT_END = Param("slot_end")
+_SLOT_GROUP = Param("slot_group")
 
 
 class SlotWindowError(ConfigurationError):
@@ -197,7 +204,14 @@ def preallocate_product(
             resolved_index = ingestor.resolved_index(plugin_ctx)
         except Exception as exc:
             raise ConfigurationError(
-                f"Plugin '{plugin_name}' failed to resolve index_spec: {exc}"
+                Message(
+                    "Plugin '{plugin}' failed to resolve index_spec: {error}",
+                    plugin=plugin_name,
+                    error=exception_text(exc),
+                    product=identity.product_name,
+                    product_uri=plugin_target,
+                    run_id=run_id,
+                )
             ) from exc
 
         # Classify groups: bounded vs unbounded. No side effects here — the
@@ -285,7 +299,7 @@ def preallocate_product(
                 plugin_name=plugin_name,
             )
         except LegacyIndexRecordError as exc:
-            raise SchemaDriftError(str(exc)) from exc
+            raise SchemaDriftError(str(exc) if exc.message is None else exc.message) from exc
         _preallocate_can_record_failure = True
         schema = ingestor.zarr_schema(plugin_ctx)
         all_specs = [array for group in schema for array in group.arrays]
@@ -613,22 +627,28 @@ def preallocate_product(
                         slot_group=None,
                     )
                 except Exception as exc:
-                    # Function-scope import: keeps the hint module out of CLI start-up.
-                    from firecube.core.hints import abandon_run_command
-
                     # A silently non-terminal run blocks all further ingest of
                     # the product until an operator abandons it. Never swallow.
-                    logger.error(
-                        "failed to record terminal state for preallocate run %s: %s; "
+                    # The log names the library operation; `warn` gets the same
+                    # message, which the CLI prints with its command.
+                    product_uri = chunk_manager.get_product_root(identity.product_name)
+                    terminal_failure = Message(
+                        "failed to record terminal state for preallocate run {run_id}: {error}; "
                         "the run stays non-terminal and blocks resume until it is "
-                        "abandoned:\n  %s",
-                        run_id,
-                        exc,
-                        abandon_run_command(
-                            chunk_manager.get_product_root(identity.product_name),
-                            run_id,
+                        "abandoned:\n  {abandon}",
+                        run_id=run_id,
+                        error=exception_text(exc),
+                        abandon=Operation(
+                            "abandon_run",
+                            product_name=product_uri,
+                            run_id=run_id,
+                            reason=Placeholder('"<reason>"'),
                         ),
+                        product=identity.product_name,
+                        product_uri=product_uri,
                     )
+                    logger.error(terminal_failure)
+                    warn(terminal_failure)
                     if final_state == "complete":
                         # Defer the re-raise so the inner finally below
                         # can release the claim first.
@@ -642,21 +662,26 @@ def preallocate_product(
                 try:
                     _preallocate_claim_handle.release()
                 except Exception as exc:
-                    # Function-scope import: keeps the hint module out of CLI start-up.
-                    from firecube.core.hints import clear_claim_command
-
-                    logger.error(
-                        "failed to release materialization claim for run %s: %s; "
+                    product_uri = chunk_manager.get_product_root(identity.product_name)
+                    claim_domain = _preallocate_claim_handle.info.domain
+                    release_failure = Message(
+                        "failed to release materialization claim for run {run_id}: {error}; "
                         "a stale claim blocks future preallocates until it is "
-                        "cleared:\n  %s",
-                        run_id,
-                        exc,
-                        clear_claim_command(
-                            chunk_manager.get_product_root(identity.product_name),
-                            _preallocate_claim_handle.info.domain,
+                        "cleared:\n  {clear}",
+                        run_id=run_id,
+                        error=exception_text(exc),
+                        clear=Operation(
+                            "clear_claim",
+                            product_name=product_uri,
+                            domain_id=claim_domain,
                             force=True,  # the claim is fresh until its heartbeat times out
                         ),
+                        product=identity.product_name,
+                        product_uri=product_uri,
+                        claim_domain=claim_domain,
                     )
+                    logger.error(release_failure)
+                    warn(release_failure)
                     # Propagate only on the success path AND when no
                     # terminal-record failure is already queued: the
                     # terminal-record exception is the root cause and
@@ -832,8 +857,12 @@ def _discover_engine_owned_values(
             )
     if input_data is None:
         raise ConfigurationError(
-            f"engine-owned arrays {paths} take their values from inspect_item on every "
-            "source item; pass --input-data so preallocate can inspect them"
+            Message(
+                "engine-owned arrays {paths} take their values from inspect_item on every "
+                "source item; pass {input_data} so preallocate can inspect them",
+                paths=paths,
+                input_data=Param("input_data"),
+            )
         )
     dtypes = {
         group_spec.group: {
@@ -865,15 +894,24 @@ def _resolve_preallocate_windows(
         available = tuple(resolved_index.groups)
         if slot_group not in available:
             raise SlotWindowError(
-                f"--slot-group {slot_group!r} is not declared by the plugin's "
-                f"IndexSpec; available groups: {list(available)!r}"
+                Message(
+                    "{slot_group} {group!r} is not declared by the plugin's "
+                    "IndexSpec; available groups: {available!r}",
+                    slot_group=_SLOT_GROUP,
+                    group=slot_group,
+                    available=list(available),
+                )
             )
         axis = resolved_index.axis_for(slot_group)
         if not axis_has_resolvable_extent(axis, resolved_index, slot_group):
             raise SlotWindowError(
-                f"--slot-group {slot_group!r} has no resolvable extent "
-                "(unbounded axis); set end_date or slot_count on the plugin's "
-                "time axis to scope a preallocate window to this group"
+                Message(
+                    "{slot_group} {group!r} has no resolvable extent "
+                    "(unbounded axis); set end_date or slot_count on the plugin's "
+                    "time axis to scope a preallocate window to this group",
+                    slot_group=_SLOT_GROUP,
+                    group=slot_group,
+                )
             )
 
     windows: dict[str, tuple[int, int]] = {}
@@ -893,14 +931,45 @@ def _resolve_preallocate_windows(
         start = 0 if slot_start is None else slot_start
         end = group_size if slot_end is None else slot_end
         if start < 0:
-            raise SlotWindowError(f"--slot-start must be >= 0, got {start}")
+            raise SlotWindowError(
+                Message(
+                    "{slot_start} must be >= 0, got {start}",
+                    slot_start=_SLOT_START,
+                    start=start,
+                    group=group,
+                    slot_window=(start, end),
+                )
+            )
         if end < 0:
-            raise SlotWindowError(f"--slot-end must be >= 0, got {end}")
+            raise SlotWindowError(
+                Message(
+                    "{slot_end} must be >= 0, got {end}",
+                    slot_end=_SLOT_END,
+                    end=end,
+                    group=group,
+                    slot_window=(start, end),
+                )
+            )
         if start >= end:
-            raise SlotWindowError(f"--slot-start must be < --slot-end, got [{start}, {end})")
+            raise SlotWindowError(
+                Message(
+                    "{slot_start} must be < {slot_end}, got [{slot_window[0]}, {slot_window[1]})",
+                    slot_start=_SLOT_START,
+                    slot_end=_SLOT_END,
+                    slot_window=(start, end),
+                    group=group,
+                )
+            )
         if end > group_size:
             raise SlotWindowError(
-                f"--slot-end {end} exceeds resolved extent {group_size} for group {group!r}"
+                Message(
+                    "{slot_end} {end} exceeds resolved extent {extent} for group {group!r}",
+                    slot_end=_SLOT_END,
+                    end=end,
+                    extent=group_size,
+                    group=group,
+                    slot_window=(start, end),
+                )
             )
         windows[group] = (start, end)
     return windows

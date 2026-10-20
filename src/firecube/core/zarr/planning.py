@@ -24,7 +24,7 @@ import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Protocol, cast
 
-from firecube.core.errors import ConfigurationError
+from firecube.core.errors import ConfigurationError, Message, Param
 from firecube.core.index_spec import RegularTimeAxis, effective_regular_time_policy
 from firecube.core.zarr._coord_chunks import resolve_coord_chunks
 from firecube.core.zarr.guard._layout import (
@@ -138,7 +138,13 @@ def resolve_per_group_slot_sizes(
     """
     if explicit is not None:
         if explicit <= 0:
-            raise ConfigurationError(f"--slot-size must be > 0, got {explicit}")
+            raise ConfigurationError(
+                Message(
+                    "{slot_size} must be > 0, got {explicit}",
+                    slot_size=Param("slot_size"),
+                    explicit=explicit,
+                )
+            )
         explicit = int(explicit)
 
     per_group: dict[str, int] = {}
@@ -168,10 +174,21 @@ def resolve_per_group_slot_sizes(
     if explicit is not None:
         invalid = {g: req for g, req in per_group.items() if explicit % req != 0}
         if invalid:
-            details = "; ".join(
-                f"group '{g}' needs multiple of {req}" for g, req in sorted(invalid.items())
+            details = Message.join(
+                "; ",
+                (
+                    Message("group '{group}' needs multiple of {required}", group=g, required=req)
+                    for g, req in sorted(invalid.items())
+                ),
             )
-            raise ConfigurationError(f"--slot-size={explicit} not valid: {details}")
+            raise ConfigurationError(
+                Message(
+                    "{slot_size}={explicit} not valid: {details}",
+                    slot_size=Param("slot_size"),
+                    explicit=explicit,
+                    details=details,
+                )
+            )
         return dict.fromkeys(per_group, explicit)
     return per_group
 

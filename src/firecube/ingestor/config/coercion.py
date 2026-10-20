@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from typing import Any, get_args, get_origin
 
+from firecube.core.errors import Message, PluginOption
 from firecube.ingestor.errors import ConfigurationError
 
 
@@ -134,9 +135,14 @@ def coerce_cli_value(value: Any, target_type: Any, field_name: str) -> Any:
                 if "[" not in value and "," not in value and args and args[0] is str:
                     return [value]
                 raise ConfigurationError(
-                    f"Invalid JSON list for {field_name!r}: {value!r}. "
-                    "Check shell quoting for the value. "
-                    f"Try: --option '{field_name}={_json_list_hint(value)}'"
+                    Message(
+                        "Invalid JSON list for {field_name!r}: {value!r}. "
+                        "Check shell quoting for the value. "
+                        "Try: {suggestion}",
+                        field_name=field_name,
+                        value=value,
+                        suggestion=PluginOption(field_name, _json_list_hint(value)),
+                    )
                 ) from exc
             if not isinstance(parsed, list):
                 raise ValueError(

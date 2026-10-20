@@ -26,7 +26,8 @@ import warnings
 from dataclasses import dataclass, fields
 from typing import Any, TypeVar, get_type_hints
 
-from firecube.core.formats._input_filters import (
+from firecube.core.errors import Message, Param
+from firecube.core.formats.input_filters import (
     reject_legacy_input_patterns,
     validate_input_filters,
 )
@@ -202,7 +203,13 @@ class EngineConfig:
             return
 
         if self.slot_start is None or self.slot_end is None:
-            raise ValueError("--slot-start and --slot-end must be provided together")
+            raise ValueError(
+                Message(
+                    "{slot_start} and {slot_end} must be provided together",
+                    slot_start=Param("slot_start"),
+                    slot_end=Param("slot_end"),
+                )
+            )
 
         if self.slot_start < 0:
             raise ValueError(f"slot_start must be non-negative, got {self.slot_start}")

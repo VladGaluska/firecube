@@ -44,7 +44,7 @@ from zarr.abc.store import Store
 from zarr.errors import GroupNotFoundError, NodeNotFoundError
 from zarr.storage import FsspecStore, LocalStore
 
-from firecube.core.errors import SchemaDriftError
+from firecube.core.errors import Message, Placeholder, SchemaDriftError
 from firecube.core.uris import is_remote_target, local_path_from_target
 from firecube.core.zarr._coord_lifecycle import (
     CoordLifecycleState,
@@ -54,6 +54,7 @@ from firecube.core.zarr._coord_lifecycle import (
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
 from firecube.core.zarr.guard._unit_locks import _store_identity
 from firecube.core.zarr.guard.chunk_geometry import Bounds
+from firecube.core.zarr.guard.engine_owned import preallocate_operation
 from firecube.core.zarr.guard.guarded_write import (
     ArrayHold,
     WriteFootprint,
@@ -1359,13 +1360,17 @@ class RegionZarrWriter:
             incoming_norm = self._normalize_for_coord_compare(timestamp_val, target_dtype)
             if np.isnat(current_norm):
                 raise SchemaDriftError(
-                    f"coord array {timestamp_path} slot {ts_index} is NaT under "
-                    "firecube_coord_managed marker; the materialization step "
-                    "must run first. Invoke: firecube zarr preallocate "
-                    "<plugin> --target <uri> --product-name <name> "
-                    "--write-mode <mode> --input-data <path> "
-                    "--slot-start=<n> --slot-end=<m> (from Python: "
-                    "firecube.ingestor.runtime.preallocate.preallocate_product)"
+                    Message(
+                        "coord array {array_path} slot {ts_index} is NaT under "
+                        "firecube_coord_managed marker; the materialization step "
+                        "must run first. Invoke: {preallocate}",
+                        array_path=timestamp_path,
+                        group=group,
+                        ts_index=ts_index,
+                        preallocate=preallocate_operation(
+                            slot_start=Placeholder("<n>"), slot_end=Placeholder("<m>")
+                        ),
+                    )
                 )
             if current_norm == incoming_norm:
                 return

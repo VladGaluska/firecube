@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from firecube.core.controlplane.repo import describe_control_plane
+from firecube.core.errors import FirecubeError, Message, Param, PluginOption
 from firecube.core.observability import attach_context, capture_context, detach_context
 from firecube.ingestor.config.engine import EngineConfig
 from firecube.ingestor.contracts.interfaces import (
@@ -75,26 +76,68 @@ if TYPE_CHECKING:
     from firecube.ingestor.runtime.base import BaseIngestor
 
 
-class PipelineFailedBatchesError(RuntimeError):
-    """Raised when finalization observes failed batch results."""
+class PipelineFailedBatchesError(FirecubeError, RuntimeError):
+    """Raised when finalization observes failed batch results.
+
+    The message joins the first three failures' messages, so their facts and
+    recovery operations stay readable through `FirecubeError.recovery` and `context`.
+
+    Args:
+        run_id: The run whose batches failed.
+        failed: The failed batch results, in completion order.
+        not_attempted: How many batches the run halted before attempting.
+
+    Attributes:
+        run_id: The run whose batches failed.
+        failed: The failed batch results, in completion order.
+        not_attempted: How many batches the run halted before attempting.
+    """
+
+    def __init__(
+        self, *, run_id: str, failed: Sequence[PipelineResult], not_attempted: int
+    ) -> None:
+        self.run_id = run_id
+        self.failed = tuple(failed)
+        self.not_attempted = not_attempted
+        super().__init__(
+            _failed_batches_message(run_id=run_id, failed=self.failed, not_attempted=not_attempted)
+        )
 
 
 def _failed_batches_message(
-    *, run_id: str, failed: list[PipelineResult], not_attempted: int
-) -> str:
-    """Compose a failure message without promising that retry bypasses validation."""
-    err_summary = "; ".join((res.error or "unknown").rstrip(". ") for res in failed[:3])
-    message = f"Pipeline run {run_id!r} had {len(failed)} failed batch(es): {err_summary}. "
-    if not_attempted:
-        message += (
-            f"{not_attempted} later batch(es) were not attempted: this host stops at the "
-            "first failed batch so no batch appends past a gap. "
-        )
-    return message + (
+    *, run_id: str, failed: Sequence[PipelineResult], not_attempted: int
+) -> Message:
+    """Compose a failure message without promising that retry bypasses validation.
+
+    Each of the first three failures contributes its `FirecubeError` message, or its
+    `error` text when the batch failed on any other exception.
+    """
+    summaries: list[str] = []
+    for res in failed[:3]:
+        message = res.failure.message if res.failure is not None else None
+        text = message or res.error or "unknown"
+        if isinstance(text, Message):
+            summaries.append(text.without_trailing_stop())
+        else:
+            summaries.append(text.rstrip(". "))
+    halted = (
+        f"{not_attempted} later batch(es) were not attempted: this host stops at the "
+        "first failed batch so no batch appends past a gap. "
+        if not_attempted
+        else ""
+    )
+    return Message(
+        "Pipeline run {run_id!r} had {count} failed batch(es): {summary}. {halted}"
         "Run recorded as status=failed. Recovery: resolve the batch error above before retrying. "
-        "For compatible Zarr inputs, --option resume_existing=true skips present timestamps "
-        "and refills failed slots; --option force_reingest=true overwrites existing timestamps. "
-        "Neither option can insert absent timestamps before the stored maximum or bypass schema validation."
+        "For compatible Zarr inputs, {resume} skips present timestamps "
+        "and refills failed slots; {force} overwrites existing timestamps. "
+        "Neither option can insert absent timestamps before the stored maximum or bypass schema validation.",
+        run_id=run_id,
+        count=len(failed),
+        summary=Message.join("; ", summaries),
+        halted=halted,
+        resume=PluginOption("resume_existing", "true"),
+        force=PluginOption("force_reingest", "true"),
     )
 
 
@@ -221,6 +264,7 @@ def _process_batch_timed(
             outputs=OutputPaths(primary=Path("")),
             success=False,
             error=str(exc),
+            failure=exc if isinstance(exc, FirecubeError) else None,
         )
 
     duration_s = max(time.perf_counter() - start_wall, 0.0)
@@ -463,6 +507,7 @@ class PipelineRunner:
                             outputs=OutputPaths(primary=Path("")),
                             success=False,
                             error=str(exc),
+                            failure=exc if isinstance(exc, FirecubeError) else None,
                         )
 
                     halt = self._handle_completed_batch(
@@ -620,7 +665,12 @@ def _create_batches_with_parallel_filter(
         binding = getattr(host, "_index_binding", None)
         if binding is None:
             raise ConfigurationError(
-                "--slot-start/--slot-end require index_spec(); the plugin returned None"
+                Message(
+                    "{slot_start}/{slot_end} require index_spec(); the plugin returned None",
+                    slot_start=Param("slot_start"),
+                    slot_end=Param("slot_end"),
+                    plugin=host.name,
+                )
             )
 
         # The coord-chunk overlap guard is intentionally absent here.
@@ -856,11 +906,9 @@ class PipelineExecutor:
             failed = [res for res in state.results if res.attempted and not res.success]
             if failed:
                 raise PipelineFailedBatchesError(
-                    _failed_batches_message(
-                        run_id=ctx.run_id or "unknown",
-                        failed=failed,
-                        not_attempted=len(state.batches_not_attempted),
-                    )
+                    run_id=ctx.run_id or "unknown",
+                    failed=failed,
+                    not_attempted=len(state.batches_not_attempted),
                 )
 
             # Prefer remote path from results if any

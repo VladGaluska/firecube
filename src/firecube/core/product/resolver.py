@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from firecube.core.errors import Message, Param
 from firecube.core.product.identity import ProductIdentity, ensure_product_uri
 from firecube.core.storage.uri import StorageUri
 from firecube.core.uris import (
@@ -81,9 +82,14 @@ class ProductResolver:
             msg = str(e).lower()
             if "scheme" in msg or "file://" in msg or "bare paths" in msg:
                 raise ValueError(
-                    "--target must be a full URI like 's3://bucket/path/x.zarr' or "
-                    "'file:///abs/path/x.zarr'. Bare names and relative paths are rejected. "
-                    f"Original error: {e}"
+                    Message(
+                        "{target} must be a full URI like 's3://bucket/path/x.zarr' or "
+                        "'file:///abs/path/x.zarr'. Bare names and relative paths are rejected. "
+                        "Original error: {error}",
+                        target=Param("target"),
+                        error=str(e),
+                        product=product_name,
+                    )
                 ) from e
             raise
         return ProductIdentity.from_uri(uri, format=format, product_name=product_name)

@@ -194,9 +194,9 @@ def test_invalid_sdk_filters_fail(value):
     "options", [{"include_patterns": []}, {"include_patterns": [], "input_filters": []}]
 )
 def test_legacy_sdk_options_fail_with_migration(options):
-    with pytest.raises(ValueError, match="include_patterns has been removed; use --input-filters"):
+    with pytest.raises(ValueError, match="include_patterns has been removed; use input_filters="):
         EngineConfig.from_options(options)
-    with pytest.raises(ValueError, match="include_patterns has been removed; use --input-filters"):
+    with pytest.raises(ValueError, match="include_patterns has been removed; use input_filters="):
         TierConfigurator(None, None, plugin_name="test").configure(
             IngestContext(source=".", options=options)
         )

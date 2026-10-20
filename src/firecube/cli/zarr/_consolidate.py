@@ -19,7 +19,7 @@ from __future__ import annotations
 import click
 
 from firecube.cli._ctx import get_storage_config
-from firecube.cli._errors import wrap_user_facing_errors
+from firecube.cli._errors import echo_rendered, render, wrap_user_facing_errors
 from firecube.cli._product import require_full_uri
 from firecube.cli._uri_policy import (
     apply_smart_default,
@@ -161,10 +161,10 @@ def consolidate_time_coord(
             chunk_size=chunk_size,
             time_dim=time_dim,
             dry_run=dry_run,
-            report=click.echo,
+            report=echo_rendered,
         )
     except ProductIdentityError as exc:
-        raise click.UsageError(str(exc)) from exc
+        raise click.UsageError(render(exc)) from exc
 
     if dry_run:
         click.echo("Summary:")

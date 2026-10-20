@@ -42,6 +42,7 @@ from firecube.core.controlplane.types import (
     canonical_index_bytes,
 )
 from firecube.ingestor.runtime.index_record import verify_index_record
+from tests.helpers.cli_hints import parse_hint
 from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.integration
@@ -358,12 +359,13 @@ def test_verify_attrs_without_record_advice_recovers_both_ways(tmp_path: Path) -
     verify = _verify_args(cube, "index_spec_single")
     refused = CliRunner().invoke(cli, verify)
     assert refused.exit_code == 1
+    rebuild = f"firecube zarr index rebuild --target file://{cube} --plugin <plugin> --product-name"
     assert (
         "attrs drift \u2014 root attr has resolved-index identity hash but no on-disk record; "
-        "`firecube zarr index rebuild` refuses this state. Restore "
+        f"`{rebuild} index_spec_single` refuses this state. Restore "
         "`.firecube/index/current.json`, or remove the root attrs "
         "`firecube_resolved_index_identity_hash` and `firecube_resolved_index` and run "
-        "`firecube zarr index rebuild` with the plugin that wrote the data."
+        f"`{rebuild} index_spec_single` with the plugin that wrote the data."
     ) in refused.stderr
     current.write_bytes(saved)
     restored = CliRunner().invoke(cli, verify)
@@ -382,14 +384,27 @@ def test_verify_attrs_drift_advice_recovers_by_removing_hash_attr(tmp_path: Path
     _set_resolved_index_attr(cube, "f" * 64)
     refused = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
     assert refused.exit_code == 1
+    rebuild = f"firecube zarr index rebuild --target file://{cube} --plugin <plugin> --product-name"
     assert (
         "attrs drift \u2014 root attr diverges from on-disk record; "
-        "`firecube zarr index rebuild` refuses this state. Remove the root attr "
-        "`firecube_resolved_index_identity_hash`, then run `firecube zarr index rebuild`: "
-        "it writes the attr again from the record."
+        f"`{rebuild} index_spec_single` refuses this state. Remove the root attr "
+        "`firecube_resolved_index_identity_hash`, then run "
+        f"`{rebuild} index_spec_single`: it writes the attr again from the record."
     ) in refused.stderr
     _delete_resolved_index_attr(cube)
     _rebuild_cube(cube, "index_spec_single", "index_spec_single")
     assert zarr.open(str(cube)).attrs[RESOLVED_INDEX_IDENTITY_HASH_ATTR] == record.identity_hash
     verified = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
     assert verified.exit_code == 0 and "VERIFIED" in verified.stdout
+
+
+@pytest.mark.parametrize("state", ["without-record", "drift"])
+def test_repro_verify_attrs_advice_prints_runnable_rebuild_command(tmp_path: Path, state: str):
+    cube = tmp_path / "cube"
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    if state == "drift":
+        _set_resolved_index_attr(cube, "f" * 64)
+    else:
+        (cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME).unlink()
+    refused = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
+    assert parse_hint(refused.stderr, "firecube zarr index rebuild")

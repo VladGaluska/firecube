@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 from firecube.core.filesystem import create_filesystem
 from firecube.core.product.identity import ProductIdentity
@@ -278,22 +278,6 @@ def _raise_mismatch(target_uri: str, group_path: str, existing: str, declared_di
         f"but plugin declared '{declared_dim}'.\n"
         "Refusing to append. Rebuild the cube with the declared time dimension "
         "or migrate the existing cube before appending."
-    )
-
-
-def _raise_unknown_time_dim(
-    target_uri: str,
-    group_path: str,
-    array_name: str,
-    dim_names: Sequence[str],
-    declared_dim: str,
-) -> NoReturn:
-    raise ConfigurationError(
-        f"Existing cube at {target_uri} group '{group_path}' array '{array_name}' "
-        f"has dimensions {list(dim_names)!r}, but none match declared time dimension "
-        f"'{declared_dim}' or known legacy time dimensions "
-        f"('{_LEGACY_TIME_DIM}', '{_CF_TIME_DIM}'). Refusing to append because "
-        "Firecube cannot determine time dimension safely."
     )
 
 

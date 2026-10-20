@@ -44,7 +44,13 @@ from typing import Any
 
 import numpy as np
 
-from firecube.core.errors import ConfigurationError, SchemaDriftError
+from firecube.core.errors import (
+    ConfigurationError,
+    Message,
+    Operation,
+    Placeholder,
+    SchemaDriftError,
+)
 from firecube.core.zarr._sealing_markers import (
     ATTR_ENGINE_OWNED,
     ATTR_ENGINE_OWNED_COMPLETE,
@@ -52,14 +58,31 @@ from firecube.core.zarr._sealing_markers import (
 )
 from firecube.core.zarr.guard.metadata_authority import MetadataAuthority, set_attributes
 
-PREALLOCATE_COMMAND = (
-    "firecube zarr preallocate <plugin> --target <uri> --product-name <name> "
-    "--write-mode <mode> --input-data <path>"
-)
-"""Recovery command named by every refusal about unmaterialized values."""
 
-PREALLOCATE_FUNCTION = "firecube.ingestor.runtime.preallocate.preallocate_product"
-"""Python entry point named beside the recovery command (a string: core imports no ingestor)."""
+def exception_text(exc: BaseException) -> str:
+    """Return the exception's `Message` when it was raised with one, else `str(exc)`.
+
+    Use it to nest a caught refusal in a wrapper's message without losing its parts.
+    """
+    first = exc.args[0] if exc.args else None
+    return first if isinstance(first, Message) else str(exc)
+
+
+def preallocate_operation(**extra: object) -> Operation:
+    """Return the preallocate recovery operation every unmaterialized-value refusal names.
+
+    The CLI prints the command with placeholders for its required arguments; a library caller
+    reads the function path. Keyword arguments add or replace arguments, such as a slot window.
+    """
+    arguments: dict[str, object] = {
+        "plugin": Placeholder("<plugin>"),
+        "target": Placeholder("<uri>"),
+        "product_name": Placeholder("<name>"),
+        "write_mode": Placeholder("<mode>"),
+        "input_data": Placeholder("<path>"),
+    }
+    arguments.update(extra)
+    return Operation("preallocate", **arguments)
 
 
 def is_engine_owned_spec(arr_spec: Any) -> bool:
@@ -283,7 +306,11 @@ def collect_engine_owned_values(
             info = ingestor.inspect_item(item, plugin_ctx)
         except Exception as exc:
             raise ConfigurationError(
-                f"inspect_item raised an error for item {item!r}: {exc}"
+                Message(
+                    "inspect_item raised an error for item {item!r}: {cause}",
+                    item=item,
+                    cause=exception_text(exc),
+                )
             ) from exc
         if info is None:
             continue
@@ -300,8 +327,14 @@ def collect_engine_owned_values(
                 slot = int(resolved_index.position(group, coordinate))
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise ConfigurationError(
-                    f"inspect_item returned coordinate {coordinate!r} for item {item!r} "
-                    f"that could not be mapped to a slot of group {group!r}: {exc}"
+                    Message(
+                        "inspect_item returned coordinate {coordinate!r} for item {item!r} "
+                        "that could not be mapped to a slot of group {group!r}: {cause}",
+                        coordinate=coordinate,
+                        item=item,
+                        group=group,
+                        cause=exception_text(exc),
+                    )
                 ) from exc
             if not 0 <= slot < extents[group]:
                 continue
@@ -507,9 +540,14 @@ def require_engine_owned_materialized(root: Any | None, array_paths: Sequence[st
             missing.append(path)
     if missing:
         raise ConfigurationError(
-            f"engine-owned arrays {missing} are not materialized in the target (absent, or "
-            f"a preallocate did not finish); pods only verify them. Write them first "
-            f"with: {PREALLOCATE_COMMAND} (from Python: {PREALLOCATE_FUNCTION})"
+            Message(
+                "engine-owned arrays {missing} are not materialized in the target (absent, or "
+                "a preallocate did not finish); pods only verify them. Write them first "
+                "with: {preallocate}",
+                missing=missing,
+                array_path=tuple(missing),
+                preallocate=preallocate_operation(),
+            )
         )
 
 
@@ -557,9 +595,14 @@ def require_engine_owned_ownership(root: Any | None, declared: Sequence[tuple[st
 
 def _slot_holds_no_value(array_path: str, slot: int) -> SchemaDriftError:
     return SchemaDriftError(
-        f"engine-owned array {array_path!r} slot {slot} holds no value: "
-        f"preallocate saw no source item for it. Re-run {PREALLOCATE_COMMAND} "
-        f"(from Python: {PREALLOCATE_FUNCTION}) with inputs that include this slot."
+        Message(
+            "engine-owned array {array_path!r} slot {slot} holds no value: "
+            "preallocate saw no source item for it. Re-run {preallocate} "
+            "with inputs that include this slot.",
+            array_path=array_path,
+            slot=slot,
+            preallocate=preallocate_operation(),
+        )
     )
 
 

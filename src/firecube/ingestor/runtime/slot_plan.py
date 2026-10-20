@@ -33,6 +33,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from firecube.core.controlplane import ChunkManager
+from firecube.core.errors import (
+    CommandName,
+    FirecubeError,
+    Message,
+    Operation,
+    Param,
+    Placeholder,
+)
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.ingestor.errors import ConfigurationError
@@ -138,6 +146,17 @@ class GroupSlotPlan:
         return iter_partitions(self.aligned, self.slot_size)
 
 
+_SLOTS_COMMAND = CommandName(("zarr", "slots"), library="plan_slots")
+"""Label the planner in a message: `firecube zarr slots` in the CLI, `plan_slots` in Python."""
+
+
+def _cause_text(exc: BaseException) -> str:
+    """Return the refusal `Message` of `exc` when it has one, else `str(exc)`, so parts survive."""
+    if isinstance(exc, FirecubeError) and exc.message is not None:
+        return exc.message
+    return str(exc)
+
+
 def _ignore_line(line: str) -> None:
     """Discard a warning line."""
 
@@ -221,8 +240,15 @@ def plan_slots(
             and type(ingestor).discover_source_files is BaseIngestor.discover_source_files
         ):
             raise SlotPlanError(
-                f"Plugin '{plugin_name}' requires --input-data for AUTO discovery. "
-                "Pass --input-data <source> or override discover_source_files() in the plugin."
+                Message(
+                    "Plugin '{plugin}' requires {input_data} for AUTO discovery. "
+                    "Pass {input_data_source} or override discover_source_files() in the plugin.",
+                    plugin=plugin_name,
+                    input_data=Param("input_data"),
+                    input_data_source=Param("input_data", Placeholder("<source>")),
+                    product=identity.product_name,
+                    product_uri=target,
+                )
             )
         ingestor.bind_index_at_startup(plugin_ctx)
         resolved_index = ingestor.resolved_index(plugin_ctx)
@@ -244,10 +270,19 @@ def plan_slots(
         and chunk_manager.get_slot_index_model(product=identity.product_name) is not None
     ):
         warn(
-            "Legacy slot-index record detected without a resolved-index record; "
-            "run `firecube zarr index rebuild` "
-            "(from Python: `firecube.ingestor.runtime.index_record.rebuild_index_record`) "
-            "to migrate."
+            Message(
+                "Legacy slot-index record detected without a resolved-index record; "
+                "run `{rebuild}` to migrate.",
+                rebuild=Operation(
+                    "rebuild_index",
+                    target=target,
+                    plugin=plugin_name,
+                    product_name=identity.product_name,
+                ),
+                product=identity.product_name,
+                product_uri=target,
+                plugin=plugin_name,
+            )
         )
     global_schema = {group: resolved_index.size(group) for group in resolved_index.groups}
     for group_name, expected in global_schema.items():
@@ -261,7 +296,7 @@ def plan_slots(
     try:
         validate_global_expected_subset_of_schema(global_schema, schema)
     except ConfigurationError as exc:
-        raise SlotPlanError(str(exc)) from exc
+        raise SlotPlanError(_cause_text(exc)) from exc
 
     if alignment_warnings:
         warn_on_chunk_alignment(global_schema, schema)
@@ -280,7 +315,7 @@ def plan_slots(
             schema, slot_size, stored_units=stored_units
         )
     except ConfigurationError as exc:
-        raise SlotPlanError(str(exc)) from exc
+        raise SlotPlanError(_cause_text(exc)) from exc
 
     if not resume:
         coverage_by_group: dict[str, list[tuple[int, int]]] = {g: [] for g in global_schema}
@@ -293,9 +328,17 @@ def plan_slots(
             )
         except Exception as exc:
             raise SlotPlanError(
-                f"firecube zarr slots: resume-aware coverage lookup failed ({exc}). "
-                f"Either fix the underlying failure or pass --no-resume to emit "
-                f"full ranges without coverage narrowing."
+                Message(
+                    "{command}: resume-aware coverage lookup failed ({cause}). "
+                    "Either fix the underlying failure or pass {no_resume} to emit "
+                    "full ranges without coverage narrowing.",
+                    command=_SLOTS_COMMAND,
+                    cause=_cause_text(exc),
+                    no_resume=Param("no_resume", True),
+                    plugin=plugin_name,
+                    product=identity.product_name,
+                    product_uri=target,
+                )
             ) from exc
 
     plans: list[GroupSlotPlan] = []
@@ -329,7 +372,7 @@ def plan_slots(
         try:
             units = resolve_per_group_slot_sizes(schema, None, stored_units=stored_units)
         except ConfigurationError as exc:
-            raise SlotPlanError(str(exc)) from exc
+            raise SlotPlanError(_cause_text(exc)) from exc
         suggested = smallest_executable_slot_size(
             {plan.name: plan.remaining for plan in plans},
             {plan.name: plan.total for plan in plans},
@@ -381,7 +424,6 @@ def _stored_time_units(
     from firecube.core.zarr.guard.engine_owned import is_pod_written_slot_array
     from firecube.core.zarr.guard.unit_ownership import stored_write_unit
 
-    unreadable = f"firecube zarr slots: cannot read the layout of existing arrays in {target}"
     units: dict[str, list[int]] = {}
     try:
         # Existence goes through the storage driver before any zarr store is built:
@@ -409,7 +451,16 @@ def _stored_time_units(
                     continue
                 units.setdefault(group_spec.group, []).append(int(stored_write_unit(arr)[0][0]))
     except Exception as exc:
-        raise SlotPlanError(f"{unreadable} ({type(exc).__name__}: {exc}).") from exc
+        raise SlotPlanError(
+            Message(
+                "{command}: cannot read the layout of existing arrays in {product_uri} "
+                "({exc_type}: {cause}).",
+                command=_SLOTS_COMMAND,
+                product_uri=target,
+                exc_type=type(exc).__name__,
+                cause=_cause_text(exc),
+            )
+        ) from exc
     return units
 
 

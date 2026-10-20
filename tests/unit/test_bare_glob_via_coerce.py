@@ -15,15 +15,19 @@
 from __future__ import annotations
 
 import re
+import shlex
 
+import click
 import pytest
+from click.testing import CliRunner
 
+from firecube.cli._errors import wrap_user_facing_errors
 from firecube.ingestor.config.coercion import coerce_cli_value
 from firecube.ingestor.errors import ConfigurationError
 
 pytestmark = pytest.mark.unit
 
-_HINT_PATTERN = re.compile(r"Try: --option 'example_list=(?P<value>.*)'$")
+_HINT_PATTERN = re.compile(r"Try: example_list=(?P<value>.*)$")
 
 
 def _hinted_value(message: str) -> str:
@@ -67,3 +71,15 @@ def test_valid_json_list_unchanged() -> None:
     """Verified-correct: JSON list still accepted."""
     result = coerce_cli_value('["*.csv"]', list[str] | None, "example_list")
     assert result == ["*.csv"]
+
+
+def test_repro_option_hint_with_single_quote_parses_back_to_the_value() -> None:
+    @click.command()
+    @wrap_user_facing_errors
+    def coerce() -> None:
+        coerce_cli_value("[it's.csv]", list[str] | None, "example_list")
+
+    output = CliRunner().invoke(coerce).output
+    tokens = shlex.split(output[output.index("--option") :])
+    assert tokens[0] == "--option"
+    assert coerce_cli_value(tokens[1].partition("=")[2], list[str] | None, "x") == ["it's.csv"]

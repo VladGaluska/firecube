@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from firecube.core.errors import Message, Param
 from firecube.core.storage.driver_config import (
     StorageDriverConfig,
 )
@@ -115,6 +116,10 @@ class ProductTarget:
     ) -> None:
         if driver_config.driver == "obstore" and protocol not in _OBSTORE_SUPPORTED_PROTOCOLS:
             raise ValueError(
-                f"Storage driver 'obstore' does not support protocol '{protocol}'; "
-                "use --storage-driver=fsspec instead."
+                Message(
+                    "Storage driver 'obstore' does not support protocol '{protocol}'; "
+                    "use {storage_driver}=fsspec instead.",
+                    protocol=protocol,
+                    storage_driver=Param("storage_driver"),
+                )
             )

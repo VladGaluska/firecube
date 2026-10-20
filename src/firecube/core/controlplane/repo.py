@@ -178,12 +178,6 @@ class ManifestRepository:
     def base_uri(self) -> str:
         return self._base_uri.to_str()
 
-    def record_entry(self, product: str, entry: dict[str, Any]) -> None:
-        raise ManifestError(
-            "ChunkManager v2 no longer accepts arbitrary chunk-entry writes. Use record_run_started(), "
-            "record_span(), and record_run_terminal() instead."
-        )
-
     @contextmanager
     def run_entries_cache_scope(self) -> Generator[None, None, None]:
         prev = self._run_entries_cache

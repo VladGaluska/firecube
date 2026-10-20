@@ -20,8 +20,12 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+import click
+
+from firecube.cli._errors import render
 from firecube.cli._typed_options import coerce_options_for_plugin
 from firecube.ingestor.api import PluginContext
+from firecube.ingestor.errors import RemovedConfigKeyError
 from firecube.ingestor.runtime.configure import configure_ingestor
 
 logger = logging.getLogger("firecube.cli.zarr")
@@ -44,12 +48,15 @@ def _configure_ingestor_for_cli(
     `configure_ingestor`.
     """
     coerced_options = coerce_options_for_plugin(ingestor.name, tuple(options))
-    return configure_ingestor(
-        ingestor,
-        target=target,
-        options=dict(coerced_options),
-        run_id=run_id,
-        source=source,
-        storage=storage,
-        input_filters=input_filters,
-    )
+    try:
+        return configure_ingestor(
+            ingestor,
+            target=target,
+            options=dict(coerced_options),
+            run_id=run_id,
+            source=source,
+            storage=storage,
+            input_filters=input_filters,
+        )
+    except RemovedConfigKeyError as exc:
+        raise click.UsageError(render(exc)) from exc

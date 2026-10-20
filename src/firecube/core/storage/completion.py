@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from firecube.core.config import StorageConfig
-from firecube.core.errors import ConfigurationError, StorageError
+from firecube.core.errors import ConfigurationError, Message, Param, StorageError
 from firecube.core.product import CompletionRoute, write_mode_policy
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.product.target import ProductTarget
@@ -330,9 +330,14 @@ class StorageCompleter:
 
         if not source_path.exists():
             raise StorageError(
-                f"Ingestion failed: write_mode is 'staged' but no local output "
-                f"was found at {source_path}. "
-                "If the plugin writes directly to the target, use --write-mode direct."
+                Message(
+                    "Ingestion failed: write_mode is 'staged' but no local output "
+                    "was found at {source_path}. "
+                    "If the plugin writes directly to the target, use {write_mode}.",
+                    source_path=source_path,
+                    product_uri=final_target_uri,
+                    write_mode=Param("write_mode", "direct"),
+                )
             )
 
         storage_config = _storage_config_from_ctx(ctx)

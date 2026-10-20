@@ -30,11 +30,13 @@ from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.types import (
     INDEX_CURRENT_FILENAME,
     INDEX_DIRNAME,
+    RESOLVED_INDEX_IDENTITY_HASH_ATTR,
     SLOT_INDEX_CURRENT_FILENAME,
     SLOT_INDEX_DIRNAME,
     IndexEnsuredEvent,
     ResolvedIndexRecord,
 )
+from firecube.core.errors import ManifestError, ResolvedIndexAttrsConflictError
 from firecube.core.index_resolve import resolve_index_spec
 from firecube.core.index_spec import IndexSpec, IntegerAxis, RegularTimeAxis
 from firecube.core.slot_index import SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR
@@ -581,3 +583,36 @@ def test_rebuild_library_none_spec_raises_and_leaves_no_run_record(tmp_path: Pat
         assert manager.list_runs(product="index_rebuild_product") == []
     finally:
         manager.close()
+
+
+@pytest.mark.contract
+def test_rebuild_library_attrs_drift_raises_the_manifest_error_unchanged(tmp_path: Path) -> None:
+    cube = tmp_path / "library_drift_cube"
+    cube.mkdir()
+    manager = _manager(f"file://{cube}", "index_rebuild_product")
+    try:
+        rebuild_index_record(**_library_kwargs(cube, manager, _RebuildPlugin()))
+        zarr.open(str(cube), mode="a").attrs[RESOLVED_INDEX_IDENTITY_HASH_ATTR] = "f" * 64
+        with pytest.raises(ManifestError) as refused:
+            rebuild_index_record(**_library_kwargs(cube, manager, _RebuildPlugin()))
+    finally:
+        manager.close()
+
+    assert type(refused.value) is ResolvedIndexAttrsConflictError
+    assert not isinstance(refused.value, IndexRecordError)
+
+
+@pytest.mark.parametrize("state", ["without-record", "drift"])
+def test_repro_rebuild_attrs_conflict_exits_with_error_line_not_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    _register_plugins(monkeypatch)
+    cube = tmp_path / "cube"
+    assert CliRunner().invoke(cli, _args(cube)).exit_code == 0
+    if state == "drift":
+        zarr.open(str(cube), mode="a").attrs[RESOLVED_INDEX_IDENTITY_HASH_ATTR] = "f" * 64
+    else:
+        (cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME).unlink()
+    result = CliRunner().invoke(cli, _args(cube))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.stderr.startswith("Error: "), result.stderr

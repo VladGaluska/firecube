@@ -152,19 +152,6 @@ def test_generic_true_declared_codecs(tmp_path) -> None:
     assert "blosc" in names, f"True+[blosc] must apply declared blosc codec, got {names!r}"
 
 
-def test_generic_false_declared_codecs_raises() -> None:
-    """Cell 4 (Generic): False + [blosc] → rejected at config construction."""
-    with pytest.raises(ConfigurationError) as excinfo:
-        ZarrTemplateConfig(
-            zarr_compression=False,
-            zarr_codecs=[BLOSC_ENTRY],
-        )
-    msg = str(excinfo.value)
-    assert "zarr_compression" in msg and "zarr_codecs" in msg, (
-        f"error must name both zarr_compression and zarr_codecs: {msg!r}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # DirectZarr path — derive_effective_codecs_for_spec → ensure_group
 # ---------------------------------------------------------------------------

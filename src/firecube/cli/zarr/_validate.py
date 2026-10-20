@@ -21,7 +21,7 @@ import json
 import click
 
 from firecube.cli._ctx import get_storage_config
-from firecube.cli._errors import wrap_user_facing_errors
+from firecube.cli._errors import render, wrap_user_facing_errors
 from firecube.cli._product import require_full_uri, resolve_product_identity
 from firecube.cli._shared_options import (
     product_uri_option,
@@ -152,8 +152,10 @@ def validate(
     except FileNotFoundError as exc:
         raise click.ClickException(f"Group '{group_path}' not found in Zarr product.") from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(json.dumps(report.to_dict(), indent=2))
+        raise click.ClickException(render(exc)) from exc
+    report_dict = report.to_dict()
+    report_dict["info_notes"] = [render(note) for note in report_dict["info_notes"]]
+    click.echo(json.dumps(report_dict, indent=2))
     if not report.is_valid:
         raise click.exceptions.Exit(1)
 

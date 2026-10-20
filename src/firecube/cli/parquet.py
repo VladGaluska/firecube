@@ -24,6 +24,7 @@ import click
 import duckdb
 
 from firecube.cli._ctx import get_storage_config
+from firecube.cli._errors import render
 from firecube.cli._product import resolve_product_identity
 from firecube.cli._shared_options import (
     product_uri_option,
@@ -87,7 +88,7 @@ def _check_parquet_magic(fs: StorageFilesystem, path: StorageUri) -> tuple[bool,
     try:
         size = int(fs.info(path).get("size") or 0)
     except Exception as exc:
-        return False, f"Failed to stat: {exc}"
+        return False, f"Failed to stat: {render(exc)}"
 
     if size < 8:
         return False, "File too small to be a Parquet"
@@ -98,7 +99,7 @@ def _check_parquet_magic(fs: StorageFilesystem, path: StorageUri) -> tuple[bool,
             handle.seek(size - 4)
             tail = handle.read(4)
     except Exception as exc:
-        return False, f"Failed to open/read: {exc}"
+        return False, f"Failed to open/read: {render(exc)}"
 
     if head != b"PAR1":
         return False, "Missing PAR1 header"
@@ -296,4 +297,4 @@ def consolidate(
         )
 
     except Exception as exc:
-        raise click.ClickException(f"Consolidation failed: {exc}") from exc
+        raise click.ClickException(f"Consolidation failed: {render(exc)}") from exc

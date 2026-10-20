@@ -26,6 +26,7 @@ from typing import Any, cast
 import xarray as xr
 
 from firecube.core.api import is_remote_target, local_path_from_target, require_tensogram
+from firecube.core.errors import FirecubeError
 from firecube.ingestor.api import (
     BaseIngestor,
     OutputPaths,
@@ -135,6 +136,7 @@ def process_tensogram_batch(self: Any, batch: PipelineBatch, ctx: PluginContext)
             outputs=OutputPaths(primary=Path("")),
             success=False,
             error=str(exc),
+            failure=exc if isinstance(exc, FirecubeError) else None,
         )
 
     finally:

@@ -783,16 +783,6 @@ def _upload_tree_multipart(fs: Any, local_path: Path, remote_path: str) -> bool:
     return True
 
 
-def _upload_tree_shape0(metadata: dict[str, Any]) -> int | None:
-    shape = metadata.get("shape", [])
-    if not shape:
-        return None
-    try:
-        return int(shape[0])
-    except (TypeError, ValueError, IndexError):
-        return None
-
-
 def _read_if_present(fs: Any, uri: StorageUri) -> bytes | None:
     try:
         return bytes(fs.read_bytes(uri))

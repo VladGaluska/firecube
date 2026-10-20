@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -122,3 +123,16 @@ def test_plan_error_message_format(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "--dry-run" in output_lower, result.output
     assert "--force" in output_lower, result.output
     assert "--yes-i-really-mean-it" in output_lower, result.output
+
+
+def test_repro_blocked_ranges_delete_span_command_carries_the_target_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        slot_plan, "_query_slots_coverage", lambda **kwargs: {"group_a": [(0, 73)], "group_b": []}
+    )
+    result = CliRunner().invoke(cli, _plan_args(tmp_path))
+    assert result.exit_code != 0, result.output
+    match = re.search(r"firecube chunks delete-span --product-name (<[^>]+>|\S+)", result.output)
+    assert match, result.output
+    assert match.group(1) == "<target URI>" or match.group(1).endswith("/out.zarr"), match.group(0)

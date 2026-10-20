@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from firecube.core.controlplane import ChunkManager
-from firecube.core.errors import ConfigurationError, SchemaDriftError
+from firecube.core.errors import ConfigurationError, Message, Param, SchemaDriftError
 from firecube.core.product.resolver import ProductResolver
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
@@ -59,6 +59,7 @@ from firecube.core.zarr._sealing_markers import (
     ATTR_PREALLOCATED,
 )
 from firecube.core.zarr.coord_materialization import coord_to_datetime64
+from firecube.core.zarr.guard.engine_owned import exception_text
 
 if TYPE_CHECKING:
     from firecube.core.config import StorageConfig
@@ -181,11 +182,18 @@ def consolidate_time_coords(
             consolidating_key = f"{resolved_time_dim}.consolidating"
             if resolved_time_dim not in array_keys and consolidating_key not in array_keys:
                 raise ConfigurationError(
-                    f"Group {_display_group_name(group)}: expected time coord "
-                    f"{resolved_time_dim!r} (source: {dim_source}) not present "
-                    f"in group (arrays: {sorted(array_keys)!r}). Refusing to "
-                    "no-op. Pass a matching --time-dim or ensure the store was "
-                    "written by a plugin whose time_dim_name matches this cube."
+                    Message(
+                        "Group {group}: expected time coord "
+                        "{coord!r} (source: {dim_source}) not present "
+                        "in group (arrays: {arrays!r}). Refusing to "
+                        "no-op. Pass a matching {time_dim} or ensure the store was "
+                        "written by a plugin whose time_dim_name matches this cube.",
+                        group=_display_group_name(group),
+                        coord=resolved_time_dim,
+                        dim_source=dim_source,
+                        arrays=sorted(array_keys),
+                        time_dim=Param("time_dim"),
+                    )
                 )
             consolidated = _consolidate_group_time_coord(
                 group,
@@ -232,7 +240,7 @@ def _resolve_product_identity(target: str, *, product_name: str) -> ProductIdent
     try:
         return ProductResolver.resolve(target, format="zarr", product_name=product_name)
     except ValueError as exc:
-        raise ProductIdentityError(str(exc)) from exc
+        raise ProductIdentityError(exception_text(exc)) from exc
 
 
 def _walk_zarr_groups(root: Any) -> Generator[Any]:
@@ -323,8 +331,13 @@ def _resolve_time_dim_for_group(
         return candidates.pop(), "discovered"
     if len(candidates) > 1:
         raise ConfigurationError(
-            f"Group {_display_group_name(group)}: multiple time-coord candidates "
-            f"{sorted(candidates)!r}. Pass --time-dim explicitly to disambiguate."
+            Message(
+                "Group {group}: multiple time-coord candidates "
+                "{candidates!r}. Pass {time_dim} explicitly to disambiguate.",
+                group=_display_group_name(group),
+                candidates=sorted(candidates),
+                time_dim=Param("time_dim"),
+            )
         )
     return None, None
 

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from firecube.core.controlplane.types import CLAIMS_DIRNAME, ClaimInfo, WriteDomain
-from firecube.core.errors import ClaimConflictError, ControlPlaneCorruptionError
+from firecube.core.errors import ClaimConflictError, ControlPlaneCorruptionError, Message, Param
 from firecube.core.filesystem import StorageFilesystemFull
 from firecube.core.storage.uri import StorageUri
 
@@ -286,7 +286,13 @@ class FilesystemClaimService:
             return False
         if not force and not info.stale:
             raise ClaimConflictError(
-                f"Refusing to clear active claim {domain_id}; rerun with --force to override."
+                Message(
+                    "Refusing to clear active claim {claim_domain}; rerun with {force} to override.",
+                    claim_domain=domain_id,
+                    force=Param("force", True),
+                    product=product,
+                    claim_owner=info.owner_id,
+                )
             )
         with suppress(FileNotFoundError):
             self._fs.rm(claim_path, recursive=False)

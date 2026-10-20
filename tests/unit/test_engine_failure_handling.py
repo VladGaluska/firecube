@@ -16,9 +16,13 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import click
 import pytest
 
+from firecube.cli._errors import render
+from firecube.core.errors import ConfigurationError, FirecubeError, Message, Param
 from firecube.ingestor.contracts.interfaces import PipelineHost
+from firecube.ingestor.runtime import engine
 from firecube.ingestor.runtime.engine import PipelineExecutor, PipelineFailedBatchesError
 from firecube.ingestor.types.context import (
     IngestContext,
@@ -26,6 +30,7 @@ from firecube.ingestor.types.context import (
     PipelineBatch,
     PipelineResult,
     PipelineRunState,
+    PluginContext,
     RuntimeIngestContext,
 )
 
@@ -101,3 +106,34 @@ def test_finalize_passes_when_all_batches_succeed(tmp_path: Path) -> None:
     result = PipelineExecutor().finalize(_runtime_ctx(tmp_path), state, _host())
 
     assert result.output_path == "s3://bucket/product"
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("exc", [ConfigurationError("bad"), ValueError("bad")])
+def test_batch_result_keeps_firecube_exception_only(tmp_path: Path, exc: Exception) -> None:
+    host = _host()
+    host._process_batch.side_effect = exc
+    result = engine._process_batch_timed(host, _batch("b1"), PluginContext(_runtime_ctx(tmp_path)))
+    assert not result.success and result.error == str(exc)
+    assert result.failure is (exc if isinstance(exc, FirecubeError) else None)
+
+
+@pytest.mark.contract
+def test_failed_batches_error_text_renders_flags_only_under_click() -> None:
+    cause = ConfigurationError(Message("bad {p}", p=Param("time_dim")))
+    failed = [PipelineResult(batch=_batch("b1"), success=False, error=str(cause))]
+    failed[0].failure = cause
+    err = PipelineFailedBatchesError(run_id="r1", failed=failed, not_attempted=2)
+    assert isinstance(err, FirecubeError) and isinstance(err, RuntimeError)
+    assert (err.run_id, list(err.failed), err.not_attempted) == ("r1", failed, 2)
+    assert "--" not in str(err) and "bad time_dim" in str(err)
+    assert render(
+        err, click.Context(click.Command("ingest", params=[click.Option(["--time-dim"])]))
+    ) == (
+        "Pipeline run 'r1' had 1 failed batch(es): bad --time-dim. 2 later batch(es) were not "
+        "attempted: this host stops at the first failed batch so no batch appends past a gap. "
+        "Run recorded as status=failed. Recovery: resolve the batch error above before retrying. "
+        "For compatible Zarr inputs, --option resume_existing=true skips present timestamps "
+        "and refills failed slots; --option force_reingest=true overwrites existing timestamps. "
+        "Neither option can insert absent timestamps before the stored maximum or bypass schema validation."
+    )

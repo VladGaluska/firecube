@@ -36,7 +36,7 @@ from firecube.core.controlplane.types import (
     SCHEMA_FILENAME,
     WriteDomain,
 )
-from firecube.core.errors import ClaimConflictError, FirecubeError
+from firecube.core.errors import ClaimConflictError, FirecubeError, Message
 from firecube.ingestor.runtime.recording import SpanRecorder
 from firecube.ingestor.types.context import (
     IngestResult,
@@ -133,6 +133,12 @@ def _ignore_line(line: str) -> None:
     """Discard a progress or warning line."""
 
 
+def _error_text(exc: BaseException) -> str:
+    """Return the `Message` an exception was raised with, else its text."""
+    first = exc.args[0] if exc.args else None
+    return first if isinstance(first, Message) else str(exc)
+
+
 def _acquire_maintenance_claim(
     *, manager, product: str, operation: str, owner_id: str
 ) -> tuple[WriteDomain, Any]:
@@ -146,8 +152,8 @@ def _acquire_maintenance_claim(
     """
     active_claims = manager.list_claims(product=product)
     if active_claims:
-        # Function-scope import: keeps the hint module out of CLI start-up.
-        from firecube.core.hints import maintenance_refusal_message
+        # Function-scope import: keeps the control-plane manager out of module import.
+        from firecube.core.controlplane.manager import maintenance_refusal_message
 
         details = ", ".join(f"{claim.domain} (owner={claim.owner_id})" for claim in active_claims)
         raise ArchiveClaimError(
@@ -169,8 +175,8 @@ def _acquire_maintenance_claim(
             product=product, domain=domain, owner_id=owner_id, describe_conflict=False
         )
     except ClaimConflictError as exc:
-        # Function-scope import: keeps the hint module out of CLI start-up.
-        from firecube.core.hints import maintenance_refusal_message
+        # Function-scope import: keeps the control-plane manager out of module import.
+        from firecube.core.controlplane.manager import maintenance_refusal_message
 
         blocking: list[Any] = []
         with contextlib.suppress(Exception):
@@ -180,7 +186,7 @@ def _acquire_maintenance_claim(
                 repo=manager.repo,
                 product=product,
                 operation=operation,
-                detail=str(exc) or "write claim acquisition failed",
+                detail=_error_text(exc) or "write claim acquisition failed",
                 claims=blocking,
             ),
             product=product,
@@ -201,8 +207,12 @@ def _release_claim(claim_handle: Any, *, warn: Callable[[str], None]) -> None:
         except Exception as exc:
             # Warn, never raise: a raise here replaces the archive or record error.
             warn(
-                f"Warning: claim {claim_handle.info.domain} at "
-                f"{claim_handle.claim_path.to_str()} not released: {exc}"
+                Message(
+                    "Warning: claim {claim_domain} at {claim_path} not released: {error}",
+                    claim_domain=claim_handle.info.domain,
+                    claim_path=claim_handle.claim_path.to_str(),
+                    error=_error_text(exc),
+                )
             )
 
 
@@ -251,7 +261,9 @@ def _record_archive_create_failure(
             manager=manager, product=product, run_id=run_id, scope_meta=scope_meta, error=error
         )
     except Exception as exc:
-        warn(f"Warning: archive create failure not recorded: {exc}")
+        warn(
+            Message("Warning: archive create failure not recorded: {error}", error=_error_text(exc))
+        )
 
 
 def create_archive(
@@ -378,7 +390,7 @@ def create_archive(
                     error=str(exc),
                     warn=warn,
                 )
-            raise ArchiveConversionError(str(exc), archive=archive) from exc
+            raise ArchiveConversionError(_error_text(exc), archive=archive) from exc
         except Exception as exc:
             if manager is not None:
                 _record_archive_create_failure(
@@ -521,7 +533,12 @@ def restore_archive(
                 error=error,
             )
         except Exception as exc:
-            warn(f"Warning: archive restore failure not recorded: {exc}")
+            warn(
+                Message(
+                    "Warning: archive restore failure not recorded: {error}",
+                    error=_error_text(exc),
+                )
+            )
 
     restore_source = archive_path
     claim_handle: Any = None
@@ -570,7 +587,7 @@ def restore_archive(
                 )
         except (FileExistsError, ImportError, ValueError) as exc:
             _record_failure(str(exc))
-            raise ArchiveConversionError(str(exc), archive=archive) from exc
+            raise ArchiveConversionError(_error_text(exc), archive=archive) from exc
         except Exception as exc:
             _record_failure(str(exc))
             raise
@@ -610,6 +627,12 @@ def restore_archive(
         try:
             manager.close()
         except Exception as exc:
-            warn(f"Warning: control plane of {target_uri_str} not closed: {exc}")
+            warn(
+                Message(
+                    "Warning: control plane of {product_uri} not closed: {error}",
+                    product_uri=target_uri_str,
+                    error=_error_text(exc),
+                )
+            )
 
     return ArchiveRestoreResult(run_id=restore_run_id, summary=result)

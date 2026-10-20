@@ -14,12 +14,17 @@
 
 """Exceptions for Firecube Ingestor."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from firecube.core.errors import (
     ConfigurationError,
     FirecubeError,
     ManifestError,
+    Message,
+    Operation,
+    Param,
+    Placeholder,
+    PluginOption,
     SchemaDriftError,
     StorageError,
 )
@@ -46,6 +51,36 @@ class UnboundedAxisError(ConfigurationError):
             "to enable parallel ingestion"
         )
         self.group = group
+
+
+class RemovedConfigKeyError(ConfigurationError):
+    """A config or option key that firecube no longer accepts was supplied.
+
+    The message names `product_name` and `config_file` as parameters, so the
+    CLI prints the matching flags. The CLI reports it as a usage error.
+
+    Args:
+        key: The removed key, for example ``output_name``.
+
+    Attributes:
+        key: The removed key.
+    """
+
+    def __init__(self, key: str) -> None:
+        super().__init__(
+            Message(
+                "Config key {key!r} is no longer accepted. "
+                "Use '{product_name}' or 'default_product_name' instead.\n"
+                "Edit the CLI invocation or the config file passed via {config_file}.",
+                key=key,
+                product_name=Param("product_name"),
+                config_file=Param("config_file"),
+            )
+        )
+        self.key = key
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self.key,), self.__dict__)
 
 
 class SchemaSizeMismatchError(IngestorError):
@@ -132,10 +167,15 @@ class AppendOverwriteRefused(ResumeConflictError):
                 "order, or rebuild a new target from all required inputs in chronological order."
             )
         elif reason == "unsorted_existing_coord":
-            hint = (
+            hint = Message(
                 "Existing append coordinate must be unique and strictly increasing. "
-                "Run `firecube zarr validate <target>` on the target product URI "
-                "to diagnose the coordinate order before retrying."
+                "Run `{validate}` on the target product "
+                "to diagnose the coordinate order before retrying.",
+                validate=Operation(
+                    "validate",
+                    product=Placeholder("<uri>"),
+                    group_path=Placeholder("<group>"),
+                ),
             )
         elif reason == "unsorted_incoming":
             hint = (
@@ -147,11 +187,13 @@ class AppendOverwriteRefused(ResumeConflictError):
         elif reason == "state_array_missing":
             if array_path is None:
                 raise ValueError("array_path is required for reason='state_array_missing'")
-            hint = (
-                f"Timestamp-state array {array_path!r} does not exist in the target "
+            hint = Message(
+                "Timestamp-state array {array_path!r} does not exist in the target "
                 "store, so incoming timestamps cannot be classified against it. "
-                "Rerun with `--option resume_existing=true` so the existing group is "
-                "upgraded with the state array before classification."
+                "Rerun with `{resume}` so the existing group is "
+                "upgraded with the state array before classification.",
+                array_path=array_path,
+                resume=PluginOption("resume_existing", "true"),
             )
         else:
             hint = (
@@ -159,8 +201,14 @@ class AppendOverwriteRefused(ResumeConflictError):
                 "timestamps and contiguous overlap."
             )
         super().__init__(
-            f"Cannot overwrite {n} timestamp(s) [{', '.join(refused_timestamps[:3])}{'...' if n > 3 else ''}]: {reason}. "
-            f"{hint}"
+            Message(
+                "Cannot overwrite {n} timestamp(s) [{shown}{more}]: {reason}. {hint}",
+                n=n,
+                shown=", ".join(refused_timestamps[:3]),
+                more="..." if n > 3 else "",
+                reason=reason,
+                hint=hint,
+            )
         )
         self.refused_timestamps = refused_timestamps
         self.reason = reason
@@ -240,6 +288,7 @@ __all__ = [
     "IntegrityGuardError",
     "ManifestError",
     "RangeOverlapError",
+    "RemovedConfigKeyError",
     "ResumeConflictError",
     "SchemaDriftError",
     "SchemaDriftReingestError",

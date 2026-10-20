@@ -45,7 +45,13 @@ from typing import Any
 import numpy as np
 from zarr.storage import LocalStore
 
-from firecube.core.errors import ConfigurationError, SchemaDriftError
+from firecube.core.errors import (
+    CommandName,
+    ConfigurationError,
+    Message,
+    Param,
+    SchemaDriftError,
+)
 from firecube.core.index_resolve import (
     ExtentUnknownError,
 )
@@ -67,6 +73,7 @@ from firecube.core.zarr._reserved_attrs import (
 )
 from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
 from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.engine_owned import exception_text
 from firecube.core.zarr.guard.guarded_write import (
     ArrayHold,
     guarded_write,
@@ -331,7 +338,12 @@ def discover_regular_observed_coord_values(
             info = ingestor.inspect_item(item, plugin_ctx)
         except Exception as exc:
             raise ConfigurationError(
-                f"inspect_item raised an error for item {item!r}: {exc}"
+                Message(
+                    "inspect_item raised an error for item {item!r}: {cause}",
+                    item=item,
+                    group=group_name,
+                    cause=exception_text(exc),
+                )
             ) from exc
         if info is None:
             continue
@@ -340,8 +352,14 @@ def discover_regular_observed_coord_values(
             slot_index = int(resolved_index.position(group_name, coordinate))
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(
-                f"inspect_item returned coordinate {coordinate!r} for item {item!r} "
-                f"that could not be mapped to a slot index: {exc}"
+                Message(
+                    "inspect_item returned coordinate {coordinate!r} for item {item!r} "
+                    "that could not be mapped to a slot index: {cause}",
+                    coordinate=coordinate,
+                    item=item,
+                    group=group_name,
+                    cause=exception_text(exc),
+                )
             ) from exc
         if not (slot_start <= slot_index < slot_end):
             continue
@@ -447,10 +465,38 @@ def stamp_coord_managed_marker(writer: Any, coord_path: str) -> Any:
         return writer.update_array_attrs(coord_path, {ATTR_COORD_MANAGED: True})
     except Exception as exc:
         raise SchemaDriftError(
-            f"failed to stamp {ATTR_COORD_MANAGED} on coordinate array {coord_path}; "
-            "the observed shell is a legacy/unmarked state and must be cleaned up "
-            "with existing `firecube chunks` tooling before retrying"
+            Message(
+                "failed to stamp {marker} on coordinate array {array_path}; "
+                "the observed shell is a legacy/unmarked state and must be cleaned up "
+                "with existing `{tooling}` tooling before retrying",
+                marker=ATTR_COORD_MANAGED,
+                array_path=coord_path,
+                tooling=_CHUNKS_TOOLING,
+            )
         ) from exc
+
+
+_CHUNKS_TOOLING = CommandName(("chunks",), "ChunkManager")
+
+
+def _legacy_shell_refusal(
+    coord_path: str, group: str, slot_window: tuple[int, int]
+) -> SchemaDriftError:
+    """Build the refusal for an observed-regime coordinate shell without the managed marker."""
+    return SchemaDriftError(
+        Message(
+            "coordinate array {array_path} lacks {marker}; marker "
+            "absent means legacy classification, so observed-regime "
+            "materialization refuses to run on this shell. Clean up the "
+            "legacy coordinate shell with existing `{tooling}` tooling "
+            "before retrying.",
+            array_path=coord_path,
+            group=group,
+            slot_window=slot_window,
+            marker=ATTR_COORD_MANAGED,
+            tooling=_CHUNKS_TOOLING,
+        )
+    )
 
 
 def materialize_regular_coord_array(
@@ -530,10 +576,19 @@ def materialize_regular_coord_array(
         # stays recoverable.
         if not observed_values:
             raise ConfigurationError(
-                f"no items discovered from --input-data={input_data!r} for {coord_path}; "
-                f"refusing to stamp firecube_coord_managed on an empty array "
-                f"(would block further ingest). Check --input-data path, plugin's "
-                f"discover_source_files, and --slot-start/--slot-end window."
+                Message(
+                    "no items discovered from {input_data_param}={input_data!r} for {array_path}; "
+                    "refusing to stamp firecube_coord_managed on an empty array "
+                    "(would block further ingest). Check {input_data_param} path, plugin's "
+                    "discover_source_files, and {slot_start}/{slot_end} window.",
+                    input_data_param=Param("input_data"),
+                    input_data=input_data,
+                    array_path=coord_path,
+                    group=group_name,
+                    slot_window=(slot_start, effective_slot_end),
+                    slot_start=Param("slot_start"),
+                    slot_end=Param("slot_end"),
+                )
             )
 
     existing = existing_array(root, coord_path)
@@ -616,12 +671,8 @@ def materialize_regular_coord_array(
                     f"cannot stamp {ATTR_COORD_MANAGED}"
                 )
             if not bool(existing.attrs.get(ATTR_COORD_MANAGED, False)):
-                raise SchemaDriftError(
-                    f"coordinate array {coord_path} lacks {ATTR_COORD_MANAGED}; marker "
-                    "absent means legacy classification, so observed-regime "
-                    "materialization refuses to run on this shell. Clean up the "
-                    "legacy coordinate shell with existing `firecube chunks` tooling "
-                    "before retrying."
+                raise _legacy_shell_refusal(
+                    coord_path, group_name, (slot_start, effective_slot_end)
                 )
             with _hold_coord(writer, coord_path) as hold:
                 written, matched = reconcile_observed_regular_coord_values(
@@ -646,12 +697,8 @@ def materialize_regular_coord_array(
             )
         elif observed_regime:
             if not bool(existing.attrs.get(ATTR_COORD_MANAGED, False)):
-                raise SchemaDriftError(
-                    f"coordinate array {coord_path} lacks {ATTR_COORD_MANAGED}; marker "
-                    "absent means legacy classification, so observed-regime "
-                    "materialization refuses to run on this shell. Clean up the "
-                    "legacy coordinate shell with existing `firecube chunks` tooling "
-                    "before retrying."
+                raise _legacy_shell_refusal(
+                    coord_path, group_name, (slot_start, effective_slot_end)
                 )
             report(
                 f"array {coord_path}: existing regular coord array kept coord-managed "

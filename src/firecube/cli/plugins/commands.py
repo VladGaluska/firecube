@@ -23,6 +23,7 @@ from pathlib import Path
 
 import click
 
+from firecube.cli._errors import render
 from firecube.core import observability
 from firecube.ingestor.registry.metadata import (
     get_plugin_descriptor,
@@ -217,7 +218,7 @@ def create_plugin(
         try:
             return validate_plugin_name(value)
         except ValueError as exc:
-            raise click.BadParameter(str(exc), param_hint="NAME") from exc
+            raise click.BadParameter(render(exc), param_hint="NAME") from exc
 
     # Interactive Wizard
     if not non_interactive:
@@ -270,7 +271,7 @@ def create_plugin(
             template_type=resolved_template,
         )
     except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     ingestor_file = next((project_path / "src").glob("*/ingestor.py"))
     click.echo(f"✨ Created plugin project: {project_path}")

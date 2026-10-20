@@ -20,6 +20,8 @@ import itertools
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from firecube.core.errors import Message, Param
+
 
 def physical_chunk_keys_for_region(
     *,
@@ -318,8 +320,8 @@ def unit_ownership_refusal(
     unit_shape: Sequence[int],
     unit_slots: tuple[int, int],
     window: tuple[int, int],
-) -> str:
-    """Return the operator message for a slot window that shares a stored unit.
+) -> Message:
+    """Return the refusal message for a slot window that shares a stored unit.
 
     Examples:
         >>> "slots [0, 12)" in unit_ownership_refusal(
@@ -329,13 +331,23 @@ def unit_ownership_refusal(
     """
     first, end = unit_slots
     size = int(unit_shape[0])
-    return (
-        f"{array_path}: the stored {unit_kind} shape {tuple(unit_shape)!r} puts slots "
-        f"[{first}, {end}) in one {unit_kind} object, but this run's slot window "
-        f"[{window[0]}, {window[1]}) holds only part of them. A writer of the other slots "
-        f"rewrites the same object, and one of the two writes is lost. Use "
-        f"--slot-start/--slot-end windows aligned to {size} slots (here [{first}, {end})), "
-        f"or ingest into a new store whose array {_one_slot_unit_advice(unit_kind)}."
+    return Message(
+        "{array_path}: the stored {unit_kind} shape {unit_shape!r} puts slots "
+        "[{first}, {end}) in one {unit_kind} object, but this run's slot window "
+        "[{slot_window[0]}, {slot_window[1]}) holds only part of them. A writer of the other slots "
+        "rewrites the same object, and one of the two writes is lost. Use "
+        "{slot_start}/{slot_end} windows aligned to {size} slots (here [{first}, {end})), "
+        "or ingest into a new store whose array {advice}.",
+        array_path=array_path,
+        unit_kind=unit_kind,
+        unit_shape=tuple(unit_shape),
+        first=first,
+        end=end,
+        slot_window=tuple(window),
+        slot_start=Param("slot_start"),
+        slot_end=Param("slot_end"),
+        size=size,
+        advice=_one_slot_unit_advice(unit_kind),
     )
 
 
@@ -385,8 +397,8 @@ def staged_partial_unit_refusal(
     unit_shape: Sequence[int],
     unit_cells: Bounds,
     detail: str,
-) -> str:
-    """Return the operator message for a staged run that would promote a partial unit.
+) -> Message:
+    """Return the refusal message for a staged run that would promote a partial unit.
 
     Examples:
         >>> "slots [0, 12)" in staged_partial_unit_refusal(
@@ -395,14 +407,23 @@ def staged_partial_unit_refusal(
         True
     """
     first, end = unit_cells[0]
-    return (
-        f"{array_path}: staged promotion replaces whole {unit_kind} objects, and the "
-        f"stored {unit_kind} shape {tuple(unit_shape)!r} puts slots [{first}, {end}) "
-        f"(cells {list(unit_cells)!r}) in one object, but this run does not write all "
-        f"of it: {detail}. Promoting it would reset the unwritten cells in the target "
-        f"to the fill value. Write every slot and cell of the {unit_kind} in one run, "
-        f"ingest with --write-mode direct, or use a store whose array "
-        f"{_one_slot_unit_advice(unit_kind)}."
+    return Message(
+        "{array_path}: staged promotion replaces whole {unit_kind} objects, and the "
+        "stored {unit_kind} shape {unit_shape!r} puts slots [{first}, {end}) "
+        "(cells {cells!r}) in one object, but this run does not write all "
+        "of it: {detail}. Promoting it would reset the unwritten cells in the target "
+        "to the fill value. Write every slot and cell of the {unit_kind} in one run, "
+        "ingest with {write_mode}, or use a store whose array "
+        "{advice}.",
+        array_path=array_path,
+        unit_kind=unit_kind,
+        unit_shape=tuple(unit_shape),
+        first=first,
+        end=end,
+        cells=list(unit_cells),
+        detail=detail,
+        write_mode=Param("write_mode", "direct"),
+        advice=_one_slot_unit_advice(unit_kind),
     )
 
 

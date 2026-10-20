@@ -24,7 +24,7 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -63,6 +63,10 @@ from firecube.core.errors import (
     ConfigurationError,
     LegacyIndexRecordError,
     ManifestError,
+    Message,
+    Operation,
+    Placeholder,
+    ResolvedIndexAttrsConflictError,
     ResolvedIndexClaimTimeoutError,
     ResolvedIndexConflictError,
     SlotIndexModelClaimTimeoutError,
@@ -721,20 +725,25 @@ class ChunkManager:
             # Serial (non-range) runs own the full extent by convention; keep
             # symmetric with resume_guard._check_non_terminal_runs (reverse leg).
             if serial_peers:
-                # Function-scope import: keeps the hint module out of CLI start-up.
-                from firecube.core.hints import abandon_run_command
-
                 serial_peer = serial_peers[0]
                 elapsed = "unknown"
                 if serial_peer.started_at:
                     elapsed_s = datetime.now(tz=UTC).timestamp() - float(serial_peer.started_at)
                     elapsed = f"{elapsed_s:.0f}s"
+                product_uri = self.get_product_root(product)
                 raise ConfigurationError(
-                    f"conflicting serial ingest run {serial_peer.run_id} is live "
-                    f"(holds full extent; state: {serial_peer.status}, running for {elapsed}); "
-                    f"if this run is confirmed dead, abandon it explicitly, then re-run "
-                    f"preallocate. Automatic timeout is not implemented.\n"
-                    f"  {abandon_run_command(self.get_product_root(product), serial_peer.run_id)}"
+                    Message(
+                        "conflicting serial ingest run {run_id} is live "
+                        "(holds full extent; state: {status}, running for {elapsed}); "
+                        "if this run is confirmed dead, abandon it explicitly, then re-run "
+                        "preallocate. Automatic timeout is not implemented.\n  {abandon}",
+                        run_id=serial_peer.run_id,
+                        status=serial_peer.status,
+                        elapsed=elapsed,
+                        abandon=_abandon_operation(product_uri, serial_peer.run_id),
+                        product=product,
+                        product_uri=product_uri,
+                    )
                 )
             for group, window in windows_by_group.items():
                 chunk_size = coord_chunk_sizes.get(group)
@@ -749,20 +758,29 @@ class ChunkManager:
                     peer_chunks = set(chunk_axis_range(peer_range[0], peer_range[1], chunk_size))
                     overlap = sorted(proposed_chunks & peer_chunks)
                     if overlap:
-                        # Function-scope import: keeps the hint module out of CLI start-up.
-                        from firecube.core.hints import abandon_run_command
-
                         elapsed = "unknown"
                         if peer.started_at:
                             elapsed_s = datetime.now(tz=UTC).timestamp() - float(peer.started_at)
                             elapsed = f"{elapsed_s:.0f}s"
+                        product_uri = self.get_product_root(product)
                         raise ConfigurationError(
-                            f"group {group!r} window [{window[0]}, {window[1]}) touches "
-                            f"coordinate chunk(s) {overlap} owned by run {peer.run_id} "
-                            f"(state: {peer.status}, materializing for {elapsed}); "
-                            f"if this run is confirmed dead, abandon it explicitly, then re-run "
-                            f"preallocate. Automatic timeout is not implemented.\n"
-                            f"  {abandon_run_command(self.get_product_root(product), peer.run_id)}"
+                            Message(
+                                "group {group!r} window [{slot_window[0]}, {slot_window[1]}) "
+                                "touches coordinate chunk(s) {overlap} owned by run {run_id} "
+                                "(state: {status}, materializing for {elapsed}); "
+                                "if this run is confirmed dead, abandon it explicitly, then "
+                                "re-run preallocate. Automatic timeout is not implemented.\n"
+                                "  {abandon}",
+                                group=group,
+                                slot_window=(window[0], window[1]),
+                                overlap=overlap,
+                                run_id=peer.run_id,
+                                status=peer.status,
+                                elapsed=elapsed,
+                                abandon=_abandon_operation(product_uri, peer.run_id),
+                                product=product,
+                                product_uri=product_uri,
+                            )
                         )
             whole = dict(whole_extent_groups or {})
             for group in whole:
@@ -771,16 +789,23 @@ class ChunkManager:
                         continue
                     peer_range = peer.slot_range
                     assert peer_range is not None
-                    # Function-scope import: keeps the hint module out of CLI start-up.
-                    from firecube.core.hints import abandon_run_command
-
+                    product_uri = self.get_product_root(product)
                     raise ConfigurationError(
-                        f"group {group!r} has engine-owned arrays, which preallocate writes "
-                        f"whole, but run {peer.run_id} is live on window "
-                        f"[{peer_range[0]}, {peer_range[1]}) (state: {peer.status}); wait for "
-                        f"it to finish, or if it is confirmed dead abandon it explicitly, then "
-                        f"re-run preallocate. Automatic timeout is not implemented.\n"
-                        f"  {abandon_run_command(self.get_product_root(product), peer.run_id)}"
+                        Message(
+                            "group {group!r} has engine-owned arrays, which preallocate writes "
+                            "whole, but run {run_id} is live on window "
+                            "[{slot_window[0]}, {slot_window[1]}) (state: {status}); wait for "
+                            "it to finish, or if it is confirmed dead abandon it explicitly, "
+                            "then re-run preallocate. Automatic timeout is not implemented.\n"
+                            "  {abandon}",
+                            group=group,
+                            run_id=peer.run_id,
+                            slot_window=(peer_range[0], peer_range[1]),
+                            status=peer.status,
+                            abandon=_abandon_operation(product_uri, peer.run_id),
+                            product=product,
+                            product_uri=product_uri,
+                        )
                     )
 
             claimed = [*windows_by_group.values(), *((0, extent) for extent in whole.values())]
@@ -910,7 +935,12 @@ class ChunkManager:
             raise
         except Exception as exc:
             raise ManifestError(
-                f"The write claims of {product} could not be listed: {exc}.\n{recovery()}"
+                Message(
+                    "The write claims of {product} could not be listed: {error}.\n{recovery}",
+                    product=product,
+                    error=str(exc),
+                    recovery=recovery(),
+                )
             ) from exc
 
     def _release_claims(
@@ -968,14 +998,15 @@ class ChunkManager:
         running the abandon again releases its claims.
         """
 
-        def recovery() -> str:
-            # Function-scope import: keeps the hint module out of CLI start-up.
-            from firecube.core.hints import abandon_run_command
-
-            command = abandon_run_command(self.get_product_root(product), run_id)
-            return (
-                f"Run {run_id} is recorded {status}; run the abandon again to release its "
-                f"claims:\n  {command}"
+        def recovery() -> Message:
+            product_uri = self.get_product_root(product)
+            return Message(
+                "Run {run_id} is recorded {status}; run the abandon again to release its "
+                "claims:\n  {abandon}",
+                run_id=run_id,
+                status=status,
+                abandon=_abandon_operation(product_uri, run_id),
+                product_uri=product_uri,
             )
 
         claims = [
@@ -1114,56 +1145,89 @@ class ChunkManager:
             if not describe_conflict:
                 raise
             raise ClaimConflictError(
-                f"{exc}\n{self._claim_conflict_detail(product=product, domain=domain)}"
+                Message(
+                    "{conflict}\n{detail}",
+                    conflict=str(exc) if exc.message is None else exc.message,
+                    detail=self._claim_conflict_detail(product=product, domain=domain),
+                )
             ) from exc
 
     def _claim_conflict_detail(self, *, product: str, domain: WriteDomain) -> str:
         """Describe who holds a conflicting claim and how to release it; never raises.
 
-        Re-reads the claim, resolves its owner to a recorded run and prints the clear command,
-        plus the abandon command when exactly one run owns the claim.
+        Re-reads the claim, resolves its owner to a recorded run and names the clear
+        operation, plus the abandon operation when exactly one run owns the claim.
         """
-        # Function-scope import: keeps the hint module out of CLI start-up.
-        from firecube.core.hints import abandon_run_command, clear_claim_command
-
         try:
             product_uri = self.get_product_root(product)
         except Exception as exc:
-            return f"The product root could not be resolved: {exc}."
+            return Message(
+                "The product root could not be resolved: {error}.",
+                error=str(exc),
+                product=product,
+            )
         try:
             service = self.repo.claims
             assert service is not None
             claim = service.read_claim_by_domain(product=product, domain=domain.identifier)
         except Exception as exc:
-            clear = clear_claim_command(product_uri, domain.identifier)
-            return (
-                f"The claim could not be read: {exc}.\n"
-                f"If no process of its owner is running, clear the claim:\n  {clear}"
+            return Message(
+                "The claim could not be read: {error}.\n"
+                "If no process of its owner is running, clear the claim:\n  {clear}",
+                error=str(exc),
+                clear=_clear_operation(product_uri, domain.identifier, force=False),
+                product=product,
+                product_uri=product_uri,
+                claim_domain=domain.identifier,
             )
         if claim is None:
             return "The claim was released after the conflict; retry."
-        clear = clear_claim_command(product_uri, domain.identifier, force=not claim.stale)
-        abandon = ""
+        clear = _clear_operation(product_uri, domain.identifier, force=not claim.stale)
+        abandon: str = ""
         try:
             owner = self._resolve_claim_owner(product=product, owner_id=claim.owner_id)
             if owner.run is not None:
                 run = owner.run
-                stale = ", stale" if run.stale else ""
-                who = f"Owner {claim.owner_id} is run {run.run_id} (status: {run.status}{stale})."
-                abandon = (
-                    f"\nor abandon run {run.run_id}, which releases the claims it alone owns:"
-                    f"\n  {abandon_run_command(product_uri, run.run_id)}"
+                who = Message(
+                    "Owner {claim_owner} is run {run_id} (status: {status}{stale}).",
+                    claim_owner=claim.owner_id,
+                    run_id=run.run_id,
+                    status=run.status,
+                    stale=", stale" if run.stale else "",
+                )
+                abandon = Message(
+                    "\nor abandon run {run_id}, which releases the claims it alone owns:"
+                    "\n  {abandon}",
+                    run_id=run.run_id,
+                    abandon=_abandon_operation(product_uri, run.run_id),
                 )
             elif owner.ambiguous:
-                candidates = ", ".join(run.run_id for run in owner.runs)
-                who = f"Owner {claim.owner_id} matches more than one recorded run: {candidates}."
+                who = Message(
+                    "Owner {claim_owner} matches more than one recorded run: {candidates}.",
+                    claim_owner=claim.owner_id,
+                    candidates=", ".join(run.run_id for run in owner.runs),
+                )
             else:
-                who = f"Owner {claim.owner_id} is not a recorded run of this product."
+                who = Message(
+                    "Owner {claim_owner} is not a recorded run of this product.",
+                    claim_owner=claim.owner_id,
+                )
         except Exception as exc:
-            who = f"The run status of owner {claim.owner_id} could not be read: {exc}."
+            who = Message(
+                "The run status of owner {claim_owner} could not be read: {error}.",
+                claim_owner=claim.owner_id,
+                error=str(exc),
+            )
             abandon = ""
-        return (
-            f"{who}\nIf no process of that owner is running, clear the claim:\n  {clear}{abandon}"
+        return Message(
+            "{who}\nIf no process of that owner is running, clear the claim:\n  {clear}{abandon}",
+            who=who,
+            clear=clear,
+            abandon=abandon,
+            product=product,
+            product_uri=product_uri,
+            claim_domain=domain.identifier,
+            claim_owner=claim.owner_id,
         )
 
     def list_claims(self, *, product: str | None = None):
@@ -1373,7 +1437,7 @@ class ChunkManager:
             return cp_record, "created"
 
         if cp_record is None and attrs_hash is not None:
-            raise ManifestError(
+            raise ResolvedIndexAttrsConflictError(
                 "zarr root attrs have resolved-index identity hash but no control-plane record"
             )
 
@@ -1388,7 +1452,7 @@ class ChunkManager:
             )
 
         if cp_record is not None and attrs_hash != record.identity_hash:
-            raise ManifestError(
+            raise ResolvedIndexAttrsConflictError(
                 "zarr root attrs have drifted from authoritative resolved-index record: "
                 f"cp_hash={cp_record.identity_hash[:16]} "
                 f"attrs_hash={str(attrs_hash)[:16]!r}"
@@ -1990,6 +2054,75 @@ class ChunkManager:
         )
 
 
+def _abandon_operation(product_uri: str, run_id: str) -> Operation:
+    """Name the abandon of one run, its reason left as a placeholder."""
+    return Operation(
+        "abandon_run", product_name=product_uri, run_id=run_id, reason=Placeholder('"<reason>"')
+    )
+
+
+def _clear_operation(product_uri: str, domain_id: str, *, force: bool) -> Operation:
+    """Name the clear of one claim domain; pass `force=True` for a claim that is not stale."""
+    return Operation("clear_claim", product_name=product_uri, domain_id=domain_id, force=force)
+
+
+def maintenance_refusal_message(
+    *,
+    repo: ManifestRepository,
+    product: str,
+    operation: str,
+    detail: str,
+    claims: Sequence[ClaimInfo],
+) -> Message:
+    """Return the message that refuses a maintenance operation, with its recovery operations.
+
+    Name each blocking claim and its owner, the clear operation for it (forced when the
+    claim is fresh) and, when its owner resolves to exactly one recorded run, the abandon
+    operation. Read errors drop the owner line and the abandon, never the clear.
+    """
+    refusal = "Cannot run {operation} for product {product}: {detail}."
+    facts: dict[str, object] = {"operation": operation, "product": product, "detail": detail}
+    if not claims:
+        return Message(refusal, **facts)
+    try:
+        product_uri = repo.get_product_root_uri(product)
+    except Exception as exc:
+        return Message(
+            refusal + " The product root could not be resolved: {error}.", **facts, error=str(exc)
+        )
+    lines: list[str] = [Message(refusal, **facts, product_uri=product_uri)]
+    owner_runs: dict[str, Any] = {}
+    for claim in claims:
+        if claim.owner_id not in owner_runs:
+            try:
+                owner_runs[claim.owner_id] = repo.resolve_claim_owner(
+                    product=product, owner_id=claim.owner_id
+                ).run
+            except Exception:
+                owner_runs[claim.owner_id] = None
+        run = owner_runs[claim.owner_id]
+        abandon: str = ""
+        if run is not None:
+            abandon = Message(
+                "\nor abandon run {run_id} (status: {status}), which releases the claims "
+                "it alone owns:\n  {abandon}",
+                run_id=run.run_id,
+                status=run.status,
+                abandon=_abandon_operation(product_uri, run.run_id),
+            )
+        lines.append(
+            Message(
+                "\nIf no process of {claim_owner} is running, clear the claim {claim_domain}:"
+                "\n  {clear}{abandon}",
+                claim_owner=claim.owner_id,
+                claim_domain=claim.domain,
+                clear=_clear_operation(product_uri, claim.domain, force=not claim.stale),
+                abandon=abandon,
+            )
+        )
+    return Message.join("", lines)
+
+
 def check_legacy_index_record(
     chunk_manager: ChunkManager,
     *,
@@ -2023,9 +2156,14 @@ def check_legacy_index_record(
     legacy_path = f"{control_root.rstrip('/')}/{SLOT_INDEX_DIRNAME}/{SLOT_INDEX_CURRENT_FILENAME}"
     product_uri = chunk_manager.get_product_root(product)
     raise LegacyIndexRecordError(
-        f"Legacy index record detected at {legacy_path}. "
-        f"Run `firecube zarr index rebuild --target {product_uri} --plugin {plugin_name} "
-        f"--product-name {product}` "
-        "(from Python: `firecube.ingestor.runtime.index_record.rebuild_index_record`) "
-        "to migrate."
+        Message(
+            "Legacy index record detected at {legacy_path}. Run `{rebuild}` to migrate.",
+            legacy_path=legacy_path,
+            rebuild=Operation(
+                "rebuild_index", target=product_uri, plugin=plugin_name, product_name=product
+            ),
+            product=product,
+            product_uri=product_uri,
+            plugin=plugin_name,
+        )
     )

@@ -457,6 +457,20 @@ def test_session_promotion_units_map_units_to_object_keys(tmp_path: Path) -> Non
     assert units.absent == {"parent/data/chunked/c/1/0", "parent/data/sharded/c/1/0"}
 
 
+def test_unit_object_key_of_a_root_array_names_the_stored_object(tmp_path: Path) -> None:
+    """A Zarr v3 array at the store root has path '', so its key has no leading slash."""
+    from firecube.core.zarr.guard.guarded_write import unit_store_key
+    from firecube.core.zarr.guard.unit_ownership import _unit_object_key
+
+    arr = zarr.create_array(str(tmp_path / "root.zarr"), shape=(2,), chunks=(2,), dtype="f4")
+    arr[:] = 1.0
+
+    key = _unit_object_key(arr, (0,))
+
+    assert key == unit_store_key(arr, (0,))
+    assert (tmp_path / "root.zarr" / key).is_file()
+
+
 def test_session_promotion_units_refuse_a_unit_no_guarded_write_reported(
     tmp_path: Path,
 ) -> None:

@@ -32,7 +32,7 @@ from firecube.core.controlplane.ranges import (
 from firecube.core.controlplane.ranges import (
     subtract_index_ranges as _subtract_index_ranges,
 )
-from firecube.core.errors import ManifestError
+from firecube.core.errors import ManifestError, Message, Operation, Placeholder
 from firecube.ingestor.runtime._metrics_helpers import _extract_timestamps_skipped
 from firecube.ingestor.types.context import (
     IngestResult,
@@ -143,15 +143,23 @@ class SpanRecorder:
                 slice_meta=meta,
             )
             if prior_spans and not coverage:
-                # Function-scope import: keeps the hint module out of CLI start-up.
-                from firecube.core.hints import abandon_run_command
-
                 product_uri = self._chunk_manager.get_product_root(product)
                 raise ManifestError(
-                    f"force_reingest refusing to commit replacement for product={product!r}: "
-                    f"prior_spans={len(prior_spans)} but new coverage is empty. "
-                    "This would erase active coverage. Abandon the run first:\n"
-                    f"  {abandon_run_command(product_uri, run_id)}"
+                    Message(
+                        "force_reingest refusing to commit replacement for product={product!r}: "
+                        "prior_spans={prior_spans} but new coverage is empty. "
+                        "This would erase active coverage. Abandon the run first:\n  {abandon}",
+                        product=product,
+                        prior_spans=len(prior_spans),
+                        abandon=Operation(
+                            "abandon_run",
+                            product_name=product_uri,
+                            run_id=run_id,
+                            reason=Placeholder('"<reason>"'),
+                        ),
+                        product_uri=product_uri,
+                        run_id=run_id,
+                    )
                 )
             replaced_span_keys, overwrites_by_coverage = _replacement_plan(
                 prior_spans=prior_spans,

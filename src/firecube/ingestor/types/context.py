@@ -21,6 +21,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from firecube.core.errors import FirecubeError
+
 from .result_metrics import (  # pyright: ignore[reportMissingImports]
     OutputPaths,
     ResultMetrics,
@@ -478,7 +480,13 @@ class PipelineBatch:
 
 @dataclass(slots=True, init=False)
 class PipelineResult:
-    """Result from a pipeline batch processing."""
+    """Result from a pipeline batch processing.
+
+    Attributes:
+        error: Why the batch failed, as text; `None` on success.
+        failure: The `FirecubeError` that failed the batch, so callers read its facts without
+            parsing `error`. `None` on success and for any other exception.
+    """
 
     batch: PipelineBatch
     output_format: str = "zarr"
@@ -490,6 +498,7 @@ class PipelineResult:
     success: bool = True
     error: str | None = None
     attempted: bool = True
+    failure: FirecubeError | None = None
 
     def __init__(
         self,
@@ -504,6 +513,7 @@ class PipelineResult:
         error: str | None = None,
         output_format: str = "zarr",
         attempted: bool = True,
+        failure: FirecubeError | None = None,
     ) -> None:
         self.batch = batch
         self.output_format = output_format
@@ -518,6 +528,7 @@ class PipelineResult:
         # already halted after an earlier failure; such results are
         # neither successes nor failures and never reach the batch hooks.
         self.attempted = attempted
+        self.failure = failure
 
     @property
     def output_path(self) -> Path | str | None:

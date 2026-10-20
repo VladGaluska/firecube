@@ -39,7 +39,7 @@ from firecube.core.controlplane.types import (
     DeletionPlan,
     WriteDomain,
 )
-from firecube.core.errors import ClaimConflictError, ManifestError
+from firecube.core.errors import ClaimConflictError, ManifestError, Message, Param
 from firecube.core.runtime import identity_from_storage_config
 from firecube.core.storage.uri import StorageUri
 from firecube.core.zarr.validation import _STATE_ARRAY_NAME
@@ -185,14 +185,23 @@ def _skipped_arrays_warning(span_key: str, time_dim_name: str, skipped: Sequence
     )
 
 
-def _no_time_indexed_array_message(time_dim_name: str, arrays: Sequence[str]) -> str:
+def _no_time_indexed_array_message(time_dim_name: str, arrays: Sequence[str]) -> Message:
     # Every array lacking the dim is also what a wrong time-dim name looks
     # like, so the refusal carries the same remediation as the resolver.
-    return (
-        f"no array in this span carries time dimension '{time_dim_name}'; refusing to mark "
-        f"it deleted (span arrays: {', '.join(arrays) or 'none'}). If the cube was written "
-        "with a different time dimension, pass it explicitly (CLI: --time-dim)."
+    return Message(
+        "no array in this span carries time dimension '{time_dim_name}'; refusing to mark "
+        "it deleted (span arrays: {arrays}). If the cube was written "
+        "with a different time dimension, pass it explicitly (CLI: {time_dim}).",
+        time_dim_name=time_dim_name,
+        arrays=", ".join(arrays) or "none",
+        time_dim=Param("time_dim"),
     )
+
+
+def _error_text(exc: BaseException) -> str:
+    """Return the `Message` an exception was raised with, else its text."""
+    first = exc.args[0] if exc.args else None
+    return first if isinstance(first, Message) else str(exc)
 
 
 def _decode_declared_float_fill(array_path: str, dtype: Any, units: str, declared: Any) -> Any:
@@ -605,8 +614,8 @@ class DeletionEngine:
             for product in product_list:
                 active_claims = self.repo.list_claims(product=product)
                 if active_claims:
-                    # Function-scope import: keeps the hint module out of CLI start-up.
-                    from firecube.core.hints import maintenance_refusal_message
+                    # Function-scope import: the manager module imports this one.
+                    from firecube.core.controlplane.manager import maintenance_refusal_message
 
                     details = ", ".join(
                         f"{claim.domain} (owner={claim.owner_id})" for claim in active_claims
@@ -626,10 +635,10 @@ class DeletionEngine:
                 self.repo.acquire_claim(product=acquiring, domain=domain, owner_id=owner_id)
                 acquired.append((acquiring, domain))
         except ClaimConflictError as exc:
-            # Function-scope import: keeps the hint module out of CLI start-up.
-            from firecube.core.hints import maintenance_refusal_message
+            # Function-scope import: the manager module imports this one.
+            from firecube.core.controlplane.manager import maintenance_refusal_message
 
-            detail = str(exc) or "write claim acquisition failed"
+            detail = _error_text(exc) or "write claim acquisition failed"
             blocking: list[ClaimInfo] = []
             with suppress(Exception):
                 blocking = self.repo.list_claims(product=acquiring)
@@ -1175,7 +1184,13 @@ class DeletionEngine:
                     ),
                 )
             except Exception as e:
-                errors.append(f"Failed to region-fill span {span.key}: {e}")
+                errors.append(
+                    Message(
+                        "Failed to region-fill span {span}: {error}",
+                        span=span.key,
+                        error=_error_text(e),
+                    )
+                )
                 return {"deleted_keys": 0, "deleted_spans": 0, "errors": errors}
             if skipped:
                 warnings.append(_skipped_arrays_warning(span.key, expected_time_dim_name, skipped))
@@ -1247,14 +1262,23 @@ class DeletionEngine:
                 # Raises like the unresolvable-axis error this replaces, so a
                 # wrong time-dim name still aborts delete_spans loudly.
                 raise ValueError(
-                    f"Span {span.key}: "
-                    + _no_time_indexed_array_message(
-                        expected_time_dim_name, [str(a) for a in arrays]
+                    Message(
+                        "Span {span}: {refusal}",
+                        span=span.key,
+                        refusal=_no_time_indexed_array_message(
+                            expected_time_dim_name, [str(a) for a in arrays]
+                        ),
                     )
                 )
 
         if not measured_aligned and not force:
-            errors.append(f"Span {span.key} is not time-chunk aligned; rerun with force=True")
+            errors.append(
+                Message(
+                    "Span {span} is not time-chunk aligned; rerun with {force}",
+                    span=span.key,
+                    force=Param("force", True),
+                )
+            )
             return {"deleted_keys": 0, "deleted_spans": 0, "errors": errors, "warnings": warnings}
 
         if not measured_aligned and force:
@@ -1308,9 +1332,14 @@ class DeletionEngine:
                     )
             elif not yes_i_really_mean_it:
                 errors.append(
-                    f"Span {span.key} shares physical chunks with other active spans: "
-                    f"{collateral_summary}. Re-run with yes_i_really_mean_it=True to "
-                    f"acknowledge the collateral destruction."
+                    Message(
+                        "Span {span} shares physical chunks with other active spans: "
+                        "{collateral}. Re-run with {confirm} to "
+                        "acknowledge the collateral destruction.",
+                        span=span.key,
+                        collateral=collateral_summary,
+                        confirm=Param("yes_i_really_mean_it", True),
+                    )
                 )
                 return {
                     "deleted_keys": 0,
@@ -1394,8 +1423,13 @@ class DeletionEngine:
                                     effective_ranges = expanded
                         except (FileNotFoundError, KeyError, ValueError) as exc:
                             errors.append(
-                                f"Span {span.key}: could not expand state ranges to chunk "
-                                f"boundaries from {state_path}: {exc}"
+                                Message(
+                                    "Span {span}: could not expand state ranges to chunk "
+                                    "boundaries from {array_path}: {error}",
+                                    span=span.key,
+                                    array_path=state_path,
+                                    error=_error_text(exc),
+                                )
                             )
                     update_timestamp_state(
                         store_uri=store_uri,
@@ -1506,7 +1540,13 @@ class DeletionEngine:
                     outcomes.append(
                         {
                             "warnings": [
-                                f"Span {span.key} is already replaced by an in-place fill (write_strategy=region_nan_fill); skipped. Rerun with force=True to fill it again."
+                                Message(
+                                    "Span {span} is already replaced by an in-place fill "
+                                    "(write_strategy=region_nan_fill); skipped. "
+                                    "Rerun with {force} to fill it again.",
+                                    span=span.key,
+                                    force=Param("force", True),
+                                )
                             ]
                         }
                     )

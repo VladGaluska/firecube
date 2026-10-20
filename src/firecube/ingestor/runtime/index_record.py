@@ -30,7 +30,12 @@ from typing import Any, Literal
 from firecube.core import observability
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.manager import check_legacy_index_record
-from firecube.core.errors import LegacyIndexRecordError, ManifestError, ResolvedIndexConflictError
+from firecube.core.errors import (
+    LegacyIndexRecordError,
+    ManifestError,
+    Message,
+    ResolvedIndexConflictError,
+)
 from firecube.core.index_resolve import ExtentUnknownError, ResolvedIndex, resolve_index_spec
 from firecube.core.observability.metrics import TelemetryService, emit_index_ensured_full
 from firecube.ingestor.errors import ConfigurationError
@@ -92,6 +97,12 @@ class IndexVerification:
     attrs_hash: str | None = None
     declared_hash: str | None = None
     detail: str | None = None
+
+
+def _text_keeping_message(exc: BaseException) -> str:
+    """Return the exception's `Message` when it carries one, else `str(exc)`, so the CLI can render it."""
+    first = exc.args[0] if exc.args else None
+    return first if isinstance(first, Message) else str(exc)
 
 
 def _plugin_context(target: str, *, run_id: str) -> PluginContext:
@@ -231,7 +242,7 @@ def rebuild_index_record(
             run_created = True
         except ResolvedIndexConflictError as exc:
             run_created = True
-            warn(str(exc))
+            warn(_text_keeping_message(exc))
             raise
         telemetry = TelemetryService(
             observability.create_ingestion_telemetry(
@@ -330,7 +341,7 @@ def verify_index_record(
             chunk_manager, product=product_name, plugin_name=plugin_name or product_name
         )
     except LegacyIndexRecordError as exc:
-        return IndexVerification(outcome="legacy-record", detail=str(exc))
+        return IndexVerification(outcome="legacy-record", detail=_text_keeping_message(exc))
 
     attrs_hash = chunk_manager.read_resolved_index_attrs_hash(product=product_name)
     if record is None:

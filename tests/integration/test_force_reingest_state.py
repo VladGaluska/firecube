@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+from firecube.cli._errors import render
 from firecube.core.controlplane import ChunkManager, SpanCoverage
 from firecube.core.controlplane.types import EVENT_REPLACEMENT_COMMITTED
 from firecube.core.errors import ManifestError, StorageError
@@ -237,7 +238,8 @@ def test_force_reingest_with_empty_coverage_refuses_and_keeps_prior_span(
                     slice_meta={"plugin": "test_product", "group": "F024"},
                     record_spans=record_spans,
                 )
-            run_hint(str(excinfo.value), "firecube chunks runs abandon", "--dry-run")
+            assert "ChunkManager.abandon_run" in str(excinfo.value)
+            run_hint(render(excinfo.value), "firecube chunks runs abandon", "--dry-run")
 
             current = _current_state(manager, product=product)
             assert current[prior_key]["status"] == "active"

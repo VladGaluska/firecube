@@ -19,6 +19,7 @@ from pathlib import Path
 
 import click
 
+from firecube.cli._errors import render
 from firecube.core.errors import ManifestError
 
 from ._common import confirm_deletion, parse_datetime, parse_meta_filters, parse_time_range
@@ -436,7 +437,7 @@ def delete_span_cmd(
             time_dim_name=time_dim,
         )
     except (ManifestError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     if dry_run:
         if result.get("region_filled_spans", 0):
@@ -465,7 +466,7 @@ def delete_span_cmd(
     if warnings_out:
         click.echo(f"\nWarnings: {len(warnings_out)}")
         for w in warnings_out[:10]:
-            click.echo(f"  - {w}")
+            click.echo(f"  - {render(w)}")
 
     collateral = result.get("collateral_spans") or []
     if collateral and not dry_run:
@@ -477,5 +478,5 @@ def delete_span_cmd(
     if errors:
         click.echo(f"\nErrors: {len(errors)}")
         for err in errors[:10]:
-            click.echo(f"  - {err}")
+            click.echo(f"  - {render(err)}")
         raise click.exceptions.Exit(1)

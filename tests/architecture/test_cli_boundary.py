@@ -54,59 +54,12 @@ _LOG_METHODS = frozenset(
     {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
 )
 
-_SE_TEXT = "UNTIL structured-errors: runtime text names CLI flags or commands"
-_SE = "UNTIL structured-errors: Click is still imported below the CLI"
-
 # Row tables. Key -> tag.
-_CLICK_ROWS: dict[str, str] = {
-    "src/firecube/core/config.py": _SE,
-    "src/firecube/ingestor/runtime/configure.py": _SE,
-}
+_CLICK_ROWS: dict[str, str] = {}
 _CLI_IMPORT_ROWS: dict[str, str] = {
     "src/firecube/__main__.py": "PERMANENT: python -m firecube is the CLI's own entry point",
 }
 # Text rows, one per line: "path below src/firecube | enclosing scope | sorted tokens".
-_CLI_TEXT_UNTIL = """
-core/config.py | StorageConfig.validate | --access-key, --secret-key
-core/controlplane/_snapshot.py | load_current_state | --product, firecube chunks
-core/controlplane/claims.py | FilesystemClaimService.clear_claim | --force
-core/controlplane/deletion.py | _no_time_indexed_array_message | --time-dim
-core/controlplane/manager.py | check_legacy_index_record | --plugin, --product-name, --target, firecube zarr
-core/controlplane/time_dim.py | resolve_span_time_dims | --time-dim
-core/controlplane/time_dim.py | resolve_time_dim_index | --time-dim
-core/intake.py | _storage_config_for_target | --storage-driver, --storage-type
-core/product/resolver.py | ProductResolver.resolve | --target
-core/product/target.py | ProductTarget._validate_driver_protocol | --storage-driver
-core/storage/completion.py | StorageCompleter.complete_s3_staged | --write-mode
-core/tensogram/metadata.py | extract_zarr_array_metadata | --storage-driver, --storage-type
-core/zarr/coord_consolidation.py | consolidate_time_coords | --time-dim
-core/zarr/coord_consolidation.py | _resolve_time_dim_for_group | --time-dim
-core/zarr/coord_materialization.py | materialize_regular_coord_array | --input-data, --input-data, --slot-end, --slot-start, firecube chunks, firecube chunks
-core/zarr/coord_materialization.py | stamp_coord_managed_marker | firecube chunks
-core/zarr/guard/chunk_geometry.py | staged_partial_unit_refusal | --write-mode
-core/zarr/guard/chunk_geometry.py | unit_ownership_refusal | --slot-end, --slot-start
-core/zarr/planning.py | resolve_per_group_slot_sizes | --slot-size, --slot-size
-core/zarr/region_writer.py | RegionZarrWriter.write_timestamp | --input-data, --product-name, --slot-end, --slot-start, --target, --write-mode, firecube zarr
-core/zarr/validation.py | validate_group_with_fs | --time-dim
-ingestor/config/coercion.py | coerce_cli_value | --option
-ingestor/config/engine.py | EngineConfig.__post_init__ | --slot-end, --slot-start
-ingestor/errors.py | AppendOverwriteRefused.__init__ | --option
-ingestor/runtime/base.py | BaseIngestor.discover_source_files | --input-data, --input-filters, --option
-ingestor/runtime/configure.py | TierConfigurator.configure | --config-file, --product-name, --show-options
-ingestor/runtime/configure.py | _validate_storage_driver | --storage-driver
-ingestor/runtime/engine.py | _create_batches_with_parallel_filter | --slot-end, --slot-start
-ingestor/runtime/parallel_gate.py | validate_parallel_capability | --slot-end, --slot-end, --slot-end, --slot-end, --slot-group, --slot-group, --slot-start, --slot-start, --slot-start, --slot-start
-ingestor/runtime/preallocate.py | _discover_engine_owned_values | --input-data
-ingestor/runtime/preallocate.py | _resolve_preallocate_windows | --slot-end, --slot-end, --slot-end, --slot-group, --slot-group, --slot-start, --slot-start
-ingestor/runtime/resume_guard.py | ResumeGuard._check_completed_spans_for_slot_overlap | --option, --slot-end, --slot-start
-ingestor/runtime/resume_guard.py | ResumeGuard._check_non_terminal_runs | --option
-ingestor/runtime/resume_guard.py | ResumeGuard._enforce | --option, --option, --option, --option, --option, --option, --option, --option, --option, --option, --option
-ingestor/runtime/slot_plan.py | _stored_time_units | firecube zarr
-ingestor/runtime/slot_plan.py | plan_slots | --input-data, --input-data, --no-resume, firecube zarr
-ingestor/templates/config.py | _validate_zarr_common | --option
-ingestor/templates/direct_zarr.py | _setup_global_zarr_schema | firecube zarr
-ingestor/templates/generic.py | GenericParquetIngestor.write_parquet | --storage-driver, --storage-type
-"""
 _CLI_TEXT_PERMANENT = {
     "core/controlplane/manager.py | ChunkManager._apply_slot_model_precedence | firecube will": (
         "PERMANENT: prose, the phrase firecube will not adopt it names no command"
@@ -119,29 +72,14 @@ _CLI_TEXT_PERMANENT = {
     ),
 }
 _CLI_TEXT_ROWS: dict[tuple[str, str, tuple[str, ...]], str] = {
-    **{
-        ("src/firecube/" + path.strip(), scope.strip(), tuple(tok.strip().split(", "))): _SE_TEXT
-        for path, scope, tok in (row.split(" | ") for row in _CLI_TEXT_UNTIL.strip().splitlines())
-    },
-    **{
-        ("src/firecube/" + p.strip(), sc.strip(), tuple(t.strip().split(", "))): tag
-        for row, tag in _CLI_TEXT_PERMANENT.items()
-        for p, sc, t in [row.split(" | ")]
-    },
+    ("src/firecube/" + p.strip(), sc.strip(), tuple(t.strip().split(", "))): tag
+    for row, tag in _CLI_TEXT_PERMANENT.items()
+    for p, sc, t in [row.split(" | ")]
 }
 # path -> tag; every CLI-text hit in the file is covered.
-_CLI_TEXT_FILE_ROWS: dict[str, str] = {
-    "src/firecube/core/hints.py": "UNTIL structured-errors: builds CLI commands for error hints",
-}
+_CLI_TEXT_FILE_ROWS: dict[str, str] = {}
 # (path, private module, import count) -> tag
-_PRIVATE_IMPORT_ROWS: dict[tuple[str, str, int], str] = {
-    ("src/firecube/cli/_input_filters.py", "firecube.core.formats._input_filters", 1): (
-        "UNTIL unscheduled: private core module imported by the CLI"
-    ),
-    ("src/firecube/cli/_typed_options.py", "firecube.core.formats._input_filters", 1): (
-        "UNTIL unscheduled: private core module imported by the CLI"
-    ),
-}
+_PRIVATE_IMPORT_ROWS: dict[tuple[str, str, int], str] = {}
 # path -> (cap, tag)
 _LINE_CEILING_ROWS: dict[str, tuple[int, str]] = {
     "src/firecube/cli/main.py": (963, "UNTIL unscheduled: module is over the ceiling"),

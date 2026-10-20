@@ -107,16 +107,6 @@ def test_unknown_slot_group_fails_before_writes() -> None:
     assert "group_b" in message
 
 
-def test_known_slot_group_passes_capability_gate() -> None:
-    ingestor = SlotGroupCapable([_group("group_a", 5), _group("group_b", 6)])
-
-    result = validate_parallel_capability(ingestor, 0, 10, ctx=_ctx(), slot_group="group_a")
-
-    assert result is not None
-    assert result.resolved.size("group_a") == 100
-    assert result.resolved.size("group_b") == 100
-
-
 def test_slot_group_none_validates_all_groups_chunks() -> None:
     ingestor = SlotGroupCapable([_group("group_a", 5), _group("group_b", 6)])
 

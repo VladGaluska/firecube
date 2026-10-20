@@ -38,6 +38,7 @@ from zarr.abc.store import Store
 from zarr.buffer import default_buffer_prototype
 
 from firecube.core.config import StorageConfig
+from firecube.core.errors import Message, Param
 from firecube.core.filesystem.ops import (
     _open_fsspec_url,  # type: ignore
     create_filesystem_for_uri,
@@ -820,28 +821,6 @@ def _extract_indices_from_key(full_path: str) -> list[int]:
     return indices
 
 
-def _walk_chunk_entries(fs, chunk_dir: str) -> list[str] | Any:
-    """Yield chunk file paths under a Zarr chunk directory."""
-    stack = [chunk_dir.rstrip("/")]
-    while stack:
-        current = stack.pop()
-        try:
-            entries = fs.ls(current, detail=True)
-        except FileNotFoundError:
-            continue
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("name") or "").rstrip("/")
-            entry_type = entry.get("type")
-            if entry_type in {"directory", "dir"}:
-                stack.append(name)
-                continue
-            if name:
-                yield name
-
-
 @dataclass(frozen=True)
 class _ArrayInfo:
     path: str
@@ -1383,9 +1362,13 @@ def validate_group_with_fs(
     for parent, time_dim in candidate_time_dims_by_parent.items():
         if time_dim is None and any(_parent_path(p) == parent for p in static_target_paths):
             info_notes.append(
-                f"static-marker check skipped for {parent or '/'}: "
-                "time dimension unknown (no state array); "
-                "pass --time-dim to enable the check"
+                Message(
+                    "static-marker check skipped for {group}: "
+                    "time dimension unknown (no state array); "
+                    "pass {time_dim} to enable the check",
+                    group=parent or "/",
+                    time_dim=Param("time_dim"),
+                )
             )
     static_marker_failures = _collect_static_marker_failures(
         all_metadata,

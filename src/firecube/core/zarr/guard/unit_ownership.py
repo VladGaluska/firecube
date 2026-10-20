@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from operator import index as operator_index
 from typing import Any
 
-from firecube.core.errors import ConfigurationError
+from firecube.core.errors import ConfigurationError, Message
 from firecube.core.zarr.guard._unit_locks import canonical_array_path
 from firecube.core.zarr.guard.chunk_geometry import (
     Bounds,
@@ -114,7 +114,7 @@ def require_window_owns_stored_units(
             )
         )
     if problems:
-        raise ConfigurationError("\n".join(problems))
+        raise ConfigurationError(Message.join("\n", problems))
 
 
 @dataclass(frozen=True)
@@ -227,7 +227,7 @@ def require_staged_units_fully_written(
                 )
             )
     if problems:
-        raise ConfigurationError("\n".join(problems))
+        raise ConfigurationError(Message.join("\n", problems))
 
 
 def _touched_units_per_array(
@@ -253,7 +253,8 @@ def _touched_units_per_array(
 
 
 def _unit_object_key(arr: Any, unit: tuple[int, ...]) -> str:
-    return f"{arr.path}/{arr.metadata.chunk_key_encoding.encode_chunk_key(unit)}"
+    key = arr.metadata.chunk_key_encoding.encode_chunk_key(unit)
+    return f"{arr.path}/{key}" if arr.path else key
 
 
 def staged_unit_object_keys(root: Any | None, touched: Sequence[StagedSlotWrite]) -> frozenset[str]:
@@ -367,15 +368,17 @@ def require_planned_slots_fill_units(
                         unit_kind=unit_kind,
                         unit_shape=unit_shape,
                         unit_cells=((first, end),),
-                        detail=(
-                            f"window [{window[0]}, {window[1]}) has no source item for "
-                            f"slots {_format_slots(missing)}"
+                        detail=Message(
+                            "window [{slot_window[0]}, {slot_window[1]}) has no source item for "
+                            "slots {slots}",
+                            slot_window=tuple(window),
+                            slots=_format_slots(missing),
                         ),
                     )
                 )
                 break
     if problems:
-        raise ConfigurationError("\n".join(problems))
+        raise ConfigurationError(Message.join("\n", problems))
 
 
 def _format_slots(slots: Sequence[int], limit: int = 6) -> str:

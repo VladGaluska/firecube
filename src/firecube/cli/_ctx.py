@@ -21,6 +21,7 @@ from typing import Any
 
 import click
 
+from firecube.cli._errors import render
 from firecube.core.config import StorageConfig, load_config_file
 from firecube.core.runtime import identity_from_storage_config, resolve_storage_config
 
@@ -65,7 +66,9 @@ def get_storage_config(
             set_global=set_global,
         )
     except Exception as exc:
-        raise click.ClickException(f"Failed to resolve storage configuration: {exc}") from exc
+        raise click.ClickException(
+            f"Failed to resolve storage configuration: {render(exc)}"
+        ) from exc
 
     if cache and overrides is None:
         ctx.obj["storage_config"] = storage_config

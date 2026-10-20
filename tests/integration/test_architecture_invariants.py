@@ -23,10 +23,13 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import MagicMock, patch
 
+import click
 import numpy as np
 import pytest
 import zarr
 
+from firecube.cli._errors import render
+from firecube.cli.main import cli
 from firecube.core.config import StorageConfig, derive_target_uri
 from firecube.core.controlplane import ChunkManager
 from firecube.core.errors import StorageError
@@ -491,10 +494,12 @@ def test_obstore_duckdb_remote_hard_error() -> None:
         RuntimeError,
         match=(
             "DuckDB remote parquet is not supported under storage_driver=obstore\\. "
-            "Re-run this command with --storage-driver=fsspec\\."
+            "Re-run this command with storage_driver=fsspec\\."
         ),
-    ):
+    ) as refused:
         session.duckdb.apply(con)
+    validate = cli.commands["parquet"].commands["validate"]  # type: ignore[attr-defined]
+    assert render(refused.value, click.Context(validate)).endswith("with --storage-driver=fsspec.")
 
     local_resolved = ProductTarget.resolve(
         "/tmp/data.parquet",

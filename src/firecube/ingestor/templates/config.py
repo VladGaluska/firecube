@@ -24,14 +24,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast, get_type_hints
 
-from firecube.core.errors import ConfigurationError
+from firecube.core.errors import CommandName, ConfigurationError, Message, PluginOption
 from firecube.ingestor.config.engine import config_keys
 
 T = TypeVar("T", bound="TemplateConfig")
 
-ZARR_MULTI_RES_REMOVED_MESSAGE = (
+ZARR_MULTI_RES_REMOVED_MESSAGE = Message(
     "zarr_multi_res during ingest has been removed; "
-    "run 'firecube zarr multires <target>' after ingestion instead."
+    "run '{multires} <target>' after ingestion instead.",
+    multires=CommandName(("zarr", "multires"), library="ZarrMultiresBuilder.build"),
 )
 
 
@@ -131,9 +132,12 @@ def _validate_zarr_common(
 
     if sharding and chunk_shape is not None and shard_shape is None:
         raise ConfigurationError(
-            "zarr_sharding=true requires zarr_shard_shape when zarr_chunk_shape is set. "
-            "Provide zarr_shard_shape to complete the sharding configuration. "
-            'Example: --option \'zarr_shard_shape={"time":10,"lat":100,"lon":100}\''
+            Message(
+                "zarr_sharding=true requires zarr_shard_shape when zarr_chunk_shape is set. "
+                "Provide zarr_shard_shape to complete the sharding configuration. "
+                "Example: {example}",
+                example=PluginOption("zarr_shard_shape", '{"time":10,"lat":100,"lon":100}'),
+            )
         )
 
     if shard_shape is not None and chunk_shape is not None:

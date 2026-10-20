@@ -26,9 +26,16 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import click
 
+from firecube.cli._errors import echo_rendered, render
 from firecube.cli._formatter import FirecubeGroup
 from firecube.core.controlplane import ChunkManager
-from firecube.core.errors import ManifestError, ResolvedIndexConflictError
+from firecube.core.errors import (
+    ManifestError,
+    Message,
+    Operation,
+    ResolvedIndexAttrsConflictError,
+    ResolvedIndexConflictError,
+)
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
@@ -62,7 +69,7 @@ def _load_record(manager: ChunkManager, product_name: str) -> Any | None:
     try:
         return manager.get_resolved_index(product=product_name)
     except ManifestError as exc:
-        click.echo(str(exc), err=True)
+        click.echo(render(exc), err=True)
         raise click.exceptions.Exit(1) from exc
 
 
@@ -137,7 +144,7 @@ def _derived_coordinates_for_group(
         epoch_dt = datetime.datetime.fromisoformat(epoch_str.replace("Z", "+00:00"))
     except (ValueError, TypeError) as exc:
         raise click.ClickException(
-            f"Group {group_name!r}: cannot parse epoch {epoch_str!r}: {exc}"
+            f"Group {group_name!r}: cannot parse epoch {epoch_str!r}: {render(exc)}"
         ) from exc
 
     delta = datetime.timedelta(seconds=cadence_s)
@@ -248,27 +255,38 @@ def verify_cmd(target: str, product_name: str, plugin: str | None) -> None:
             cause = exc.__cause__
             if isinstance(cause, click.ClickException):
                 raise cause  # noqa: B904 - re-raise the plugin's exception as it was raised
-            raise click.ClickException(str(exc)) from exc
-        _render_verification(verification)
+            raise click.ClickException(render(exc)) from exc
+        _render_verification(
+            verification,
+            rebuild=Operation(
+                "rebuild_index", target=target, plugin=plugin, product_name=product_name
+            ),
+        )
     finally:
         manager.close()
 
 
-def _render_verification(verification: IndexVerification) -> None:
-    """Echo a verification verdict; exit 1 on drift or an unusable record, 3 without one."""
+def _render_verification(verification: IndexVerification, *, rebuild: Operation) -> None:
+    """Echo a verification verdict; exit 1 on drift or an unusable record, 3 without one.
+
+    `rebuild` is the `zarr index rebuild` call, with this invocation's values, that the
+    attrs advice prints.
+    """
     outcome = verification.outcome
     if outcome in ("unreadable-record", "legacy-record"):
-        click.echo(str(verification.detail), err=True)
+        detail = verification.detail
+        click.echo(str(detail) if detail is None else render(detail), err=True)
         raise click.exceptions.Exit(1)
     if outcome == "attrs-without-record":
-        click.echo(
+        advice = Message(
             "attrs drift — root attr has resolved-index identity hash but no "
-            "on-disk record; `firecube zarr index rebuild` refuses this state. "
+            "on-disk record; `{rebuild}` refuses this state. "
             "Restore `.firecube/index/current.json`, or remove the root attrs "
             "`firecube_resolved_index_identity_hash` and `firecube_resolved_index` "
-            "and run `firecube zarr index rebuild` with the plugin that wrote the data.",
-            err=True,
+            "and run `{rebuild}` with the plugin that wrote the data.",
+            rebuild=rebuild,
         )
+        click.echo(render(advice), err=True)
         raise click.exceptions.Exit(1)
     if outcome == "no-record":
         _exit_no_record()
@@ -282,14 +300,15 @@ def _render_verification(verification: IndexVerification) -> None:
         )
         raise click.exceptions.Exit(1)
     if outcome == "attrs-drift":
-        click.echo(
+        advice = Message(
             "attrs drift — root attr diverges from on-disk record; "
-            "`firecube zarr index rebuild` refuses this state. "
+            "`{rebuild}` refuses this state. "
             "Remove the root attr `firecube_resolved_index_identity_hash`, "
-            "then run `firecube zarr index rebuild`: it writes the attr again "
+            "then run `{rebuild}`: it writes the attr again "
             "from the record.",
-            err=True,
+            rebuild=rebuild,
         )
+        click.echo(render(advice), err=True)
         raise click.exceptions.Exit(1)
     if verification.attrs_hash is None:
         click.echo(
@@ -319,14 +338,16 @@ def rebuild_cmd(target: str, plugin: str, product_name: str) -> None:
                 target=target,
                 product_name=product_name,
                 logger=logger,
-                report=click.echo,
-                warn=functools.partial(click.echo, err=True),
+                report=echo_rendered,
+                warn=functools.partial(echo_rendered, err=True),
             )
         except IndexRecordError as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(render(exc)) from exc
         except ResolvedIndexConflictError as exc:
             # The library has already echoed the conflict through ``warn``.
             raise click.exceptions.Exit(1) from exc
+        except ResolvedIndexAttrsConflictError as exc:
+            raise click.ClickException(render(exc)) from exc
     finally:
         with contextlib.suppress(Exception):
             manager.close()

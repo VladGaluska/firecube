@@ -54,6 +54,7 @@ from typing import Any, ClassVar
 import pytest
 from click.testing import CliRunner
 
+from firecube.cli._errors import render
 from firecube.cli.main import cli
 from firecube.core.api import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.core.controlplane.claims import ClaimHandle
@@ -394,7 +395,10 @@ def test_preallocate_failure_logs_runnable_recovery_commands(
     finally:
         logging.getLogger("firecube.cli.zarr").removeHandler(handler)
 
-    logs = {r.getMessage().split(" ")[2]: r.getMessage() for r in log_records}
+    logs = {r.getMessage().split(" ")[2]: r.msg for r in log_records}  # the logged `Message`
+    assert "ChunkManager.clear_claim" in logs["release"]
+    assert "ChunkManager.abandon_run" in logs["record"]
+    assert "firecube chunks" not in logs["release"] + logs["record"]
     run_id = logs["record"].split("preallocate run ")[1].split(": ")[0]
 
     def run_statuses() -> list[str]:
@@ -404,9 +408,9 @@ def test_preallocate_failure_logs_runnable_recovery_commands(
     try:
         assert _coord_materialization_claims_on_disk(target) != []
         assert run_statuses() == ["started"]
-        run_hint(logs["release"], "firecube chunks claims clear", "--yes-i-really-mean-it")
+        run_hint(render(logs["release"]), "firecube chunks claims clear", "--yes-i-really-mean-it")
         assert _coord_materialization_claims_on_disk(target) == []
-        run_hint(logs["record"], "firecube chunks runs abandon", "--yes-i-really-mean-it")
+        run_hint(render(logs["record"]), "firecube chunks runs abandon", "--yes-i-really-mean-it")
         assert run_statuses() == ["abandoned"]
     finally:
         for handle in held:

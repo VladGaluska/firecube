@@ -496,3 +496,23 @@ def test_library_refuses_marker_hidden_by_subgroup_consolidated_snapshot(tmp_pat
     assert ATTR_PREALLOCATED not in arr.attrs
     assert tuple(arr.chunks) == (1,)
     np.testing.assert_array_equal(np.asarray(arr[:]), before)
+
+
+@pytest.mark.contract
+def test_library_two_time_coordinate_candidates_carry_group_and_time_dim_option(
+    tmp_path: Path,
+) -> None:
+    """The refusal exposes the group and the `time_dim` option as context, not as text to parse."""
+    cube = tmp_path / "cube.zarr"
+    _create_multi_group_legacy_cube(cube, ("data",))
+    values = _EPOCH + np.arange(4, dtype=np.int64) * _CADENCE_NS
+    zarr.open_group(str(cube), mode="r+").require_group("data").create_array(
+        "valid_time", data=values, dimension_names=("valid_time",)
+    )
+
+    with pytest.raises(ConfigurationError) as refused:
+        consolidate_time_coords(
+            target=f"file://{cube}", product_name=cube.name, storage_config=_local_storage()
+        )
+
+    assert (refused.value.context.group, refused.value.context.options) == ("/data", ("time_dim",))

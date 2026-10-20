@@ -21,6 +21,7 @@ from typing import Any
 
 import click
 
+from firecube.cli._errors import render
 from firecube.cli._product import require_full_uri
 from firecube.cli._shared_options import dry_run_flag, yes_flag
 from firecube.core.controlplane.types import AbandonSweepResult
@@ -161,7 +162,7 @@ def list_cmd(
         try:
             product_uri = StorageUri.parse(target)
         except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise click.UsageError(render(exc)) from exc
     else:
         product_name, product_uri = resolve_cli_product(product_name)
     manager = resolve_manager(ctx, workspace, product_uri=product_uri, product_name=product_name)
@@ -303,7 +304,7 @@ def abandon_cmd(
         try:
             product_uri = StorageUri.parse(target)
         except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise click.UsageError(render(exc)) from exc
     else:
         product_name, product_uri = resolve_cli_product(product_name)
 
@@ -322,7 +323,7 @@ def abandon_cmd(
                 dry_run=effective_dry_run,
             )
         except ManifestError as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(render(exc)) from exc
         _echo_abandon_sweep_result(
             product_name=product_name,
             result=result,
@@ -350,6 +351,6 @@ def abandon_cmd(
     try:
         result = manager.abandon_run(product=product_name, run_id=run_id, reason=reason)
     except ManifestError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     _echo_abandon_run_result(product_name=product_name, run_id=run_id, result=result)

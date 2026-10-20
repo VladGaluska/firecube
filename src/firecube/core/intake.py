@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 import xarray as xr
 
 from firecube.core.config import StorageConfig
+from firecube.core.errors import Message, Param
 from firecube.core.filesystem import create_filesystem
 from firecube.core.filesystem.store_factory import ZarrStoreHandle
 from firecube.core.product.identity import ProductIdentity
@@ -69,11 +70,6 @@ class CatalogSourceSpec:
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
-def _group_path(store_root: str, group: str) -> str:
-    group_clean = (group or "").strip("/")
-    return store_root.rstrip("/") if not group_clean else f"{store_root.rstrip('/')}/{group_clean}"
-
-
 def _group_target_uri(store_uri: str, group: str | None) -> str:
     group_clean = (group or "").strip("/")
     return store_uri.rstrip("/") if not group_clean else f"{store_uri.rstrip('/')}/{group_clean}"
@@ -99,7 +95,12 @@ def _storage_config_for_target(
             anonymous=storage_session.driver.anonymous,
         )
     raise ValueError(
-        "storage_config is required for catalog generation; pass --storage-type and --storage-driver"
+        Message(
+            "storage_config is required for catalog generation; pass {storage_type} and {storage_driver}",
+            storage_type=Param("storage_type"),
+            storage_driver=Param("storage_driver"),
+            product_uri=target_uri,
+        )
     )
 
 

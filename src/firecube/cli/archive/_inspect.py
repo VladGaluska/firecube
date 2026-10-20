@@ -24,6 +24,7 @@ from typing import Any
 
 import click
 
+from firecube.cli._errors import render
 from firecube.cli._shared_options import (
     archive_uri_option,
 )
@@ -123,7 +124,7 @@ def info(ctx: click.Context, archive: str, output_format: str) -> None:
     try:
         info_dict = tgm_info(local_path, operation="firecube archive info")
     except TensogramArchiveError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     _echo_archive_info(
         info_dict,

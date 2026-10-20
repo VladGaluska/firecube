@@ -386,4 +386,6 @@ def test_preallocate_product_refuses_window_beyond_extent_before_creating_arrays
 
     assert isinstance(excinfo.value, ConfigurationError)
     assert "1001" in str(excinfo.value) and "1000" in str(excinfo.value)
+    context = excinfo.value.context
+    assert (context.group, "slot_end" in context.options) == ("data", True)
     assert not (target_path / "data").exists()

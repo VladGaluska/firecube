@@ -229,7 +229,7 @@ def test_floor_mode_existing_unmarked_array_refuses_legacy_shell(
     ingested = np.datetime64("2024-01-01T00:00:02", "ns")
     root["data/time"][10] = ingested
 
-    with pytest.raises(SchemaDriftError, match=r"legacy.*firecube chunks"):
+    with pytest.raises(SchemaDriftError, match=r"legacy.*`ChunkManager` tooling"):
         materialize_regular_coord_array(
             writer=writer,
             root=root,

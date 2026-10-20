@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import click
+from firecube.core.errors import ConfigFileError, Message, Param
 
 try:  # Python 3.12+
     import tomllib  # type: ignore[import-not-found]
@@ -92,7 +92,12 @@ class StorageConfig:
         # If either key/secret is provided, require both to avoid half-configured clients.
         if (self.access_key is not None) != (self.secret_key is not None):
             raise ValueError(
-                "StorageConfig requires both --access-key and --secret-key when using explicit credentials"
+                Message(
+                    "StorageConfig requires both {access_key} and {secret_key} "
+                    "when using explicit credentials",
+                    access_key=Param("access_key"),
+                    secret_key=Param("secret_key"),
+                )
             )
 
 
@@ -134,8 +139,8 @@ def load_config_file(path: Path | str | None = None, *, strict: bool = False) ->
 
     Returns an empty dict when no config exists or TOML support is unavailable.
 
-    When ``strict=True``, raises ``click.UsageError`` if the file declares any
-    unknown top-level section. Internal callers leave ``strict=False`` so that
+    When ``strict=True``, raises ``ConfigFileError`` if TOML support is missing, the
+    file is missing or malformed, or it declares any unknown top-level section. Internal callers leave ``strict=False`` so that
     config files shared with sibling firecube tools (which may define their own
     top-level sections) continue to load; the CLI entry point opts into strict
     mode so typos in user-facing config files surface at startup.
@@ -147,12 +152,12 @@ def load_config_file(path: Path | str | None = None, *, strict: bool = False) ->
 
     if tomllib is None:
         if strict:
-            raise click.UsageError("TOML support unavailable (Python 3.12+ required)")
+            raise ConfigFileError("toml_unavailable", path=path)
         return {}
 
     if not path.exists():
         if strict:
-            raise click.UsageError(f"Config file not found: {path}")
+            raise ConfigFileError("not_found", path=path)
         return {}
 
     with path.open("rb") as handle:
@@ -160,21 +165,23 @@ def load_config_file(path: Path | str | None = None, *, strict: bool = False) ->
             data = tomllib.load(handle)
         except Exception as exc:
             if strict:
-                raise click.UsageError(f"Failed to parse config file {path}: {exc}") from exc
+                raise ConfigFileError("parse_failed", path=path, detail=str(exc)) from exc
             return {}
 
     data = data or {}
     if strict:
-        _reject_unknown_top_level_sections(data)
+        _reject_unknown_top_level_sections(data, path)
     return data
 
 
-def _reject_unknown_top_level_sections(data: dict[str, Any]) -> None:
+def _reject_unknown_top_level_sections(data: dict[str, Any], path: Path) -> None:
     unknown = [key for key in data if key not in KNOWN_TOP_LEVEL_SECTIONS]
     if unknown:
-        raise click.UsageError(
-            f"Unknown config section(s) {sorted(unknown)!r}. "
-            f"Valid sections: {sorted(KNOWN_TOP_LEVEL_SECTIONS)}"
+        raise ConfigFileError(
+            "unknown_sections",
+            path=path,
+            unknown_sections=unknown,
+            valid_sections=KNOWN_TOP_LEVEL_SECTIONS,
         )
 
 

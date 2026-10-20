@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, cast
 import click
 
 from firecube.cli._ctx import get_storage_config
-from firecube.cli._errors import wrap_user_facing_errors
+from firecube.cli._errors import echo_rendered, render, wrap_user_facing_errors
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
 from firecube.cli._product import require_full_uri, resolve_product_identity
 from firecube.cli._typed_options import TypedOptionsParam
@@ -252,21 +252,21 @@ def preallocate(
                 slot_end=resolved_slot_end,
                 slot_group=resolved_slot_group,
                 dry_run=dry_run,
-                report=click.echo,
+                report=echo_rendered,
                 warn=_echo_err,
                 on_dry_run_group=_echo_dry_run_group,
                 logger=logger,
             )
         except SlotWindowError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise click.UsageError(render(exc)) from exc
     finally:
         with contextlib.suppress(Exception):
             chunk_manager.close()
 
 
 def _echo_err(line: str) -> None:
-    """Print one line to stderr."""
-    click.echo(line, err=True)
+    """Print one line to stderr, rendered for the running command."""
+    echo_rendered(line, err=True)
 
 
 def _echo_dry_run_group(preview: PreallocateDryRunGroup) -> None:

@@ -35,17 +35,17 @@ from collections.abc import Mapping
 from enum import Enum, auto
 from typing import Any
 
-import click
-
 from firecube.core.config import DATABASE_DUCKDB_KEYS
 from firecube.core.controlplane import ChunkManager
-from firecube.core.formats._input_filters import reject_legacy_input_patterns
+from firecube.core.errors import Message, Param
+from firecube.core.formats.input_filters import reject_legacy_input_patterns
 from firecube.ingestor.config.engine import (
     SYSTEM_KEYS,
     EngineConfig,
     config_keys,
     is_experimental_option_key,
 )
+from firecube.ingestor.errors import RemovedConfigKeyError
 from firecube.ingestor.templates.config import TemplateConfig
 from firecube.ingestor.types.config import PluginConfig
 from firecube.ingestor.types.context import (
@@ -103,11 +103,7 @@ class TierConfigurator:
         reject_legacy_input_patterns(options)
 
         if "output_name" in options:
-            raise click.UsageError(
-                "Config key 'output_name' is no longer accepted. "
-                "Use '--product-name' or 'default_product_name' instead.\n"
-                "Edit the CLI invocation or the config file passed via --config-file."
-            )
+            raise RemovedConfigKeyError("output_name")
 
         engine_keys = config_keys(EngineConfig)
         template_keys = (
@@ -122,9 +118,14 @@ class TierConfigurator:
         }
         if unknown:
             raise ValueError(
-                f"Unknown configuration options for {self._plugin_name}: "
-                f"{', '.join(sorted(unknown))}. Use --show-options to see valid keys. "
-                f"Experimental options must use the x_ prefix (e.g. x_foo=...)."
+                Message(
+                    "Unknown configuration options for {plugin}: {unknown}. "
+                    "Use {show_options} to see valid keys. "
+                    "Experimental options must use the x_ prefix (e.g. x_foo=...).",
+                    plugin=self._plugin_name,
+                    unknown=", ".join(sorted(unknown)),
+                    show_options=Param("show_options"),
+                )
             )
 
         engine_opts = {k: options[k] for k in engine_keys if k in options}
@@ -176,7 +177,7 @@ def configure_ingestor(
 
     Raises:
         ValueError: If ``options`` holds a key no tier owns.
-        click.UsageError: If ``options`` holds the removed ``output_name`` key.
+        RemovedConfigKeyError: If ``options`` holds the removed ``output_name`` key.
     """
     resolved_options = dict(options)
     if input_filters is not None:
@@ -240,8 +241,12 @@ def _validate_storage_driver(storage_driver: Any, *, storage_type: str) -> None:
         require_obstore()
         if storage_type not in ("local", "s3"):
             raise ValueError(
-                f"Storage driver 'obstore' supports 'local' and 's3' storage types, "
-                f"got '{storage_type}'. Use --storage-driver fsspec instead."
+                Message(
+                    "Storage driver 'obstore' supports 'local' and 's3' storage types, "
+                    "got '{storage_type}'. Use {driver} instead.",
+                    storage_type=storage_type,
+                    driver=Param("storage_driver", "fsspec"),
+                )
             )
         log = logging.getLogger(__name__)
         log.info("Using obstore storage driver for all I/O (experimental)")

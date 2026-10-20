@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-LEGACY_INPUT_PATTERNS_MESSAGE = (
-    "include_patterns has been removed; use --input-filters '[\"*.csv\"]' "
-    'or input_filters = ["*.csv"] in configuration.'
+from firecube.core.errors import Message, Param
+
+LEGACY_INPUT_PATTERNS_MESSAGE = Message(
+    "include_patterns has been removed; use {input_filters} "
+    'or input_filters = ["*.csv"] in configuration.',
+    input_filters=Param("input_filters", '["*.csv"]'),
 )
 
 

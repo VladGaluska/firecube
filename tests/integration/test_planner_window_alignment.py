@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+from firecube.cli._errors import render
 from firecube.core.controlplane import ChunkManager
 from firecube.core.index_resolve import resolve_index_spec
 from firecube.core.index_spec import IndexSpec, RegularTimeAxis
@@ -131,8 +132,10 @@ def test_sub_chunk_window_with_concurrent_conflict_refuses(tmp_path) -> None:
         assert "coordinate chunk(s) [0]" in message
         assert "active-run" in message
         assert "state: started" in message
-        assert "--run-id active-run " in message
-        run_hint(message, "firecube chunks runs abandon", "--dry-run")
+        assert "ChunkManager.abandon_run" in message and "--run-id" not in message
+        printed = render(exc_info.value)
+        assert "--run-id active-run " in printed
+        run_hint(printed, "firecube chunks runs abandon", "--dry-run")
     finally:
         manager.close()
 
@@ -185,7 +188,8 @@ def test_window_straddling_chunk_boundary_refuses(tmp_path) -> None:
         assert "coordinate chunk(s) [0]" in message
         assert "chunk0-run" in message
         assert "state: started" in message
-        assert "chunks runs abandon" in message
+        assert "ChunkManager.abandon_run" in message and "chunks runs abandon" not in message
+        assert "chunks runs abandon" in render(exc_info.value)
     finally:
         manager.close()
 
@@ -208,8 +212,10 @@ def test_whole_extent_refusal_names_a_runnable_abandon_command(tmp_path) -> None
             _assert_window(manager, (256, 512), whole_extent_groups={_GROUP: 512})
         message = str(exc_info.value)
         assert "engine-owned arrays, which preallocate writes whole" in message
-        assert "--run-id live-peer " in message
-        run_hint(message, "firecube chunks runs abandon", "--dry-run")
+        assert "ChunkManager.abandon_run" in message and "--run-id" not in message
+        printed = render(exc_info.value)
+        assert "--run-id live-peer " in printed
+        run_hint(printed, "firecube chunks runs abandon", "--dry-run")
     finally:
         manager.close()
 

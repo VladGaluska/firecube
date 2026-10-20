@@ -14,12 +14,18 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
 from pathlib import Path
 
-import click
 import pytest
+from click.testing import CliRunner
 
+import firecube.core.errors as errors
+from firecube.cli.main import cli
 from firecube.core.config import get_plugin_defaults, load_config_file
+
+pytestmark = pytest.mark.contract
 
 
 def _write_config(tmp_path: Path, content: str) -> Path:
@@ -47,10 +53,12 @@ def test_unknown_top_level_section_is_rejected_in_strict_mode(tmp_path: Path) ->
         '[bogus_section]\nkey = "value"\n',
     )
 
-    with pytest.raises(click.UsageError) as exc_info:
+    with pytest.raises(errors.ConfigFileError) as exc_info:
         load_config_file(config_path, strict=True)
 
-    assert "bogus_section" in str(exc_info.value)
+    exc = exc_info.value
+    assert (exc.reason, list(exc.unknown_sections)) == ("unknown_sections", ["bogus_section"])
+    assert "storage" in exc.valid_sections
 
 
 def test_unknown_top_level_section_is_tolerated_in_non_strict_mode(tmp_path: Path) -> None:
@@ -98,18 +106,54 @@ def test_known_top_level_sections_are_accepted_in_strict_mode(tmp_path: Path) ->
 
 
 def test_missing_config_file_raises_in_strict_mode(tmp_path: Path) -> None:
-    """load_config_file with strict=True MUST raise click.UsageError for missing file."""
     missing = tmp_path / "missing.toml"
-    with pytest.raises(click.UsageError, match="not found"):
+    with pytest.raises(errors.ConfigFileError) as exc_info:
         load_config_file(missing, strict=True)
+    assert (exc_info.value.reason, exc_info.value.path) == ("not_found", missing)
 
 
 def test_malformed_toml_raises_in_strict_mode(tmp_path: Path) -> None:
-    """load_config_file with strict=True MUST raise click.UsageError for malformed TOML."""
     bad = tmp_path / "bad.toml"
     bad.write_text("[storage\ntype = 'local'")  # Missing ] - invalid TOML
-    with pytest.raises(click.UsageError, match=r"parse|TOML|Failed"):
+    with pytest.raises(errors.ConfigFileError) as exc_info:
         load_config_file(bad, strict=True)
+    assert exc_info.value.reason == "parse_failed"
+
+
+def test_missing_toml_support_raises_config_file_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("firecube.core.config.tomllib", None)
+    with pytest.raises(errors.ConfigFileError) as exc_info:
+        load_config_file(Path("any.toml"), strict=True)
+    assert exc_info.value.reason == "toml_unavailable"
+
+
+def test_cli_exits_2_with_unknown_section_text(tmp_path: Path) -> None:
+    bad = _write_config(tmp_path, "[bogus_section]\nkey = 1\n")
+    args = f"--config-file {bad} ingest cli_test_plugin --target {tmp_path.as_uri()}/q.zarr"
+    result = CliRunner().invoke(cli, f"{args} --product-name qa --write-mode direct".split())
+    assert result.exit_code == 2
+    assert result.output.endswith(
+        "Error: Unknown config section(s) ['bogus_section']. Valid sections: "
+        "['archive', 'database', 'metrics', 'plugins', 'storage']\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "reason, extra",
+    [
+        ("toml_unavailable", {}),
+        ("not_found", {}),
+        ("parse_failed", {"detail": "bad"}),
+        ("unknown_sections", {"unknown_sections": ["x"], "valid_sections": ["storage"]}),
+    ],
+)
+@pytest.mark.parametrize("how", ["pickle", "copy"])
+def test_config_file_error_survives_pickle_and_copy(reason, extra, how) -> None:
+    err = errors.ConfigFileError(reason, path=Path("/x/c.toml"), **extra)
+    setattr(err, "sentinel", "kept")  # noqa: B010
+    clone = pickle.loads(pickle.dumps(err)) if how == "pickle" else copy.copy(err)
+    assert type(clone) is type(err) and str(clone) == str(err) and clone.args == err.args
+    assert vars(clone) == vars(err) and clone.reason == reason  # facts and sentinel
 
 
 def test_missing_config_file_returns_empty_in_permissive_mode(tmp_path: Path) -> None:
