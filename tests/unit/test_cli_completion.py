@@ -34,14 +34,13 @@ def test_cli_completion_scripts(subtests: Any, tmp_path: Path) -> None:
 
     with table_row(subtests, "completion_zsh_script_to_file", tmp_path):
         runner = CliRunner()
-        with runner.isolated_filesystem():
-            target = Path("completion/_firecube")
-            result = runner.invoke(
-                cli,
-                ["completion", "zsh", "--output", str(target)],
-                catch_exceptions=False,
-            )
-            assert result.exit_code == 0
-            assert target.exists()
-            content = target.read_text()
-            assert "_FIRECUBE_COMPLETE" in content
+        target = tmp_path / "completion" / "_firecube"
+        result = runner.invoke(
+            cli,
+            ["completion", "zsh", "--output", str(target)],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert target.exists()
+        content = target.read_text()
+        assert "_FIRECUBE_COMPLETE" in content
