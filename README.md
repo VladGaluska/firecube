@@ -137,9 +137,9 @@ available as optional runtime extras:
 | `h5py` | 3.16.0 | BSD-3-Clause |  | https://www.h5py.org/ | Direct dependency. |
 | `dask` | 2026.6.0 | BSD-3-Clause |  | https://github.com/dask/dask/ | Direct dependency. |
 | `prometheus-client` | 0.26.0 | Apache-2.0 AND BSD-2-Clause |  | https://github.com/prometheus/client_python | Direct dependency. |
-| `opentelemetry-sdk` | 1.44.0 | Apache-2.0 |  | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-sdk | Direct dependency. |
-| `opentelemetry-exporter-otlp` | 1.44.0 | Apache-2.0 |  | https://github.com/open-telemetry/opentelemetry-python/tree/main/exporter/opentelemetry-exporter-otlp | Direct dependency. |
-| `click` | 8.4.2 | BSD-3-Clause |  | https://github.com/pallets/click | Direct dependency. |
+| `opentelemetry-sdk` | 1.45.1 | Apache-2.0 |  | https://github.com/open-telemetry/opentelemetry-python/tree/main/opentelemetry-sdk | Direct dependency. |
+| `opentelemetry-exporter-otlp` | 1.45.1 | Apache-2.0 |  | https://github.com/open-telemetry/opentelemetry-python/tree/main/exporter/opentelemetry-exporter-otlp | Direct dependency. |
+| `click` | 8.5.0 | BSD-3-Clause |  | https://github.com/pallets/click | Direct dependency. |
 | `packaging` | 26.2 | Apache-2.0 OR BSD-2-Clause |  | https://github.com/pypa/packaging | Direct dependency; dual-licensed, either licence may be used. |
 | `obstore` | 0.11.0 | MIT |  | https://developmentseed.org/obstore | Direct optional `obstore` extra dependency. |
 | `tensogram` | 0.22.0 | Apache-2.0 |  | https://sites.ecmwf.int/docs/tensogram/main | Direct optional `tensogram` extra dependency. |
@@ -147,7 +147,7 @@ available as optional runtime extras:
 | `tensogram-zarr` | 0.22.0 | Apache-2.0 |  | https://sites.ecmwf.int/docs/tensogram/main | Direct optional `tensogram` extra dependency. |
 | `healpix-geo` | 0.2.1 | Apache-2.0 |  | https://pypi.org/project/healpix-geo/ | Direct optional `healpix` extra dependency. |
 | `trollsift` | 1.0.1 | Apache-2.0 |  | https://pypi.org/project/trollsift/ | Direct optional `patterns` extra dependency. |
-| `virtualizarr` | 2.7.1 | Apache-2.0 |  | https://github.com/zarr-developers/VirtualiZarr | Direct optional `virtualzarr` extra dependency. |
+| `virtualizarr` | 2.7.3 | Apache-2.0 |  | https://github.com/zarr-developers/VirtualiZarr | Direct optional `virtualzarr` extra dependency. |
 
 ### Direct Build, Edit, And Test Dependencies
 
@@ -166,7 +166,7 @@ documentation, or testing:
 | `moto` | 5.2.2 | Development tools | Apache-2.0 |  | https://github.com/getmoto/moto | Direct optional `test` extra dependency. |
 | `griffelib` | 2.1.0 | Development tools | ISC |  | https://pypi.org/project/griffelib/ | Direct optional `test` extra dependency; static docstring inspection for the API docs coverage test. |
 | `pytest` | 9.1.1 | Development tools | MIT |  | https://docs.pytest.org/en/latest/ | Direct `dev` dependency group entry. |
-| `ruff` | 0.16.5 | Development tools | MIT |  | https://docs.astral.sh/ruff | Direct `dev` dependency group entry. |
+| `ruff` | 0.16.7 | Development tools | MIT |  | https://docs.astral.sh/ruff | Direct `dev` dependency group entry. |
 | `pytest-cov` | 7.1.0 | Development tools | MIT |  | https://pytest-cov.readthedocs.io/en/latest/changelog.html | Direct `dev` dependency group entry. |
 | `pytest-xdist` | 3.8.0 | Development tools | MIT |  | https://github.com/pytest-dev/pytest-xdist | Direct `dev` dependency group entry. |
 | `pytest-mock` | 3.15.1 | Development tools | MIT |  | https://github.com/pytest-dev/pytest-mock/ | Direct `dev` dependency group entry. |
@@ -175,7 +175,7 @@ documentation, or testing:
 | `mkdocs` | 1.6.1 | Development tools | BSD-2-Clause |  | https://github.com/mkdocs/mkdocs | Direct `docs` dependency group entry. |
 | `mkdocs-material` | 9.7.7 | Development tools | MIT |  | https://github.com/squidfunk/mkdocs-material | Direct `docs` dependency group entry. |
 | `mkdocstrings` | 1.0.4 | Development tools | ISC |  | https://mkdocstrings.github.io | Direct `docs` dependency group entry. |
-| `mkdocstrings-python` | 2.0.5 | Development tools | ISC |  | https://mkdocstrings.github.io/python | Direct `docs` dependency group entry. |
+| `mkdocstrings-python` | 2.0.8 | Development tools | ISC |  | https://mkdocstrings.github.io/python | Direct `docs` dependency group entry. |
 | `mkdocs-mermaid2-plugin` | 1.2.3 | Development tools | MIT |  | https://github.com/fralau/mkdocs-mermaid2-plugin | Direct `docs` dependency group entry. |
 | `mkdocs-click` | 0.9.0 | Development tools | Apache-2.0 |  | https://github.com/mkdocs/mkdocs-click | Direct `docs` dependency group entry. |
 | `mkdocs-macros-plugin` | 1.5.0 | Development tools | MIT |  | https://github.com/fralau/mkdocs_macros_plugin | Direct `docs` dependency group entry. |
