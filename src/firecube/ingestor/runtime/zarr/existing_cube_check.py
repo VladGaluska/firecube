@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 from firecube.core.filesystem import create_filesystem
 from firecube.core.product.identity import ProductIdentity
@@ -156,16 +156,39 @@ def _normalize_group_path(group_path: str) -> str:
 
 def _array_metadata_records(fs: Any, group_uri: StorageUri) -> list[_ArrayMetadata]:
     records: list[_ArrayMetadata] = []
-    group_prefix = group_uri.path.rstrip("/") + "/"
 
-    for uri in fs.find(group_uri):
-        if uri.path == group_uri.join("zarr.json").path or not uri.path.endswith("/zarr.json"):
-            continue
-        relative = uri.path.removeprefix(group_prefix)
-        parts = [part for part in relative.split("/") if part]
-        if len(parts) != 2 or parts[1] != "zarr.json" or parts[0] == _INTERNAL_STATE_ARRAY:
-            continue
-        metadata = _read_json(fs, uri)
+    # One level of the group, never its chunk objects: listing the whole group costs
+    # time linear in the objects under it. ``refresh=True`` lists the store again (s3fs
+    # answers ``ls`` from a listing cache that never expires). The names are ordered by
+    # their ``<name>/zarr.json`` keys, the order ``fs.find`` lists them in.
+    #
+    # Each child's ``zarr.json`` is read first, never probed with ``exists``: the read is
+    # a GET. On s3fs, ``exists`` and the size lookup that ``cat_file`` makes before its
+    # GET can answer from a listing cache that another process has made stale, so a
+    # child created by a parallel pod would look absent. Only a read that finds nothing
+    # falls back to listing the child once with ``refresh=True``; a fresh listing of the
+    # child settles whether ``zarr.json`` is there. Any other error propagates.
+    children = sorted(
+        {
+            name
+            for entry in fs.ls(group_uri, detail=True, refresh=True)
+            if entry.get("type") == "directory"
+            and (name := str(entry["name"]).rstrip("/").rpartition("/")[2])
+            and name != _INTERNAL_STATE_ARRAY
+        },
+        key=lambda name: f"{name}/zarr.json",
+    )
+    for name in children:
+        uri = group_uri.join(name, "zarr.json")
+        try:
+            metadata = _read_json(fs, uri)
+        except FileNotFoundError:
+            listing = fs.ls(group_uri.join(name), detail=False, refresh=True)
+            if not any(
+                str(entry).rstrip("/").rpartition("/")[2] == "zarr.json" for entry in listing
+            ):
+                continue
+            metadata = _read_json(fs, uri)
         records.append(
             _ArrayMetadata(
                 name=_array_name(uri),
@@ -255,22 +278,6 @@ def _raise_mismatch(target_uri: str, group_path: str, existing: str, declared_di
         f"but plugin declared '{declared_dim}'.\n"
         "Refusing to append. Rebuild the cube with the declared time dimension "
         "or migrate the existing cube before appending."
-    )
-
-
-def _raise_unknown_time_dim(
-    target_uri: str,
-    group_path: str,
-    array_name: str,
-    dim_names: Sequence[str],
-    declared_dim: str,
-) -> NoReturn:
-    raise ConfigurationError(
-        f"Existing cube at {target_uri} group '{group_path}' array '{array_name}' "
-        f"has dimensions {list(dim_names)!r}, but none match declared time dimension "
-        f"'{declared_dim}' or known legacy time dimensions "
-        f"('{_LEGACY_TIME_DIM}', '{_CF_TIME_DIM}'). Refusing to append because "
-        "Firecube cannot determine time dimension safely."
     )
 
 

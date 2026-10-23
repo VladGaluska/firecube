@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import importlib
+from typing import Any
 
 import pytest
 
@@ -25,36 +26,32 @@ storage_session_module = importlib.import_module("firecube.core.storage.session"
 StorageUri = importlib.import_module("firecube.core.storage.uri").StorageUri
 
 
-def test_local_session_upload_raises_typed_error(monkeypatch, temp_workspace):
-    class _BrokenFs:
-        def open(self, *args, **kwargs):
-            _ = (args, kwargs)
-            raise OSError("write failed")
+def _assert_cause_is_write_failure(error: StorageError) -> None:
+    cause = error.__cause__
+    assert isinstance(cause, OSError), f"wrong cause: {cause!r}"
+    assert str(cause) == "write failed"
 
-    def _fake_create_filesystem(_binding):
-        return _BrokenFs()
 
-    monkeypatch.setattr(storage_session_module, "create_filesystem", _fake_create_filesystem)
-
-    source_file = temp_workspace / "sample.bin"
-    source_file.write_bytes(b"abc")
-
-    session = make_test_session(temp_workspace)
-
-    with pytest.raises(StorageError):
-        session.upload_tree(
-            StorageUri.from_local_path(source_file),
-            StorageUri.from_local_path(temp_workspace / "output.zarr"),
-            parallel_workers=1,
-        )
+_UPLOAD_ROWS: tuple[tuple[str, dict[str, Any], str | None], ...] = (
+    # (row id, make_test_session kwargs, target)
+    ("local_session_upload_raises_typed_error", {}, None),
+    (
+        "s3_session_upload_raises_typed_error",
+        {"protocol": "s3", "authority": "bucket"},
+        "s3://bucket/product",
+    ),
+)
 
 
 @pytest.mark.unit
-def test_s3_session_upload_raises_typed_error(monkeypatch, temp_workspace):
+def test_session_upload_raises_typed_error(subtests, monkeypatch, temp_workspace):
     class _BrokenFs:
         def open(self, *args, **kwargs):
             _ = (args, kwargs)
             raise OSError("write failed")
+
+        def capabilities(self) -> set[type]:
+            return set()
 
     def _fake_create_filesystem(_binding):
         return _BrokenFs()
@@ -64,11 +61,18 @@ def test_s3_session_upload_raises_typed_error(monkeypatch, temp_workspace):
     source_file = temp_workspace / "sample.bin"
     source_file.write_bytes(b"abc")
 
-    session = make_test_session(temp_workspace, protocol="s3", authority="bucket")
+    for row_id, session_kwargs, target in _UPLOAD_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            session = make_test_session(temp_workspace, **session_kwargs)
+            destination = (
+                StorageUri.parse(target)
+                if target
+                else StorageUri.from_local_path(temp_workspace / "output.zarr")
+            )
 
-    with pytest.raises(StorageError):
-        session.upload_tree(
-            StorageUri.from_local_path(source_file),
-            StorageUri.parse("s3://bucket/product"),
-            parallel_workers=1,
-        )
+            with pytest.raises(StorageError) as excinfo:
+                session.upload_tree(
+                    StorageUri.from_local_path(source_file), destination, parallel_workers=1
+                )
+
+            _assert_cause_is_write_failure(excinfo.value)

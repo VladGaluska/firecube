@@ -14,35 +14,26 @@
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
+from typing import Any
 
 from firecube.core.config import build_storage_config
+from tests.helpers.rows import table_row
 
 
-def test_storage_type_precedence_env_over_config(monkeypatch) -> None:
-    monkeypatch.setenv("FIRECUBE_STORAGE_TYPE", "s3")
-
+def test_storage_type_precedence(subtests: Any, tmp_path: Path) -> None:
     cfg = {"storage": {"type": "local"}}
-
-    storage_config = build_storage_config(cfg, os.environ, {})
-
-    assert storage_config.storage_type == "s3"
-
-
-def test_storage_type_precedence_cli_over_env_over_config(monkeypatch) -> None:
-    monkeypatch.setenv("FIRECUBE_STORAGE_TYPE", "s3")
-
-    cfg = {"storage": {"type": "local"}}
-    overrides = {"storage_type": "local"}
-
-    storage_config = build_storage_config(cfg, os.environ, overrides)
-
-    assert storage_config.storage_type == "local"
-
-
-def test_storage_type_falls_back_to_config_when_no_env_or_cli() -> None:
-    cfg = {"storage": {"type": "local"}}
-
-    storage_config = build_storage_config(cfg, {}, {})
-
-    assert storage_config.storage_type == "local"
+    # (row id, environment, CLI overrides, expected storage type)
+    rows: tuple[tuple[str, dict[str, str], dict[str, Any], str], ...] = (
+        ("test_storage_type_precedence_env_over_config", {"FIRECUBE_STORAGE_TYPE": "s3"}, {}, "s3"),
+        (
+            "test_storage_type_precedence_cli_over_env_over_config",
+            {"FIRECUBE_STORAGE_TYPE": "s3"},
+            {"storage_type": "local"},
+            "local",
+        ),
+        ("test_storage_type_falls_back_to_config_when_no_env_or_cli", {}, {}, "local"),
+    )
+    for row_id, env, overrides, expected in rows:
+        with table_row(subtests, row_id, tmp_path):
+            assert build_storage_config(cfg, env, overrides).storage_type == expected

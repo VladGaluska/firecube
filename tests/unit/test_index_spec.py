@@ -15,12 +15,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
+import numpy as np
 import pytest
 
-from firecube.core.api import AUTO, IrregularTimeAxis, RegularTimeAxis
+from firecube.core.api import AUTO, IrregularTimeAxis, ItemInfo, RegularTimeAxis
 from firecube.core.index_spec import _canonical_coordinate_value
 from firecube.ingestor.api import AUTO as INGESTOR_AUTO
+from tests.helpers.rows import table_row
 
 
 def test_irregular_time_axis_accepts_auto() -> None:
@@ -37,22 +41,14 @@ def test_irregular_time_axis_accepts_concrete_sequence() -> None:
     assert axis.values == (1, 2, 3)
 
 
-def test_irregular_time_axis_rejects_empty_sequence() -> None:
-    try:
-        IrregularTimeAxis(coordinate="time", values=[])
-    except ValueError as exc:
-        assert "non-empty" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("empty sequence was accepted")
-
-
-def test_irregular_time_axis_rejects_duplicate_values() -> None:
-    try:
-        IrregularTimeAxis(coordinate="time", values=[1, 1])
-    except ValueError as exc:
-        assert "duplicates" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("duplicate values were accepted")
+def test_irregular_time_axis_rejects_invalid_values(subtests: Any, tmp_path: Path) -> None:
+    rows = (
+        ("test_irregular_time_axis_rejects_empty_sequence", [], "non-empty"),
+        ("test_irregular_time_axis_rejects_duplicate_values", [1, 1], "duplicates"),
+    )
+    for row_id, values, message in rows:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(ValueError, match=message):
+            IrregularTimeAxis(coordinate="time", values=values)
 
 
 def test_irregular_time_axis_normalizes_list_to_tuple() -> None:
@@ -97,3 +93,13 @@ def test_canonical_coordinate_value_timezone_canonicalization(
     expected: object,
 ) -> None:
     assert _canonical_coordinate_value(value) == expected
+
+
+def test_item_info_values_are_copied_read_only_and_outside_the_hash():
+    buffer = np.array(1.5)
+    info = ItemInfo(coordinate=0, values={"lon": buffer})
+    buffer[...] = 9.0
+    assert info == ItemInfo(coordinate=0, values={"lon": 1.5})
+    assert hash(info) == hash(ItemInfo(coordinate=0))
+    with pytest.raises(TypeError):
+        info.values["lon"] = 2.0  # pyright: ignore[reportIndexIssue, reportOptionalSubscript]

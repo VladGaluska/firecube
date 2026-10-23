@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -317,3 +318,16 @@ def test_env_unbounded_slot_group_raises_usage_error(
     assert "resolvable extent" in combined or "unbounded" in combined, (
         f"error must explain the group has no resolvable extent; got {combined!r}"
     )
+
+
+def test_repro_env_slot_group_error_names_only_options_preallocate_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_slot_env(monkeypatch)
+    monkeypatch.setenv("FIRECUBE_SLOT_GROUP", "definitely_not_a_real_group")
+    result = CliRunner().invoke(cli, _preallocate_args(tmp_path / "bogus-group.zarr"))
+    assert result.exit_code != 0, result.output
+    command = cast(Any, cli).commands["zarr"].commands["preallocate"]
+    known = {opt for param in command.params for opt in param.opts} | {"--help"}
+    printed = set(re.findall(r"--[a-z][\w-]*", result.output))
+    assert "definitely_not_a_real_group" in result.output and printed <= known, printed - known

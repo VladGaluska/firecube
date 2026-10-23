@@ -18,10 +18,10 @@ from typing import Any, get_type_hints
 
 import click
 
-from firecube.cli._errors import UnknownOptionError
+from firecube.cli._errors import UnknownOptionError, render
 from firecube.cli._shared_options import format_option as display_format_option
 from firecube.cli.plugins.registry import PluginConfigSchemas, resolve_plugin_configs
-from firecube.core.formats._input_filters import LEGACY_INPUT_PATTERNS_MESSAGE
+from firecube.core.formats.input_filters import LEGACY_INPUT_PATTERNS_MESSAGE
 from firecube.ingestor.config.coercion import coerce_cli_value
 from firecube.ingestor.config.engine import is_experimental_option_key
 from firecube.ingestor.errors import ConfigurationError
@@ -111,7 +111,7 @@ class TypedOptionsParam(click.ParamType):
             self.fail(f"Option value for '{key}' cannot be empty.", param, ctx)
 
         if key == "include_patterns":
-            self.fail(LEGACY_INPUT_PATTERNS_MESSAGE, param, ctx)
+            self.fail(render(LEGACY_INPUT_PATTERNS_MESSAGE, ctx), param, ctx)
 
         owning_flag = _TYPED_FLAG_OWNED_KEYS.get(key)
         if owning_flag is not None:
@@ -141,7 +141,7 @@ class TypedOptionsParam(click.ParamType):
                     try:
                         return key, coerce_cli_value(raw_value, target_type, key)
                     except (ConfigurationError, TypeError, ValueError) as exc:
-                        self.fail(str(exc), param, ctx)
+                        self.fail(render(exc, ctx), param, ctx)
             except (ImportError, AttributeError, KeyError):
                 pass
 

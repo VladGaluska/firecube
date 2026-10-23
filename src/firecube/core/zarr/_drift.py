@@ -45,7 +45,7 @@ from typing import Any
 import numpy as np
 import zarr
 
-from firecube.core.zarr.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr.guard.chunk_geometry import chunk_index_to_region
 
 __all__ = [
     "GroupAttrsDiff",

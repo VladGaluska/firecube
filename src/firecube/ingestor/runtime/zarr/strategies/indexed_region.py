@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import replace
 from operator import index as operator_index
@@ -39,8 +40,18 @@ from firecube.core.uris import storage_uri_from_target
 from firecube.core.zarr._drift import (
     arrays_equal_missing_aware as _arrays_equal_missing_aware,
 )
-from firecube.core.zarr.chunk_geometry import physical_chunk_keys_for_region
-from firecube.core.zarr.region_writer import RegionZarrWriter
+from firecube.core.zarr.guard._layout import resolve_effective_layout, warn_default_layout
+from firecube.core.zarr.guard.chunk_geometry import physical_chunk_keys_for_region
+from firecube.core.zarr.guard.engine_owned import is_engine_owned_spec, is_pod_written_slot_array
+from firecube.core.zarr.guard.guarded_write import WriteResult
+from firecube.core.zarr.guard.metadata_authority import (
+    HeldClaim,
+    MetadataAuthority,
+    adopt_held_claim,
+    ensure_group,
+)
+from firecube.core.zarr.guard.unit_ownership import require_window_owns_stored_units
+from firecube.core.zarr.region_writer import RegionZarrWriter, open_root_read_only
 from firecube.ingestor.runtime.coverage import CoverageTracker
 from firecube.ingestor.runtime.parallel_evidence import log_filter_evidence
 
@@ -67,12 +78,59 @@ def _session_for_store(store_uri: str, storage_config: StorageConfig) -> Storage
 log = logging.getLogger("firecube.runtime.zarr.strategies.indexed_region")
 
 
-@contextlib.contextmanager
-def _array_write_empty_chunks_config(write_empty_chunks: bool):
-    import zarr as _zarr
+def ensure_group_ancestors(writer: RegionZarrWriter, group: str) -> None:
+    """Create the root and the missing parents of *group* under the writer's own authority.
 
-    with _zarr.config.set({"array.write_empty_chunks": write_empty_chunks}):
-        yield
+    An authority built from a claim over one group covers that group's
+    subtree only, so it may not create the nodes above it. Those are created
+    empty, when absent, under the writer's ``PROCESS_LOCAL`` authority over
+    the whole store (the threads of this process are excluded, other
+    processes are not), before the claim's authority is used.
+    """
+    root = writer._open_root()
+    parent = "/".join(p for p in group.split("/") if p).rpartition("/")[0]
+    if parent:
+        ensure_group(writer.authority, root, parent)
+
+
+def require_intents_in_slot_window(
+    group_to_intents: Mapping[str, Sequence[Any]],
+    slot_range: tuple[int, int],
+    slot_group: str | None,
+) -> None:
+    """Refuse an intent addressing a slot outside the assigned half-open window.
+
+    With ``slot_group`` set only that group's intents are checked; the others
+    are skipped with a warning (this pod does not own them). Static intents
+    carry no time semantics and are exempt.
+
+    Raises:
+        WriteIntentRangeError: An intent's ``ts_index`` is outside ``slot_range``.
+    """
+    slot_start, slot_end = slot_range
+    for group_name, intents in group_to_intents.items():
+        if slot_group is not None and group_name != slot_group:
+            if intents:
+                log.warning(
+                    "slot_group=%r: skipping %d intent(s) for group %r "
+                    "(this pod does not own that group)",
+                    slot_group,
+                    len(intents),
+                    group_name,
+                )
+            continue
+        for intent in intents:
+            if getattr(intent, "kind", None) == "static":
+                continue
+            ts = getattr(intent, "ts_index", None)
+            if ts is not None and not (slot_start <= ts < slot_end):
+                from firecube.ingestor.errors import WriteIntentRangeError
+
+                raise WriteIntentRangeError(
+                    f"Intent ts_index={ts} for group={group_name!r} is outside "
+                    f"assigned slot_range=[{slot_start}, {slot_end}). "
+                    "Plugin filter is advisory; this is a correctness violation."
+                )
 
 
 # Reserved array attr stamped once a static (write-once) array's data has been
@@ -148,19 +206,26 @@ class IndexedRegionStrategy:
         suppress_static_emission_for_non_owner: bool = False,
         static_owner_slot_start: int | None = None,
         zarr_write_empty_chunks: bool = False,
+        on_write: Callable[[WriteResult], None] | None = None,
+        track_units: bool = False,
     ) -> dict[str, Any]:
-        """Dispatch write intents into the store under a scoped Zarr config.
+        """Dispatch write intents into the store.
 
         Implements `RegionWriteStrategy.write_groups` and adds the DirectZarr
         knobs: static-write ownership and the ``write_empty_chunks`` setting,
-        which is applied only for the duration of this call so it cannot leak
-        into other Zarr operations in the same process.
+        which is applied to each array this call writes and never to
+        ``zarr.config``, so it cannot leak into other threads or Zarr
+        operations in the same process.
 
         Args:
             group_to_intents: Write intents to dispatch, keyed by group path.
             schema: Array specs used for schema setup and drift checks.
             claim_for_group: Called as ``(group)`` to obtain a write claim
-                guarding schema setup.
+                guarding schema setup. When its scope yields a `HeldClaim`,
+                the schema step and the static write-once markers change
+                ``zarr.json`` under an authority adopted from that claim,
+                over the group's subtree; otherwise under the writer's own
+                ``PROCESS_LOCAL`` authority.
             claim_for_slot: Called as ``(group, ts_index)`` to obtain a
                 per-slot write claim guarding intent dispatch.
             slot_range: Half-open ``(start, stop)`` slot window this caller
@@ -176,28 +241,39 @@ class IndexedRegionStrategy:
                 writes, compared against this run's own slot start.
             zarr_write_empty_chunks: Whether to persist chunks holding only
                 fill values. ``False`` keeps sparse arrays compact.
+            on_write: Called on the writing thread with the `WriteResult` of
+                every payload write (see `RegionZarrWriter`).
+            track_units: Report in each `WriteResult` which touched units
+                hold no object after the write. Requires ``on_write``.
 
         Returns:
             Write metrics for the call, including
             ``zarr_write_empty_chunks_effective``.
+
+        Raises:
+            ValueError: ``track_units`` is set without ``on_write``.
         """
-        with _array_write_empty_chunks_config(zarr_write_empty_chunks):
-            result = self._write_groups_unscoped(
-                group_to_intents=group_to_intents,
-                schema=schema,
-                claim_for_group=claim_for_group,
-                claim_for_slot=claim_for_slot,
-                slot_range=slot_range,
-                slot_group=slot_group,
-                codec_pipelines_by_array=codec_pipelines_by_array,
-                region_write_concurrency=region_write_concurrency,
-                suppress_static_emission_for_non_owner=suppress_static_emission_for_non_owner,
-                static_owner_slot_start=static_owner_slot_start,
-            )
+        if track_units and on_write is None:
+            raise ValueError("track_units=True reports to on_write; pass on_write as well")
+        result = self._write_groups(
+            group_to_intents=group_to_intents,
+            schema=schema,
+            claim_for_group=claim_for_group,
+            claim_for_slot=claim_for_slot,
+            slot_range=slot_range,
+            slot_group=slot_group,
+            codec_pipelines_by_array=codec_pipelines_by_array,
+            region_write_concurrency=region_write_concurrency,
+            suppress_static_emission_for_non_owner=suppress_static_emission_for_non_owner,
+            static_owner_slot_start=static_owner_slot_start,
+            zarr_write_empty_chunks=zarr_write_empty_chunks,
+            on_write=on_write,
+            track_units=track_units,
+        )
         result["zarr_write_empty_chunks_effective"] = zarr_write_empty_chunks
         return result
 
-    def _write_groups_unscoped(
+    def _write_groups(
         self,
         *,
         group_to_intents: dict[str, list[Any]],
@@ -210,6 +286,9 @@ class IndexedRegionStrategy:
         region_write_concurrency: int = 1,
         suppress_static_emission_for_non_owner: bool = False,
         static_owner_slot_start: int | None = None,
+        zarr_write_empty_chunks: bool = False,
+        on_write: Callable[[WriteResult], None] | None = None,
+        track_units: bool = False,
     ) -> dict[str, Any]:
         """Execute write intents grouped by Zarr group and return metrics.
 
@@ -220,7 +299,8 @@ class IndexedRegionStrategy:
                 the constructor-provided schema if ``None``.
             claim_for_group: Optional callback returning a context manager for
                 group/schema coordination.  When ``claim_for_slot`` is
-                provided, this protects schema setup only.
+                provided, this protects schema setup and the static
+                write-once markers only.
             claim_for_slot: Optional callback returning a context manager for
                 per-``ts_index`` intent dispatch.  Falls back to
                 ``claim_for_group`` and then a null context when omitted.
@@ -240,6 +320,9 @@ class IndexedRegionStrategy:
                 ``static_owner_slot_start``.
             static_owner_slot_start: V1 scalar owner ``slot_start`` for one
                 group per run.
+            zarr_write_empty_chunks: Passed to every writer this call builds.
+            on_write: Passed to every writer this call builds.
+            track_units: Passed to every writer this call builds.
 
         Returns:
             dict with ``"coverage"`` list and ``"duration_s"`` float.
@@ -275,40 +358,13 @@ class IndexedRegionStrategy:
         region_writes_aligned_count = 0
 
         if slot_range is not None:
-            slot_start, slot_end = slot_range
             all_intents = [
                 intent
                 for intents in group_to_intents.values()
                 for intent in intents
                 if hasattr(intent, "ts_index")
             ]
-            for group_name, intents in group_to_intents.items():
-                # Phase 3.1 T7: When slot_group is set, only validate that group's
-                # intents; skip + warn for other groups (this pod does not own them).
-                if slot_group is not None and group_name != slot_group:
-                    if intents:
-                        log.warning(
-                            "slot_group=%r: skipping %d intent(s) for group %r "
-                            "(this pod does not own that group)",
-                            slot_group,
-                            len(intents),
-                            group_name,
-                        )
-                    continue
-                for intent in intents:
-                    if getattr(intent, "kind", None) == "static":
-                        # Static arrays carry no time semantics; ts_index is
-                        # semantically ignored, so slot-range bounds do not apply.
-                        continue
-                    ts = getattr(intent, "ts_index", None)
-                    if ts is not None and not (slot_start <= ts < slot_end):
-                        from firecube.ingestor.errors import WriteIntentRangeError
-
-                        raise WriteIntentRangeError(
-                            f"Intent ts_index={ts} for group={group_name!r} is outside "
-                            f"assigned slot_range=[{slot_start}, {slot_end}). "
-                            "Plugin filter is advisory; this is a correctness violation."
-                        )
+            require_intents_in_slot_window(group_to_intents, slot_range, slot_group)
             log_filter_evidence(
                 log,
                 stage="post_intent_assertion",
@@ -317,6 +373,13 @@ class IndexedRegionStrategy:
                 filtered_count=len(all_intents),
                 dropped_count=0,
             )
+            # Before any write of this batch, every group: the window must own
+            # every stored unit its writes touch.
+            written_paths = self._pod_written_paths(group_to_intents, schema_by_group, slot_group)
+            if written_paths:
+                require_window_owns_stored_units(
+                    self._stored_root_read_only(), written_paths, slot_range
+                )
 
         for group_name, intents in group_to_intents.items():
             # Phase 3.1 T7: When slot_group is set, skip writes for other groups
@@ -332,18 +395,12 @@ class IndexedRegionStrategy:
                     arr.name for arr in group_spec.arrays if not getattr(arr, "time_indexed", True)
                 )
                 coord_names = coord_names | static_names
-            zarr_store = None
-            if self._storage_config:
-                session = self._session or _session_for_store(self._store_uri, self._storage_config)
-                zarr_store = session.zarr.create_store(
-                    uri=storage_uri_from_target(self._store_uri),
-                    mode="a",
-                ).store
-            writer = RegionZarrWriter(
-                self._store_uri,
-                store=zarr_store,
-                coord_names=coord_names,
-                time_coord_name=self._time_coord_name,
+            writer = self._new_writer(
+                coord_names,
+                zarr_write_empty_chunks,
+                on_write=on_write,
+                track_units=track_units,
+                fixed_extent=slot_range is not None,
             )
 
             intents_with_ts = [
@@ -367,13 +424,14 @@ class IndexedRegionStrategy:
             # Skip the claim and the ensure in that mode only; single-pod runs keep
             # the claim-then-ensure ordering byte-for-byte unchanged.
             parallel_mode = slot_range is not None
-            schema_ctx = (
-                contextlib.nullcontext()
-                if parallel_mode or claim_for_group is None
-                else claim_for_group(group_name)
-            )
-            with schema_ctx:
+            with self._schema_authority(
+                writer, group_name, None if parallel_mode else claim_for_group
+            ) as authority:
                 if group_spec is not None and not parallel_mode:
+                    # Under a held claim its authority; otherwise the writer's own.
+                    auth_kw: dict[str, Any] = (
+                        {"authority": authority} if authority is not None else {}
+                    )
                     for arr_spec in group_spec.arrays:
                         if arr_spec.time_indexed:
                             expected_time_count = getattr(arr_spec, "expected_time_count", None)
@@ -393,14 +451,22 @@ class IndexedRegionStrategy:
                             if codec_pipelines_by_array is not None
                             else (None, None, None)
                         )
+                        array_path = f"{group_name}/{arr_spec.name}"
+                        layout = resolve_effective_layout(
+                            arr_spec,
+                            coord_name=self._time_coord_name,
+                            # Static arrays (possibly rank 0) have no time extent.
+                            time_count=effective_shape[0] if arr_spec.time_indexed else 0,
+                            engine_owned=is_engine_owned_spec(arr_spec),
+                        )
                         writer.ensure_group(
-                            f"{group_name}/{arr_spec.name}",
+                            array_path,
                             shape=effective_shape,
                             dtype=arr_spec.dtype,
                             fill_value=arr_spec.fill_value,
-                            chunks=arr_spec.chunks,
+                            chunks=layout.chunks,
                             allow_grow=allow_grow,
-                            shards=arr_spec.shards,
+                            shards=layout.shards,
                             attrs=arr_spec.attrs,
                             dimension_names=_schema_dimension_names(
                                 arr_spec,
@@ -409,8 +475,18 @@ class IndexedRegionStrategy:
                             filters=filters,
                             serializer=serializer,
                             compressors=compressors,
+                            # Warns once: only the batch that creates the array
+                            # applies the default; later batches open it as stored.
+                            on_create=(
+                                (lambda _arr, p=array_path, lay=layout: warn_default_layout(p, lay))
+                                if layout.is_default
+                                else None
+                            ),
+                            **auth_kw,
                         )
-                    writer.set_group_attrs(group_name, getattr(group_spec, "attrs", None))
+                    writer.set_group_attrs(
+                        group_name, getattr(group_spec, "attrs", None), **auth_kw
+                    )
 
             static_intents = [
                 intent for intent in intents if getattr(intent, "kind", None) == "static"
@@ -429,6 +505,14 @@ class IndexedRegionStrategy:
                     array_specs_by_path,
                 )
 
+            # Outside a slot window each write-once marker is stamped under the
+            # authority of the group's schema claim, taken around the stamp alone.
+            stamp_scope = functools.partial(
+                self._schema_authority,
+                writer,
+                group_name,
+                None if parallel_mode else claim_for_group,
+            )
             if region_write_concurrency == 1:
                 for intent in static_intents:
                     if self._should_suppress_static_intent(
@@ -438,7 +522,7 @@ class IndexedRegionStrategy:
                         static_owner_slot_start=static_owner_slot_start,
                     ):
                         continue
-                    self._dispatch_static_intent(writer, intent)
+                    self._dispatch_static_intent(writer, intent, stamp_scope=stamp_scope)
 
                 intents_by_slot: dict[int, list[Any]] = {}
                 for intent in timed_intents:
@@ -507,7 +591,7 @@ class IndexedRegionStrategy:
                         static_owner_slot_start=static_owner_slot_start,
                     ):
                         continue
-                    self._dispatch_static_intent(writer, intent)
+                    self._dispatch_static_intent(writer, intent, stamp_scope=stamp_scope)
 
                 self._dispatch_timed_intents_concurrently(
                     writer=writer,
@@ -529,6 +613,107 @@ class IndexedRegionStrategy:
             "region_writes_aligned_count": region_writes_aligned_count,
             "region_writes_total_count": region_writes_total_count,
         }
+
+    def _new_writer(
+        self,
+        coord_names: frozenset[str],
+        write_empty_chunks: bool,
+        *,
+        on_write: Callable[[WriteResult], None] | None = None,
+        track_units: bool = False,
+        fixed_extent: bool = False,
+    ) -> RegionZarrWriter:
+        """Build a batch writer; pass ``fixed_extent`` only for slot-window batches.
+
+        Pod startup creates a slot-window batch's arrays at the full slot count
+        and its writer never grows them. Growth by another process is not detected.
+        """
+        return RegionZarrWriter(
+            self._store_uri,
+            store=self._session_store(mode="a"),
+            coord_names=coord_names,
+            time_coord_name=self._time_coord_name,
+            write_empty_chunks=write_empty_chunks,
+            on_write=on_write,
+            track_units=track_units,
+            fixed_extent=fixed_extent,
+        )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _schema_authority(
+        writer: RegionZarrWriter,
+        group_name: str,
+        claim_for_group: Callable[[str], Any] | None,
+    ) -> Iterator[MetadataAuthority | None]:
+        """Hold the group's schema claim, if any, and yield the authority it names.
+
+        When the claim's scope yields a `HeldClaim`, the root and the group's
+        parents are first created under the writer's own authority
+        (`ensure_group_ancestors`), then an authority over the group's
+        subtree is adopted from the claim; it is released before the claim.
+        Without a claim callable, or with a claim that names none, yields
+        ``None``: the writer's own ``PROCESS_LOCAL`` authority applies.
+        """
+        if claim_for_group is None:
+            yield None
+            return
+        with claim_for_group(group_name) as held:
+            if not isinstance(held, HeldClaim):
+                yield None
+                return
+            ensure_group_ancestors(writer, group_name)
+            with adopt_held_claim(writer.metadata_scope(group_name), held) as authority:
+                yield authority
+
+    def _session_store(self, *, mode: str) -> object | None:
+        if not self._storage_config:
+            return None
+        session = self._session or _session_for_store(self._store_uri, self._storage_config)
+        return session.zarr.create_store(
+            uri=storage_uri_from_target(self._store_uri),
+            mode=mode,
+        ).store
+
+    def _stored_root_read_only(self) -> Any | None:
+        """The store as written so far, opened read-only (``None`` if it does not exist)."""
+        try:
+            store = self._session_store(mode="r")
+        except FileNotFoundError:
+            return None
+        return open_root_read_only(self._store_uri, store=store)
+
+    def _pod_written_paths(
+        self,
+        group_to_intents: Mapping[str, Sequence[Any]],
+        schema_by_group: Mapping[str, Any],
+        slot_group: str | None,
+    ) -> list[str]:
+        """Paths of the time-indexed arrays this batch writes slots of.
+
+        Engine-owned arrays and the time coordinate are left out: pods only
+        verify engine-owned arrays, and a time coordinate that carries a
+        preallocate marker. An unmarked coordinate, which pods do write, is
+        left out as well. Static arrays have no slots.
+        """
+        paths: set[str] = set()
+        for group_name, intents in group_to_intents.items():
+            if slot_group is not None and group_name != slot_group:
+                continue
+            group_spec = schema_by_group.get(group_name)
+            specs = {arr.name: arr for arr in getattr(group_spec, "arrays", ())}
+            for intent in intents:
+                if getattr(intent, "kind", None) not in ("region", "1d"):
+                    continue
+                if intent.array == self._time_coord_name:
+                    continue
+                spec = specs.get(intent.array)
+                if spec is not None and not is_pod_written_slot_array(
+                    spec, time_coord_name=self._time_coord_name
+                ):
+                    continue
+                paths.add(f"{group_name}/{intent.array}")
+        return sorted(paths)
 
     @staticmethod
     def _should_suppress_static_intent(
@@ -1032,7 +1217,14 @@ class IndexedRegionStrategy:
         return IndexedRegionStrategy._as_non_negative_int(value, field=field, intent=intent)
 
     @classmethod
-    def _dispatch_static_intent(cls, writer: RegionZarrWriter, intent: Any) -> None:
+    def _dispatch_static_intent(
+        cls,
+        writer: RegionZarrWriter,
+        intent: Any,
+        *,
+        stamp_scope: Callable[[], contextlib.AbstractContextManager[MetadataAuthority | None]]
+        | None = None,
+    ) -> None:
         """Dispatch a ``kind="static"`` intent with idempotent resume semantics.
 
         Static arrays are write-once: a re-run on the same store must either
@@ -1053,27 +1245,52 @@ class IndexedRegionStrategy:
         - marker present → committed previously: the incoming data must replay
           the identical bytes (NaN/NaT-aware via ``equal_nan=True``), else
           `SchemaDriftError`. Re-writing is skipped on an exact match.
+
+        Marker check, comparison, write and marker stamp run as one
+        transaction under the writer's lock on the whole array, so concurrent
+        batches of one run (``pipeline_workers``) take it in turn within the
+        process. The array is opened inside the lock. The batch that takes the
+        lock second finds the marker and compares as a resume does: an
+        identical payload is a no-op, a different one raises
+        `SchemaDriftError`. Which payload stays depends on scheduling.
+
+        The marker is stamped through `RegionZarrWriter.update_array_attrs`,
+        which reads the node from the store under its node lock: a concurrent
+        schema step's metadata write of the same array (a ``_FillValue``
+        repair) cannot erase the marker, nor the marker that write. It is
+        stamped under the authority *stamp_scope* yields, entered around the
+        stamp alone and inside the whole-array lock (the writer's own
+        ``PROCESS_LOCAL`` authority when it yields ``None`` or is omitted).
+        The run's schema claim, which serialises schema steps, is therefore
+        never held while the payload is written.
         """
         arr_path = f"{intent.group}/{intent.array}"
         # callable() is the right duck-type check; typing.Callable would treat
         # some numpy objects with __call__ descriptors as lazy payloads.
         data = cast(np.ndarray, intent.data() if callable(intent.data) else intent.data)
+        if writer.verify_engine_written_coordinate(intent.group, intent.array, data):
+            return  # preallocate's coordinate: verified, neither written nor marked
         root = writer._open_root()
-        try:
-            arr = root[arr_path]
-        except KeyError:
-            arr = None
-        if arr is not None and bool(arr.attrs.get(_STATIC_WRITTEN_ATTR, False)):
-            # ``[...]`` reads every rank; ``[:]`` raises IndexError on 0-d arrays.
-            existing = np.asarray(arr[...])
-            if not _arrays_equal_missing_aware(existing, data):
-                raise SchemaDriftError(
-                    f"Static array {arr_path!r} diverged from existing data on "
-                    "resume. Re-ingest from scratch; static arrays are write-once."
+        with writer._hold_array(arr_path):
+            try:
+                arr = root[arr_path]  # read after the lock: another batch may have stamped it
+            except KeyError:
+                arr = None
+            if arr is not None and bool(arr.attrs.get(_STATIC_WRITTEN_ATTR, False)):
+                existing = np.asarray(arr[...])  # [...] also reads a rank-0 array
+                if not _arrays_equal_missing_aware(existing, data):
+                    raise SchemaDriftError(
+                        f"Static array {arr_path!r} diverged from existing data on "
+                        "resume, or from another batch of this run. Re-ingest from "
+                        "scratch; static arrays are write-once."
+                    )
+                return
+            writer.write_static(group=intent.group, array_name=intent.array, data=data)
+            scope = stamp_scope() if stamp_scope is not None else contextlib.nullcontext(None)
+            with scope as authority:
+                writer.update_array_attrs(
+                    arr_path, {_STATIC_WRITTEN_ATTR: True}, authority=authority
                 )
-            return
-        writer.write_static(group=intent.group, array_name=intent.array, data=data)
-        root[arr_path].attrs[_STATIC_WRITTEN_ATTR] = True
 
     @staticmethod
     def _dispatch_intent(writer: RegionZarrWriter, intent: Any) -> None:

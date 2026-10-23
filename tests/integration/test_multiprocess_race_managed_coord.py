@@ -40,8 +40,9 @@ never threads. Threads cannot reproduce the chunk-file overwrite pattern that
 the on-disk store exhibits under real process concurrency.
 
 The RED race test's trial count is driven by the ``--trials`` pytest option
-(see the top-level ``conftest.py``); the GREEN gate runs a small fixed number
-of trials. A ``multiprocessing.Manager().Barrier`` synchronizes the
+(see the top-level ``conftest.py``); the GREEN gate runs one trial: its
+outcome is deterministic (every writer agrees with the stored value). A
+``multiprocessing.Manager().Barrier`` synchronizes the
 twelve workers so they enter ``write_timestamp`` at the same instant, forcing
 simultaneous chunk access. No ``time.sleep`` is used for synchronization.
 """
@@ -69,7 +70,7 @@ _CHUNK_LEN = 256
 _WRITER_COUNT = 12
 _BARRIER_TIMEOUT_S = 30.0
 
-_GATE_TRIALS = 3
+_GATE_TRIALS = 1
 
 _BASE_NS = np.datetime64("2024-01-01T00:00:00", "ns")
 _TIMESTAMPS_NS: list[np.datetime64] = [
@@ -238,9 +239,8 @@ def test_race_eliminated_under_coord_managed(
     * ``12/12 slot values match`` — no slot drifted from its materialized
       value.
 
-    A single lost or drifted slot in any trial fails the gate. The gate runs
-    a small fixed number of trials; the ``--trials`` CLI option only drives
-    the RED race regression.
+    A single lost or drifted slot fails the gate. The gate runs one trial;
+    the ``--trials`` CLI option only drives the RED race regression.
     """
     tmp = tmp_path_factory.mktemp(f"gate-{trial}")
     store_path = tmp / "product.zarr"

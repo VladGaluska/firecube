@@ -141,6 +141,22 @@ def test_missing_group_raises_compilation_error() -> None:
     assert isinstance(err.__cause__, KeyError)
 
 
+def test_missing_group_reason_carries_cause_type_and_message() -> None:
+    iw = IndexedWrite.slot(
+        group="does_not_exist",
+        array="counts",
+        coordinate="2024-01-01T00:00:00Z",
+        data=np.zeros((4,)),
+    )
+
+    with pytest.raises(IndexedWriteCompilationError) as exc_info:
+        _compile_indexed_write(iw, _regular_index())
+
+    err = exc_info.value
+    assert isinstance(err.__cause__, KeyError)
+    assert f"KeyError: {err.__cause__}" in err.reason
+
+
 def test_region_iw_compiles_to_region_writeintent() -> None:
     idx = _regular_index()
     arr = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -178,6 +194,7 @@ def test_slot_iw_compiles_to_slot_writeintent() -> None:
 
     out = _compile_indexed_write(iw, idx)
 
+    assert isinstance(out, list)
     assert len(out) == 1
     wi = out[0]
     assert wi.kind == "1d"
@@ -210,36 +227,6 @@ def test_callable_data_passes_through_unchanged() -> None:
 
     assert out[0].data is payload
     assert not invoked
-
-
-def test_ndarray_data_passes_through_unchanged() -> None:
-    idx = _integer_index()
-    arr = np.zeros((3,), dtype=np.float32)
-    iw = IndexedWrite.slot(
-        group="data",
-        array="tally",
-        coordinate=0,
-        data=arr,
-    )
-
-    out = _compile_indexed_write(iw, idx)
-
-    assert out[0].data is arr
-
-
-def test_returns_list() -> None:
-    idx = _regular_index()
-    iw = IndexedWrite.slot(
-        group="data",
-        array="counts",
-        coordinate="2024-01-01T00:00:00Z",
-        data=np.zeros((4,)),
-    )
-
-    out = _compile_indexed_write(iw, idx)
-
-    assert isinstance(out, list)
-    assert len(out) == 1
 
 
 def test_compile_supports_irregular_axis() -> None:

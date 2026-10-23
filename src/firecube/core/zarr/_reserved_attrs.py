@@ -65,6 +65,9 @@ RESERVED_ARRAY_ATTRS: frozenset[str] = frozenset(
         FIRECUBE_STATIC_WRITTEN_ATTR,
         FIRECUBE_GROUP_IDENTITY_HASH_ATTR,
         "firecube_coord_managed",
+        "firecube_engine_owned",
+        "firecube_engine_owned_complete",
+        "firecube_engine_owned_slots",
         "firecube_preallocated",
         "firecube_consolidated_at",
     }

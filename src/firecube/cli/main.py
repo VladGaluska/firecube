@@ -27,7 +27,7 @@ import click
 
 from firecube.cli._command_schemas import IngestCommandConfig
 from firecube.cli._ctx import get_storage_config
-from firecube.cli._errors import MissingProductNameError, wrap_user_facing_errors
+from firecube.cli._errors import MissingProductNameError, render, wrap_user_facing_errors
 from firecube.cli._formatter import (
     COMMAND_GROUPS,
     OPTION_GROUPS,
@@ -327,7 +327,7 @@ OPTION_GROUPS.update(
             },
             {
                 "name": "Options",
-                "options": ["--slot-size", "--no-resume", "--format"],
+                "options": ["--slot-size", "--no-resume", "--format", "--yes-i-really-mean-it"],
             },
         ],
         "firecube zarr multires": [
@@ -824,7 +824,7 @@ def ingest(
                     product_name=str(resolved_product_name),
                 )
             except ValueError as exc:
-                raise click.UsageError(str(exc)) from exc
+                raise click.UsageError(render(exc)) from exc
             storage_overrides: dict[str, object | None] = {
                 "storage_type": str(ingest_cfg.storage_type)
                 if ingest_cfg.storage_type is not None

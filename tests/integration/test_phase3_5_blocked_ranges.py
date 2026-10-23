@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -25,8 +26,8 @@ import pytest
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
-from firecube.cli.zarr import _slots as zarr_module
 from firecube.ingestor.registry import loader as _loader
+from firecube.ingestor.runtime import slot_plan
 
 pytestmark = pytest.mark.integration
 
@@ -70,9 +71,9 @@ def test_plan_fails_when_one_group_blocked_other_valid(
 ) -> None:
     """Multi-group: group_a has blocked range, group_b has no coverage → whole command fails."""
     monkeypatch.setattr(
-        zarr_module,
+        slot_plan,
         "_query_slots_coverage",
-        lambda ctx, **kwargs: {"group_a": [(0, 73)], "group_b": []},
+        lambda **kwargs: {"group_a": [(0, 73)], "group_b": []},
     )
     result = CliRunner().invoke(cli, _plan_args(tmp_path))
 
@@ -87,9 +88,9 @@ def test_plan_succeeds_when_no_groups_blocked(
 ) -> None:
     """Valid plan with aligned coverage still emits JSON with empty blocked_ranges."""
     monkeypatch.setattr(
-        zarr_module,
+        slot_plan,
         "_query_slots_coverage",
-        lambda ctx, **kwargs: {"group_a": [], "group_b": []},
+        lambda **kwargs: {"group_a": [], "group_b": []},
     )
     result = CliRunner().invoke(cli, _plan_args(tmp_path))
 
@@ -103,9 +104,9 @@ def test_plan_succeeds_when_no_groups_blocked(
 def test_plan_error_message_format(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Error message includes group name, blocked intervals, and remediation hints."""
     monkeypatch.setattr(
-        zarr_module,
+        slot_plan,
         "_query_slots_coverage",
-        lambda ctx, **kwargs: {"group_a": [(0, 73)], "group_b": []},
+        lambda **kwargs: {"group_a": [(0, 73)], "group_b": []},
     )
     result = CliRunner().invoke(cli, _plan_args(tmp_path))
 
@@ -122,3 +123,16 @@ def test_plan_error_message_format(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "--dry-run" in output_lower, result.output
     assert "--force" in output_lower, result.output
     assert "--yes-i-really-mean-it" in output_lower, result.output
+
+
+def test_repro_blocked_ranges_delete_span_command_carries_the_target_uri(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        slot_plan, "_query_slots_coverage", lambda **kwargs: {"group_a": [(0, 73)], "group_b": []}
+    )
+    result = CliRunner().invoke(cli, _plan_args(tmp_path))
+    assert result.exit_code != 0, result.output
+    match = re.search(r"firecube chunks delete-span --product-name (<[^>]+>|\S+)", result.output)
+    assert match, result.output
+    assert match.group(1) == "<target URI>" or match.group(1).endswith("/out.zarr"), match.group(0)

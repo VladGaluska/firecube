@@ -28,38 +28,37 @@ def _batch() -> PipelineBatch:
     return PipelineBatch(batch_id="batch-1", data_path=Path("/tmp/input"))
 
 
-def test_result_metrics_defaults() -> None:
-    metrics = ResultMetrics()
-
-    assert metrics.write_mode is None
-    assert metrics.storage is None
-    assert metrics.pipeline is None
-    assert metrics.storage_handled is False
-
-
-def test_storage_metrics_defaults() -> None:
-    metrics = StorageMetrics()
-
-    assert metrics.path is None
-    assert metrics.bytes == 0
-    assert metrics.files == 0
-    assert metrics.duration_s == 0.0
-
-
-def test_pipeline_metrics_defaults() -> None:
-    metrics = PipelineMetrics()
-
-    assert metrics.duration_pipeline_s == 0.0
-    assert metrics.rows_processed is None
-    assert metrics.rows_ingested is None
-    assert metrics.coverage == []
+_DEFAULT_ROWS = (
+    (
+        "result_metrics_defaults",
+        ResultMetrics(),
+        {"write_mode": None, "storage": None, "pipeline": None, "storage_handled": False},
+    ),
+    (
+        "storage_metrics_defaults",
+        StorageMetrics(),
+        {"path": None, "bytes": 0, "files": 0, "duration_s": 0.0},
+    ),
+    (
+        "pipeline_metrics_defaults",
+        PipelineMetrics(),
+        {
+            "duration_pipeline_s": 0.0,
+            "rows_processed": None,
+            "rows_ingested": None,
+            "coverage": [],
+        },
+    ),
+    ("output_paths_defaults", OutputPaths(), {"primary": None, "zarr": None}),
+)
 
 
-def test_output_paths_defaults() -> None:
-    outputs = OutputPaths()
-
-    assert outputs.primary is None
-    assert outputs.zarr is None
+def test_typed_result_defaults(subtests) -> None:
+    for row_id, obj, expected in _DEFAULT_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            for name, want in expected.items():
+                got = getattr(obj, name)
+                assert type(got) is type(want) and got == want, (name, got)
 
 
 def test_empty_pipeline_result_constructs() -> None:

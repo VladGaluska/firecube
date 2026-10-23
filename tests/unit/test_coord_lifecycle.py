@@ -20,7 +20,11 @@ from firecube.core.zarr._coord_lifecycle import (
     raise_if_invalid,
     resolve_coord_lifecycle,
 )
-from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
+from firecube.core.zarr._sealing_markers import (
+    ATTR_COORD_MANAGED,
+    ATTR_ENGINE_OWNED,
+    ATTR_PREALLOCATED,
+)
 
 
 @pytest.mark.parametrize(
@@ -32,6 +36,10 @@ from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLO
         (
             {ATTR_PREALLOCATED: True, ATTR_COORD_MANAGED: True},
             CoordLifecycleState.INVALID_BOTH_MARKERS,
+        ),
+        (
+            {ATTR_PREALLOCATED: True, ATTR_ENGINE_OWNED: True},
+            CoordLifecycleState.INVALID_ENGINE_OWNED_MARKER,
         ),
     ],
 )
@@ -45,6 +53,7 @@ def test_coord_lifecycle_state_has_exact_members():
         "PREALLOCATED",
         "COORD_MANAGED",
         "INVALID_BOTH_MARKERS",
+        "INVALID_ENGINE_OWNED_MARKER",
     ]
 
 

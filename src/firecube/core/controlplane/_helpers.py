@@ -22,7 +22,7 @@ class.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from firecube.core.controlplane.types import CONTROL_DIRNAME, LATEST_POINTER
 from firecube.core.errors import ManifestError
@@ -31,42 +31,6 @@ from firecube.core.storage.uri import StorageUri
 
 if TYPE_CHECKING:
     from firecube.core.storage.binding import StorageBinding
-
-
-def fsspec_kwargs_from_binding(binding: StorageBinding, protocol: str) -> dict[str, Any]:
-    """Build fsspec kwargs directly from a StorageBinding (creds via binding.driver.credentials)."""
-    if protocol != "s3":
-        return {}
-
-    driver = binding.driver
-    credentials = driver.credentials
-    access_key = credentials.access_key if credentials is not None else None
-    secret_key = credentials.secret_key if credentials is not None else None
-
-    fs_kwargs: dict[str, Any] = {}
-    client_kwargs: dict[str, Any] = {}
-    config_kwargs: dict[str, Any] = {}
-
-    if driver.endpoint_url:
-        client_kwargs["endpoint_url"] = driver.endpoint_url
-    if driver.region:
-        client_kwargs["region_name"] = driver.region
-    if client_kwargs:
-        fs_kwargs["client_kwargs"] = client_kwargs
-
-    if driver.path_style is None or bool(driver.path_style):
-        config_kwargs.setdefault("s3", {})["addressing_style"] = "path"
-    else:
-        config_kwargs.setdefault("s3", {})["addressing_style"] = "virtual"
-    if config_kwargs:
-        fs_kwargs["config_kwargs"] = config_kwargs
-
-    if access_key is not None:
-        fs_kwargs["key"] = access_key
-    if secret_key is not None:
-        fs_kwargs["secret"] = secret_key
-
-    return fs_kwargs
 
 
 def open_controlplane_fs_cached(

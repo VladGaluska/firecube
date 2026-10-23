@@ -46,7 +46,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning
-uv run pytest --strict-deps -m "not slow and not s3" --cov=firecube --cov-report=term-missing --cov-report=xml -q
+uv run pytest --strict-deps -m "not slow and not s3 and not race" --cov=firecube --cov-report=term-missing --cov-report=xml -q
 uv run pytest tests/unit/test_version_consistency.py -q
 ```
 

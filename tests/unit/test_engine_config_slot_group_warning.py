@@ -15,34 +15,36 @@
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from firecube.ingestor.config.engine import EngineConfig
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
 
-def test_unsafe_chars_emit_warning() -> None:
-    with pytest.warns(UserWarning, match="URL-encoded"):
-        config = EngineConfig(slot_group="multires/0.5deg")
+def test_slot_group_character_warning(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "unsafe_chars_emit_warning", tmp_path):
+        with pytest.warns(UserWarning, match="URL-encoded"):
+            config = EngineConfig(slot_group="multires/0.5deg")
 
-    assert config.slot_group == "multires/0.5deg"
+        assert config.slot_group == "multires/0.5deg"
 
+    with table_row(subtests, "safe_chars_no_warning", tmp_path):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config = EngineConfig(slot_group="group_a")
 
-def test_safe_chars_no_warning() -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        config = EngineConfig(slot_group="group_a")
+        assert config.slot_group == "group_a"
+        assert caught == []
 
-    assert config.slot_group == "group_a"
-    assert caught == []
+    with table_row(subtests, "warning_does_not_raise", tmp_path):
+        with pytest.warns(UserWarning, match="URL-encoded"):
+            config = EngineConfig(slot_group="grp/with/slash", slot_start=0, slot_end=100)
 
-
-def test_warning_does_not_raise() -> None:
-    with pytest.warns(UserWarning, match="URL-encoded"):
-        config = EngineConfig(slot_group="grp/with/slash", slot_start=0, slot_end=100)
-
-    assert config.slot_group == "grp/with/slash"
-    assert config.slot_start == 0
-    assert config.slot_end == 100
+        assert config.slot_group == "grp/with/slash"
+        assert config.slot_start == 0
+        assert config.slot_end == 100

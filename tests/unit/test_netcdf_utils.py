@@ -14,14 +14,21 @@
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
+
 import numpy as np
+import pytest
 import xarray as xr
 
+from firecube.core.formats._iso import _iso_strs_to_datetime64, _parse_iso_utc
 from firecube.core.formats.netcdf import (
     clean_netcdf_encoding,
+    normalize_string_vars,
     prepare_netcdf_for_zarr,
     rename_time_dim,
 )
+from tests.helpers.rows import table_row
 
 
 def _make_dataset(dims: dict[str, int], encoding: dict | None = None) -> xr.Dataset:
@@ -74,24 +81,27 @@ def test_clean_encoding_idempotent() -> None:
     assert enc["dtype"] == "float32"
 
 
-def test_rename_time_dim_renames() -> None:
-    ds = _make_dataset({"time": 5, "x": 3})
-    result = rename_time_dim(ds)
-    assert "timestamp" in result.dims
-    assert "time" not in result.dims
+def test_rename_time_dim(subtests, tmp_path) -> None:
+    for row_id, dims, kwargs, source, target in [
+        ("test_rename_time_dim_renames", {"time": 5, "x": 3}, {}, "time", "timestamp"),
+        (
+            "test_rename_time_dim_custom_names",
+            {"t": 5, "x": 3},
+            {"source": "t", "target": "ts"},
+            "t",
+            "ts",
+        ),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            result = rename_time_dim(_make_dataset(dims), **kwargs)
+            assert target in result.dims
+            assert source not in result.dims
 
 
 def test_rename_time_dim_noop_when_missing() -> None:
     ds = _make_dataset({"x": 3, "y": 4})
     result = rename_time_dim(ds)
     assert dict(result.sizes) == {"x": 3, "y": 4}
-
-
-def test_rename_time_dim_custom_names() -> None:
-    ds = _make_dataset({"t": 5, "x": 3})
-    result = rename_time_dim(ds, source="t", target="ts")
-    assert "ts" in result.dims
-    assert "t" not in result.dims
 
 
 def test_prepare_combines_all() -> None:
@@ -111,84 +121,45 @@ def test_prepare_combines_all() -> None:
 # ─── _iso.py helpers ────────────────────────────────
 
 
-def test_iso_parse_utc_z_suffix() -> None:
-    from datetime import datetime
+def test_iso_parse_utc(subtests, tmp_path) -> None:
+    for row_id, text in [
+        ("test_iso_parse_utc_z_suffix", "2026-07-12T14:30:00Z"),
+        ("test_iso_parse_utc_explicit_offset", "2026-07-12T14:30:00+00:00"),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            result = _parse_iso_utc(text)
 
-    from firecube.core.formats._iso import _parse_iso_utc
-
-    result = _parse_iso_utc("2026-07-12T14:30:00Z")
-
-    assert result == datetime(2026, 7, 12, 14, 30, 0)
-    assert result.tzinfo is None
-
-
-def test_iso_parse_utc_explicit_offset() -> None:
-    from datetime import datetime
-
-    from firecube.core.formats._iso import _parse_iso_utc
-
-    result = _parse_iso_utc("2026-07-12T14:30:00+00:00")
-
-    assert result == datetime(2026, 7, 12, 14, 30, 0)
-    assert result.tzinfo is None
+            assert result == datetime(2026, 7, 12, 14, 30, 0)
+            assert result.tzinfo is None
 
 
 def test_iso_parse_preserves_microseconds() -> None:
-    from firecube.core.formats._iso import _parse_iso_utc
-
     result = _parse_iso_utc("2026-07-12T14:30:00.123456Z")
 
     assert result.microsecond == 123456
 
 
 def test_iso_parse_non_utc_raises() -> None:
-    import pytest
-
-    from firecube.core.formats._iso import _parse_iso_utc
-
     with pytest.raises(NotImplementedError):
         _parse_iso_utc("2026-07-12T14:30:00+05:00")
 
 
-def test_iso_parse_empty_raises() -> None:
-    import pytest
-
-    from firecube.core.formats._iso import _parse_iso_utc
-
-    with pytest.raises(ValueError):
-        _parse_iso_utc("")
-
-
-def test_iso_parse_invalid_raises() -> None:
-    import pytest
-
-    from firecube.core.formats._iso import _parse_iso_utc
-
-    with pytest.raises(ValueError):
-        _parse_iso_utc("not-a-date")
+def test_iso_parse_raises(subtests, tmp_path) -> None:
+    for row_id, text in [
+        ("test_iso_parse_empty_raises", ""),
+        ("test_iso_parse_invalid_raises", "not-a-date"),
+        ("test_iso_parse_timezone_naive_raises", "2026-07-12T14:30:00"),
+    ]:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(ValueError):
+            _parse_iso_utc(text)
 
 
 def test_iso_parse_nanosecond_raises() -> None:
-    import pytest
-
-    from firecube.core.formats._iso import _iso_strs_to_datetime64
-
     with pytest.raises(ValueError):
         _iso_strs_to_datetime64(["2026-07-12T14:30:00.1234567Z"])
 
 
-def test_iso_parse_timezone_naive_raises() -> None:
-    import pytest
-
-    from firecube.core.formats._iso import _parse_iso_utc
-
-    with pytest.raises(ValueError):
-        _parse_iso_utc("2026-07-12T14:30:00")
-
-
 def test_iso_strs_to_datetime64_seconds_batch() -> None:
-    from firecube.core.formats._iso import _iso_strs_to_datetime64
-
     result = _iso_strs_to_datetime64(
         [
             "2026-07-12T14:30:00Z",
@@ -201,8 +172,6 @@ def test_iso_strs_to_datetime64_seconds_batch() -> None:
 
 
 def test_iso_strs_to_datetime64_mixed_precision_batch() -> None:
-    from firecube.core.formats._iso import _iso_strs_to_datetime64
-
     result = _iso_strs_to_datetime64(
         [
             "2026-07-12T14:30:00.5Z",
@@ -214,8 +183,6 @@ def test_iso_strs_to_datetime64_mixed_precision_batch() -> None:
 
 
 def test_iso_strs_to_datetime64_empty_batch() -> None:
-    from firecube.core.formats._iso import _iso_strs_to_datetime64
-
     result = _iso_strs_to_datetime64([])
 
     assert result.shape == (0,)
@@ -228,72 +195,34 @@ def _string_ds(name: str, values: np.ndarray, dim: str = "t") -> xr.Dataset:
 # ─── normalize_string_vars ────────────────────────────
 
 
-def test_normalize_fixed_length_utf_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
+ISO_TS = "2026-01-01T00:00:00Z"
 
 
-def test_normalize_fixed_length_bytes_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
+def test_normalize_iso_target(subtests, tmp_path) -> None:
+    for row_id, values in [
+        ("test_normalize_fixed_length_utf_iso_target", np.array([ISO_TS], dtype="<U20")),
+        ("test_normalize_fixed_length_bytes_iso_target", np.array([ISO_TS.encode()], dtype="S25")),
+        ("test_normalize_object_dtype_python_str_iso_target", np.array([ISO_TS], dtype=object)),
+        (
+            "test_normalize_object_dtype_python_bytes_iso_target",
+            np.array([ISO_TS.encode()], dtype=object),
+        ),
+        (
+            "test_normalize_object_dtype_numpy_str_iso_target",
+            np.array([np.str_(ISO_TS)], dtype=object),
+        ),
+        (
+            "test_normalize_object_dtype_numpy_bytes_iso_target",
+            np.array([np.bytes_(ISO_TS.encode())], dtype=object),
+        ),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            out = normalize_string_vars(_string_ds("ts", values), iso_targets={"ts"})
 
-    ds = _string_ds("ts", np.array([b"2026-01-01T00:00:00Z"], dtype="S25"))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
-
-
-def test_normalize_object_dtype_python_str_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype=object))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
-
-
-def test_normalize_object_dtype_python_bytes_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array([b"2026-01-01T00:00:00Z"], dtype=object))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
-
-
-def test_normalize_object_dtype_numpy_str_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array([np.str_("2026-01-01T00:00:00Z")], dtype=object))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
-
-
-def test_normalize_object_dtype_numpy_bytes_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds(
-        "ts",
-        np.array([np.bytes_(b"2026-01-01T00:00:00Z")], dtype=object),
-    )
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert str(out["ts"].dtype).startswith("datetime64")
+            assert str(out["ts"].dtype).startswith("datetime64")
 
 
 def test_normalize_post_concat_widening_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds_a = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"), "t")
     ds_b = _string_ds("ts", np.array(["2026-01-01T00:01:00Z"], dtype=object), "t")
 
@@ -311,8 +240,6 @@ def test_normalize_post_concat_widening_iso_target() -> None:
 
 
 def test_normalize_already_datetime64_no_op() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("ts", np.array(["2026-01-01"], dtype="datetime64[s]"))
 
     out = normalize_string_vars(ds, iso_targets={"ts"})
@@ -320,31 +247,18 @@ def test_normalize_already_datetime64_no_op() -> None:
     assert out["ts"].dtype == np.dtype("datetime64[s]")
 
 
-def test_normalize_bytes_utf8_decode_non_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
+def test_normalize_non_iso_target_becomes_unicode(subtests, tmp_path) -> None:
+    for row_id, values in [
+        ("test_normalize_bytes_utf8_decode_non_iso_target", np.array([b"hello"], dtype="S20")),
+        ("test_normalize_object_str_non_iso_target", np.array(["hello"], dtype=object)),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            out = normalize_string_vars(_string_ds("meta", values), iso_targets={"ts"})
 
-    ds = _string_ds("meta", np.array([b"hello"], dtype="S20"))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert out["meta"].dtype.kind == "U"
-
-
-def test_normalize_object_str_non_iso_target() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("meta", np.array(["hello"], dtype=object))
-
-    out = normalize_string_vars(ds, iso_targets={"ts"})
-
-    assert out["meta"].dtype.kind == "U"
+            assert out["meta"].dtype.kind == "U"
 
 
 def test_normalize_object_non_string_not_in_iso_targets_skipped(caplog) -> None:
-    import logging
-
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("meta", np.array([1, 2, 3], dtype=object))
 
     with caplog.at_level(logging.DEBUG):
@@ -355,31 +269,19 @@ def test_normalize_object_non_string_not_in_iso_targets_skipped(caplog) -> None:
     assert records, "expected DEBUG log mentioning 'meta'"
 
 
-def test_normalize_object_non_string_in_iso_targets_raises() -> None:
-    import pytest
-
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array([1, 2, 3], dtype=object))
-
-    with pytest.raises(ValueError):
-        normalize_string_vars(ds, iso_targets={"ts"})
-
-
-def test_normalize_object_empty_in_iso_targets_raises() -> None:
-    import pytest
-
-    from firecube.core.formats.netcdf import normalize_string_vars
-
-    ds = _string_ds("ts", np.array([], dtype=object))
-
-    with pytest.raises(ValueError):
-        normalize_string_vars(ds, iso_targets={"ts"})
+def test_normalize_object_in_iso_targets_raises(subtests, tmp_path) -> None:
+    for row_id, values in [
+        (
+            "test_normalize_object_non_string_in_iso_targets_raises",
+            np.array([1, 2, 3], dtype=object),
+        ),
+        ("test_normalize_object_empty_in_iso_targets_raises", np.array([], dtype=object)),
+    ]:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(ValueError):
+            normalize_string_vars(_string_ds("ts", values), iso_targets={"ts"})
 
 
 def test_normalize_object_empty_not_in_iso_targets_skipped() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("meta", np.array([], dtype=object))
 
     out = normalize_string_vars(ds, iso_targets={"ts"})
@@ -388,8 +290,6 @@ def test_normalize_object_empty_not_in_iso_targets_skipped() -> None:
 
 
 def test_normalize_units_calendar_moved_to_encoding_by_default() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"))
     ds["ts"].attrs["units"] = "ISO 8601"
     ds["ts"].attrs["calendar"] = "standard"
@@ -405,8 +305,6 @@ def test_normalize_units_calendar_moved_to_encoding_by_default() -> None:
 
 
 def test_normalize_preserve_cf_time_attrs_keeps_them_in_attrs() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"))
     ds["ts"].attrs["units"] = "ISO 8601"
     ds["ts"].attrs["calendar"] = "standard"
@@ -421,8 +319,6 @@ def test_normalize_preserve_cf_time_attrs_keeps_them_in_attrs() -> None:
 
 
 def test_normalize_iso_target_does_not_copy_source_encoding() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     ds = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"))
     # Pollute source encoding with stale/hostile keys
     ds["ts"].encoding = {
@@ -446,8 +342,6 @@ def test_normalize_iso_target_does_not_copy_source_encoding() -> None:
 
 
 def test_normalize_moves_only_present_cf_time_attrs() -> None:
-    from firecube.core.formats.netcdf import normalize_string_vars
-
     # Case 1: only units
     ds_u = _string_ds("ts", np.array(["2026-01-01T00:00:00Z"], dtype="<U20"))
     ds_u["ts"].attrs["units"] = "ISO 8601"

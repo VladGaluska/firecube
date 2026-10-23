@@ -15,53 +15,57 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import xarray as xr
 
 from firecube.core.intake import CatalogSourceSpec, _catalog_entry_args
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
 
-def test_zarr_entry_args_chunks_default_is_on_disk_chunking() -> None:
-    spec = CatalogSourceSpec(name="test", description="test", group="", data_format="zarr")
+def test_intake_catalog_entry_args_rows(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "zarr_entry_args_chunks_default_is_on_disk_chunking", tmp_path):
+        spec = CatalogSourceSpec(name="test", description="test", group="", data_format="zarr")
 
-    args = _catalog_entry_args(store_uri="file:///tmp/some.zarr", spec=spec, storage_opts={})
+        args = _catalog_entry_args(store_uri="file:///tmp/some.zarr", spec=spec, storage_opts={})
 
-    assert args["chunks"] == {}
-    assert "urlpath" in args
-    assert "consolidated" in args
-
-
-def test_zarr_entry_args_survives_object_dtype_variable(tmp_path: Path) -> None:
-    store = tmp_path / "test.zarr"
-    ds = xr.Dataset({"str_var": (["x"], np.array(["a", "b"], dtype=object))})
-    ds.to_zarr(store, mode="w")
-    spec = CatalogSourceSpec(name="test", description="test", group="", data_format="zarr")
-
-    args = _catalog_entry_args(store_uri=str(store), spec=spec, storage_opts={})
-
-    opened = xr.open_zarr(
-        args["urlpath"],
-        group=args.get("group") or None,
-        consolidated=args.get("consolidated", False),
-        storage_options=args.get("storage_options"),
-        chunks=args["chunks"],
-    )
-    try:
         assert args["chunks"] == {}
-        assert "str_var" in opened.data_vars
-    finally:
-        opened.close()
+        assert "urlpath" in args
+        assert "consolidated" in args
 
+    with table_row(subtests, "zarr_entry_args_survives_object_dtype_variable", tmp_path) as (
+        workdir,
+        _,
+    ):
+        store = workdir / "test.zarr"
+        ds = xr.Dataset({"str_var": (["x"], np.array(["a", "b"], dtype=object))})
+        ds.to_zarr(store, mode="w")
+        spec = CatalogSourceSpec(name="test", description="test", group="", data_format="zarr")
 
-def test_parquet_entry_args_unchanged() -> None:
-    spec = CatalogSourceSpec(name="test", description="test", group="", data_format="parquet")
+        args = _catalog_entry_args(store_uri=str(store), spec=spec, storage_opts={})
 
-    args = _catalog_entry_args(store_uri="file:///tmp/some.parquet", spec=spec, storage_opts={})
+        opened = xr.open_zarr(
+            args["urlpath"],
+            group=args.get("group") or None,
+            consolidated=args.get("consolidated", False),
+            storage_options=args.get("storage_options"),
+            chunks=args["chunks"],
+        )
+        try:
+            assert args["chunks"] == {}
+            assert "str_var" in opened.data_vars
+        finally:
+            opened.close()
 
-    assert "chunks" not in args
-    assert args["urlpath"] == "file:///tmp/some.parquet"
-    assert args["engine"] == "pyarrow"
+    with table_row(subtests, "parquet_entry_args_unchanged", tmp_path):
+        spec = CatalogSourceSpec(name="test", description="test", group="", data_format="parquet")
+
+        args = _catalog_entry_args(store_uri="file:///tmp/some.parquet", spec=spec, storage_opts={})
+
+        assert "chunks" not in args
+        assert args["urlpath"] == "file:///tmp/some.parquet"
+        assert args["engine"] == "pyarrow"

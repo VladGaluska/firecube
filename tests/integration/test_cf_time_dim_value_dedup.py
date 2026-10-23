@@ -21,13 +21,18 @@ data/time/c/* workspace chunks (not data/timestamp/c/*).
 
 from __future__ import annotations
 
+import json
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import pytest
 import zarr
+from click.testing import CliRunner, Result
 
+from firecube.cli.main import cli
+from firecube.core.zarr.time_decode import decode_time_array
 from tests.helpers.storage import make_test_context
 
 pytestmark = pytest.mark.integration
@@ -122,3 +127,50 @@ def test_cf_time_dim_distinct_append_staged_value_dedup(tmp_path: Path) -> None:
     )
     assert raw[0] == np.datetime64(_T1, "s"), f"Slot 0 should be T1 ({_T1}), got {raw[0]}"
     assert raw[1] == np.datetime64(_T2, "s"), f"Slot 1 should be T2 ({_T2}), got {raw[1]}"
+
+
+def _ingest_calendar(tmp_path: Path, *, mode: str, start: str, **flags: str) -> Result:
+    source = tmp_path / "input"
+    source.mkdir(exist_ok=True)
+    (source / "dummy.nc").touch()
+    options = ["no_progress=true", f"x_start={start}", *(f"{k}={v}" for k, v in flags.items())]
+    args = ["ingest", "cf_time_dim_calendar", "--input-data", str(source), "--product-name", "cal"]
+    args += ["--target", f"file://{tmp_path / 'cal.zarr'}", "--write-mode", mode]
+    args += [a for o in options for a in ("--option", o)]
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _stored_coord(tmp_path: Path) -> Any:
+    root = zarr.open_group(str(tmp_path / "cal.zarr"), mode="r", use_consolidated=False)
+    return cast(Any, root["default"])["time"]
+
+
+@pytest.mark.parametrize("mode", ["direct", "staged"])
+def test_360_day_append_over_two_runs_round_trips_through_february_30(
+    tmp_path: Path, mode: str
+) -> None:
+    _ingest_calendar(tmp_path, mode=mode, start="2049-02-26")
+    _ingest_calendar(tmp_path, mode=mode, start="2049-03-01", resume_existing="true")
+
+    coord = _stored_coord(tmp_path)
+    values = decode_time_array(coord[:], dict(coord.attrs))
+    assert values.size == 10
+    assert values.dtype.kind == "O"
+    assert {v.calendar for v in values} == {"360_day"}
+    assert all(a < b for a, b in pairwise(values))
+    assert any(v.month == 2 and v.day == 30 for v in values)
+    assert str(coord.dtype) == "int64"
+    assert coord.attrs["calendar"] == "360_day"
+    assert "units" in coord.attrs
+
+
+def test_staged_force_reingest_over_a_feb_30_span_succeeds(tmp_path: Path) -> None:
+    first = _ingest_calendar(tmp_path, mode="staged", start="2049-02-26")
+    recorded = json.loads(first.output[first.output.rfind('{\n  "plugin"') :])
+    assert recorded["metrics"]["zarr"]["coverage"][0]["time_max"] == "2049-02-30T00:00:00"
+
+    _ingest_calendar(tmp_path, mode="staged", start="2049-03-01", force_reingest="true")
+
+    assert _stored_coord(tmp_path).shape == (10,)

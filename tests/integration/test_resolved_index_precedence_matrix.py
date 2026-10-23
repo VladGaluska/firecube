@@ -159,7 +159,9 @@ def test_row4_attrs_exist_without_file_raises_manifest_error(
         cm.ensure_resolved_index(product=_PRODUCT, record=declared)
 
 
-def test_row5_incompatible_record_raises_conflict_with_field_diff(tmp_path: Path) -> None:
+def test_row5_incompatible_record_raises_conflict_with_field_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cm = _make_manager(tmp_path)
     stored = _record(
         index=_index(
@@ -180,29 +182,6 @@ def test_row5_incompatible_record_raises_conflict_with_field_diff(tmp_path: Path
             },
         ),
     )
-    cm.ensure_resolved_index(product=_PRODUCT, record=stored)
-
-    with pytest.raises(ResolvedIndexConflictError) as excinfo:
-        cm.ensure_resolved_index(product=_PRODUCT, record=incoming)
-
-    message = str(excinfo.value)
-    assert "data_2km" in message
-    assert "data_500m" in message
-    assert "cadence_s" in message
-    assert stored.identity_hash[:16] in message
-    assert incoming.identity_hash[:16] in message
-    assert "2026-08-20" not in message
-
-
-def test_precedence_row5_conflict_emits_wal_before_raise(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cm = _make_manager(tmp_path)
-    stored = _record()
-    incoming = _record(
-        run_id="run-2",
-        index=_index(groups={"data_1km": {"kind": "integer", "size": 4, "params": {}}}),
-    )
     events: list[IndexEnsuredEvent] = []
 
     def _record_event(self: ChunkManager, event: IndexEnsuredEvent) -> None:
@@ -212,15 +191,20 @@ def test_precedence_row5_conflict_emits_wal_before_raise(
     monkeypatch.setattr(ChunkManager, "record_index_ensured_event", _record_event)
     cm.ensure_resolved_index(product=_PRODUCT, record=stored)
 
-    with pytest.raises(ResolvedIndexConflictError):
+    with pytest.raises(ResolvedIndexConflictError) as excinfo:
         cm.ensure_resolved_index(product=_PRODUCT, record=incoming)
 
-    assert len(events) == 1
-    event = events[0]
-    assert event.outcome == "conflict_refused"
-    assert event.product == _PRODUCT
-    assert event.run_id == "run-2"
-    assert event.identity_hash == incoming.identity_hash
+    # The conflict is recorded in the WAL before the raise.
+    assert [(e.outcome, e.product, e.run_id, e.identity_hash) for e in events] == [
+        ("conflict_refused", _PRODUCT, "run-2", incoming.identity_hash)
+    ]
+    message = str(excinfo.value)
+    assert "data_2km" in message
+    assert "data_500m" in message
+    assert "cadence_s" in message
+    assert stored.identity_hash[:16] in message
+    assert incoming.identity_hash[:16] in message
+    assert "2026-08-20" not in message
 
 
 def test_ensure_retry_conflict_emits_wal_before_raise(

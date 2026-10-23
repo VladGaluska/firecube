@@ -31,23 +31,24 @@ def _write_dataset(path: Path, values: np.ndarray, *, variable: str = "data") ->
         handle.create_dataset(variable, data=values)
 
 
-def test_reads_int_dataset_preserves_int_dtype(tmp_path: Path) -> None:
-    path = tmp_path / "int32.h5"
-    _write_dataset(path, np.array([1, 2, 3], dtype=np.int32))
-
-    result = read_hdf5_array(path, variable="data")
-
-    assert result.dtype == np.dtype("int32")
-    np.testing.assert_array_equal(result, np.array([1, 2, 3], dtype=np.int32))
+_PRESERVED_DTYPE_ROWS = (
+    ("reads_int_dataset_preserves_int_dtype", np.array([1, 2, 3], dtype=np.int32)),
+    ("reads_float_dataset_preserves_float_dtype", np.array([1.25, 2.5], dtype=np.float64)),
+    ("reads_uint8_dataset_preserves_uint8", np.array([0, 255], dtype=np.uint8)),
+    ("reads_bool_dataset_preserves_bool", np.array([True, False], dtype=np.bool_)),
+)
 
 
-def test_reads_float_dataset_preserves_float_dtype(tmp_path: Path) -> None:
-    path = tmp_path / "float64.h5"
-    _write_dataset(path, np.array([1.25, 2.5], dtype=np.float64))
+def test_reads_dataset_preserving_dtype(tmp_path: Path, subtests: Any) -> None:
+    for row_id, values in _PRESERVED_DTYPE_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            path = tmp_path / f"{values.dtype}.h5"
+            _write_dataset(path, values)
 
-    result = read_hdf5_array(path, variable="data")
+            result = read_hdf5_array(path, variable="data")
 
-    assert result.dtype == np.dtype("float64")
+            assert result.dtype == values.dtype
+            np.testing.assert_array_equal(result, values)
 
 
 def test_explicit_dtype_kwarg_casts(tmp_path: Path) -> None:
@@ -79,24 +80,6 @@ def test_xarray_fallback_preserves_dtype(tmp_path: Path, monkeypatch: pytest.Mon
 
     assert result.dtype == np.dtype("int32")
     np.testing.assert_array_equal(result, np.array([4, 5, 6], dtype=np.int32))
-
-
-def test_reads_uint8_dataset_preserves_uint8(tmp_path: Path) -> None:
-    path = tmp_path / "uint8.h5"
-    _write_dataset(path, np.array([0, 255], dtype=np.uint8))
-
-    result = read_hdf5_array(path, variable="data")
-
-    assert result.dtype == np.dtype("uint8")
-
-
-def test_reads_bool_dataset_preserves_bool(tmp_path: Path) -> None:
-    path = tmp_path / "bool.h5"
-    _write_dataset(path, np.array([True, False], dtype=np.bool_))
-
-    result = read_hdf5_array(path, variable="data")
-
-    assert result.dtype == np.dtype("bool")
 
 
 def test_missing_variable_raises_keyerror(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ import click
 import pytest
 
 from firecube.cli._typed_options import TypedOptionsParam
+from tests.helpers.rows import table_row
 
 
 def test_valid_string_option() -> None:
@@ -31,19 +32,23 @@ def test_valid_int_option() -> None:
     )
 
 
-def test_empty_key_rejected() -> None:
-    with pytest.raises(click.BadParameter, match="Option key cannot be empty"):
-        TypedOptionsParam().convert("=v", None, None)
+MALFORMED = [
+    ("test_empty_key_rejected", None, "=v", "Option key cannot be empty"),
+    ("test_empty_value_rejected", None, "k=", "Option value for 'k' cannot be empty"),
+    ("test_no_equals_rejected", None, "k", "Use key=value syntax"),
+    (
+        "test_invalid_value_type_rejected_with_expected_type",
+        "cli_test_plugin",
+        "test_int=not-an-int",
+        "Invalid integer for test_int",
+    ),
+]
 
 
-def test_empty_value_rejected() -> None:
-    with pytest.raises(click.BadParameter, match="Option value for 'k' cannot be empty"):
-        TypedOptionsParam().convert("k=", None, None)
-
-
-def test_no_equals_rejected() -> None:
-    with pytest.raises(click.BadParameter, match="Use key=value syntax"):
-        TypedOptionsParam().convert("k", None, None)
+def test_malformed_option_rejected(subtests, tmp_path) -> None:
+    for row_id, plugin, text, match in MALFORMED:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(click.BadParameter, match=match):
+            TypedOptionsParam(plugin).convert(text, None, None)
 
 
 def test_unknown_key_rejected_with_context() -> None:
@@ -55,11 +60,6 @@ def test_unknown_key_rejected_with_context() -> None:
     assert "test_int" in message
     assert "test_str" in message
     assert "test_bool" in message
-
-
-def test_invalid_value_type_rejected_with_expected_type() -> None:
-    with pytest.raises(click.BadParameter, match="Invalid integer for test_int"):
-        TypedOptionsParam("cli_test_plugin").convert("test_int=not-an-int", None, None)
 
 
 @pytest.mark.parametrize(

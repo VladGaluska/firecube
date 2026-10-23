@@ -52,42 +52,40 @@ def test_regular_axis_hash_is_deterministic() -> None:
     assert len(a) == 64
 
 
-def test_regular_axis_hash_differs_when_slot_count_differs() -> None:
-    axis = _make_regular()
-    assert _compute_group_identity_hash(axis, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(axis, 101, "datetime64[ns]")
-    )
+NS = "datetime64[ns]"
+HASH_DIFFERENCES = (
+    (
+        "test_regular_axis_hash_differs_when_slot_count_differs",
+        (_make_regular(), 100, NS),
+        (_make_regular(), 101, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_cadence_differs",
+        (_make_regular(cadence_s=600), 100, NS),
+        (_make_regular(cadence_s=900), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_epoch_differs",
+        (_make_regular(epoch="2024-01-01T00:00:00Z"), 100, NS),
+        (_make_regular(epoch="2025-01-01T00:00:00Z"), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_mode_differs",
+        (_make_regular(mode="exact"), 100, NS),
+        (_make_regular(mode="floor"), 100, NS),
+    ),
+    (
+        "test_regular_axis_hash_differs_when_dtype_differs",
+        (_make_regular(), 100, NS),
+        (_make_regular(), 100, "datetime64[s]"),
+    ),
+)
 
 
-def test_regular_axis_hash_differs_when_cadence_differs() -> None:
-    small = _make_regular(cadence_s=600)
-    large = _make_regular(cadence_s=900)
-    assert _compute_group_identity_hash(small, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(large, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_epoch_differs() -> None:
-    a = _make_regular(epoch="2024-01-01T00:00:00Z")
-    b = _make_regular(epoch="2025-01-01T00:00:00Z")
-    assert _compute_group_identity_hash(a, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(b, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_mode_differs() -> None:
-    exact = _make_regular(mode="exact")
-    floor = _make_regular(mode="floor")
-    assert _compute_group_identity_hash(exact, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(floor, 100, "datetime64[ns]")
-    )
-
-
-def test_regular_axis_hash_differs_when_dtype_differs() -> None:
-    axis = _make_regular()
-    assert _compute_group_identity_hash(axis, 100, "datetime64[ns]") != (
-        _compute_group_identity_hash(axis, 100, "datetime64[s]")
-    )
+def test_regular_axis_hash_differs_per_identity_input(subtests) -> None:
+    for row_id, left, right in HASH_DIFFERENCES:
+        with subtests.test(msg=row_id):
+            assert _compute_group_identity_hash(*left) != _compute_group_identity_hash(*right)
 
 
 def test_regular_axis_hash_accepts_numpy_dtype_and_string_equivalently() -> None:
@@ -145,3 +143,41 @@ def test_regular_axis_end_date_and_slot_count_yield_same_hash_at_same_size() -> 
     assert _compute_group_identity_hash(a, 100, "datetime64[ns]") == (
         _compute_group_identity_hash(b, 100, "datetime64[ns]")
     )
+
+
+def test_gregorian_axis_hashes_keep_their_pinned_persisted_values() -> None:
+    # Persisted-format contract: a shift here invalidates every existing store.
+    # Migrate, do not regenerate the literals.
+    regular = _make_regular()
+    assert _compute_group_identity_hash(regular, 100, "datetime64[ns]") == (
+        "04e7861a55f053efca8b8fab188aec5a0cfd63ca130c844407d0d880237e775a"
+    )
+    numeric = IrregularTimeAxis(coordinate="time", values=(1, 2, 3))
+    assert _compute_group_identity_hash(numeric, 3, "int64") == (
+        "3efcac228fc838b66355fec2aebae37971fa710f80fff08410c58b9b30b861f9"
+    )
+    iso = IrregularTimeAxis(
+        coordinate="timestamp", values=["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"]
+    )
+    assert _compute_group_identity_hash(iso, 2, "datetime64[ns]") == (
+        "6e0646f7147f7bd8985f5f96e93b16a699535e34429ccf4f66fafef37e359ded"
+    )
+
+
+def test_calendar_enters_the_hash_of_a_non_gregorian_axis() -> None:
+    def hash_for(**kwargs: object) -> str:
+        axis = RegularTimeAxis(
+            coordinate="time",
+            epoch="2049-01-01T00:00:00Z",
+            cadence_s=86400,
+            slot_count=90,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        return _compute_group_identity_hash(axis, 90, "int64")
+
+    assert hash_for(calendar="360_day") != hash_for()
+    assert hash_for(calendar="360_day") != hash_for(calendar="noleap")
+    assert hash_for(calendar="360_day") == (
+        "105bacab35c891da511a2b5841869dff9b66c7f3a13fee6ff2bc7a485b2672f1"
+    )
+    assert hash_for(calendar="standard") == hash_for()

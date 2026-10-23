@@ -15,11 +15,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any, Literal
 
+import click
 import pytest
 
+from firecube.cli._ctx import get_storage_config
 from firecube.core.config import StorageConfig
 from firecube.core.filesystem.fsspec_backend import _fsspec_kwargs_from_binding
 from firecube.core.filesystem.obstore_backend import _aws_config_from_driver
@@ -201,3 +204,11 @@ def test_anon_plus_credentials_warns_and_wins(
         assert kwargs["anon"] is True
     else:
         assert kwargs["skip_signature"] is True
+
+
+def test_repro_half_configured_credentials_refusal_names_no_cli_flags() -> None:
+    ctx = click.Context(click.Command("probe"))
+    with pytest.raises(click.ClickException) as excinfo:
+        get_storage_config(ctx, overrides={"storage_type": "s3", "access_key": "access-key"})
+    message = excinfo.value.message
+    assert not re.findall(r"--[a-z][\w-]*", message), f"no command has these flags: {message}"

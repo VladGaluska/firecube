@@ -18,27 +18,33 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import functools
 import inspect
 import logging
-import uuid
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import click
 
+from firecube.cli._errors import echo_rendered, render
 from firecube.cli._formatter import FirecubeGroup
-from firecube.core import observability
 from firecube.core.controlplane import ChunkManager
-from firecube.core.controlplane.manager import check_legacy_index_record
-from firecube.core.errors import LegacyIndexRecordError, ManifestError, ResolvedIndexConflictError
-from firecube.core.index_resolve import ExtentUnknownError, resolve_index_spec
-from firecube.core.observability.metrics import TelemetryService, emit_index_ensured_full
+from firecube.core.errors import (
+    ManifestError,
+    Message,
+    Operation,
+    ResolvedIndexAttrsConflictError,
+    ResolvedIndexConflictError,
+)
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
+from firecube.core.time.calendar import is_gregorian_like
 from firecube.core.uris import storage_uri_from_target
-from firecube.ingestor.api import IngestContext, PluginContext, RuntimeIngestContext
 from firecube.ingestor.registry import loader as ingestor_loader
+
+if TYPE_CHECKING:
+    from firecube.ingestor.runtime.index_record import IndexVerification
 
 logger = logging.getLogger(__name__)
 
@@ -64,31 +70,13 @@ def _load_record(manager: ChunkManager, product_name: str) -> Any | None:
     try:
         return manager.get_resolved_index(product=product_name)
     except ManifestError as exc:
-        click.echo(str(exc), err=True)
+        click.echo(render(exc), err=True)
         raise click.exceptions.Exit(1) from exc
 
 
 def _exit_no_record() -> NoReturn:
     click.echo("No index record found", err=True)
     raise click.exceptions.Exit(3)
-
-
-def _plugin_context(target: str, *, run_id: str) -> PluginContext:
-    ingest_ctx = IngestContext(
-        source="",
-        target=target,
-        in_memory=True,
-        output_format="zarr",
-        options={},
-        run_id=run_id,
-    )
-    runtime_ctx = RuntimeIngestContext.from_ingest_context(
-        ingest_ctx,
-        run_id=run_id,
-        temp_root=None,
-        materializer=None,
-    )
-    return PluginContext(runtime_ctx)
 
 
 def _load_plugin(plugin: str, manager: ChunkManager) -> Any:
@@ -126,11 +114,30 @@ def _group_rows(index_payload: dict[str, Any]) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _decoded_calendar_isoformats(values: Any, *, units: str, calendar: str) -> list[str]:
+    """Decode encoded numbers into calendar dates and format each as ISO 8601.
+
+    ``decode_time_array`` always returns an object array of calendar-valued
+    (``cftime``-shaped) scalars here, never ``datetime64``: this helper is
+    only called for a non-Gregorian-like calendar, and xarray's CF decoder
+    returns an object array of calendar-valued scalars for any such
+    calendar. Each scalar's own ``isoformat()`` is used, not a Gregorian
+    ``datetime64`` conversion.
+    """
+    import numpy as np
+
+    from firecube.core.zarr.time_decode import decode_time_array
+
+    encoded = np.asarray(values)
+    decoded = decode_time_array(encoded, {"units": units, "calendar": calendar})
+    return [item.isoformat() for item in np.asarray(decoded).reshape(-1)]
+
+
 def _derived_coordinates_for_group(
     group_name: str, group_payload: dict[str, Any]
 ) -> list[str] | None:
     kind = group_payload.get("kind")
-    if kind != "regular_time":
+    if kind not in ("regular_time", "irregular_time"):
         return None
 
     params = group_payload.get("params", {})
@@ -138,6 +145,24 @@ def _derived_coordinates_for_group(
         raise click.ClickException(
             f"Group {group_name!r}: 'params' is missing or not a mapping in the index record."
         )
+    calendar = params.get("calendar")
+    calendar_is_gregorian = calendar is None or is_gregorian_like(str(calendar))
+
+    if kind == "irregular_time":
+        # No-op for a Gregorian-like calendar (the default,
+        # proleptic_gregorian): an irregular axis's coordinate is already
+        # the plugin-declared explicit timestamp, nothing to derive.
+        if calendar_is_gregorian:
+            return None
+        values = params.get("values")
+        units = params.get("units")
+        if not isinstance(values, list) or units is None:
+            raise click.ClickException(
+                f"Group {group_name!r}: cannot compute derived coordinates: missing "
+                "required field(s) 'values'/'units' for a calendar irregular_time group. "
+                "Re-run ingestion to populate the index record."
+            )
+        return _decoded_calendar_isoformats(values, units=str(units), calendar=str(calendar))
 
     missing = [f for f in ("epoch", "cadence_s") if f not in params]
     if "size" not in group_payload:
@@ -153,11 +178,20 @@ def _derived_coordinates_for_group(
     cadence_s: int = int(params["cadence_s"])
     slot_count: int = int(group_payload["size"])
 
+    if not calendar_is_gregorian:
+        import numpy as np
+
+        from firecube.core.time.calendar import derive_regular_axis_units
+
+        units = derive_regular_axis_units(epoch_str)
+        encoded = np.arange(slot_count, dtype=np.int64) * cadence_s
+        return _decoded_calendar_isoformats(encoded, units=units, calendar=str(calendar))
+
     try:
         epoch_dt = datetime.datetime.fromisoformat(epoch_str.replace("Z", "+00:00"))
     except (ValueError, TypeError) as exc:
         raise click.ClickException(
-            f"Group {group_name!r}: cannot parse epoch {epoch_str!r}: {exc}"
+            f"Group {group_name!r}: cannot parse epoch {epoch_str!r}: {render(exc)}"
         ) from exc
 
     delta = datetime.timedelta(seconds=cadence_s)
@@ -248,72 +282,87 @@ def show_cmd(target: str, product_name: str, as_json: bool, derived: bool) -> No
 def verify_cmd(target: str, product_name: str, plugin: str | None) -> None:
     """Verify the current resolved-index record and mirrored root attr."""
 
+    from firecube.ingestor.runtime.index_record import IndexRecordError, verify_index_record
+
     manager = _manager(target, product_name)
     try:
-        record = _load_record(manager, product_name)
+        load_plugin = (
+            functools.partial(_load_plugin, plugin, manager) if plugin is not None else None
+        )
         try:
-            check_legacy_index_record(
-                manager, product=product_name, plugin_name=plugin or product_name
+            verification = verify_index_record(
+                chunk_manager=manager,
+                product_name=product_name,
+                target=target,
+                plugin_name=plugin,
+                load_plugin=load_plugin,
             )
-        except LegacyIndexRecordError as exc:
-            click.echo(str(exc), err=True)
-            raise click.exceptions.Exit(1) from exc
-
-        attrs_hash = manager.read_resolved_index_attrs_hash(product=product_name)
-        if record is None:
-            if attrs_hash is not None:
-                click.echo(
-                    "attrs drift — root attr has resolved-index identity hash but no "
-                    "on-disk record; run `firecube zarr index rebuild`",
-                    err=True,
-                )
-                raise click.exceptions.Exit(1)
-            _exit_no_record()
-
-        if plugin is not None:
-            ingestor = _load_plugin(plugin, manager)
-            try:
-                spec = ingestor.index_spec(_plugin_context(target, run_id="verify"))
-                if spec is None:
-                    raise click.ClickException(
-                        f"Plugin '{plugin}' does not opt into parallel ingestion "
-                        f"(index_spec() returned None). Nothing to verify."
-                    )
-                resolved = resolve_index_spec(
-                    spec,
-                    time_dim_name=str(getattr(ingestor, "time_dim_name", "timestamp")),
-                )
-            except click.ClickException:
-                raise
-            except Exception as exc:
-                raise click.ClickException(
-                    f"Plugin '{plugin}' failed to resolve index_spec: {exc}"
-                ) from exc
-            declared_hash = resolved.identity_hash
-            if declared_hash != record.identity_hash:
-                click.echo(
-                    "index drift — plugin resolved-index identity hash "
-                    f"{declared_hash[:8]} differs from on-disk record "
-                    f"{record.identity_hash[:8]}",
-                    err=True,
-                )
-                raise click.exceptions.Exit(1)
-
-        if attrs_hash is None:
-            click.echo(
-                "root attr will be re-mirrored on next `ensure` — this is the "
-                "expected repair path when only the on-disk record exists, not drift"
-            )
-        elif attrs_hash != record.identity_hash:
-            click.echo(
-                "attrs drift — root attr diverges from on-disk record; run "
-                "`firecube zarr index rebuild`",
-                err=True,
-            )
-            raise click.exceptions.Exit(1)
-        click.echo(f"VERIFIED resolved index {record.identity_hash[:16]}")
+        except IndexRecordError as exc:
+            # A plugin's own ClickException reaches the operator unchanged.
+            cause = exc.__cause__
+            if isinstance(cause, click.ClickException):
+                raise cause  # noqa: B904 - re-raise the plugin's exception as it was raised
+            raise click.ClickException(render(exc)) from exc
+        _render_verification(
+            verification,
+            rebuild=Operation(
+                "rebuild_index", target=target, plugin=plugin, product_name=product_name
+            ),
+        )
     finally:
         manager.close()
+
+
+def _render_verification(verification: IndexVerification, *, rebuild: Operation) -> None:
+    """Echo a verification verdict; exit 1 on drift or an unusable record, 3 without one.
+
+    `rebuild` is the `zarr index rebuild` call, with this invocation's values, that the
+    attrs advice prints.
+    """
+    outcome = verification.outcome
+    if outcome in ("unreadable-record", "legacy-record"):
+        detail = verification.detail
+        click.echo(str(detail) if detail is None else render(detail), err=True)
+        raise click.exceptions.Exit(1)
+    if outcome == "attrs-without-record":
+        advice = Message(
+            "attrs drift — root attr has resolved-index identity hash but no "
+            "on-disk record; `{rebuild}` refuses this state. "
+            "Restore `.firecube/index/current.json`, or remove the root attrs "
+            "`firecube_resolved_index_identity_hash` and `firecube_resolved_index` "
+            "and run `{rebuild}` with the plugin that wrote the data.",
+            rebuild=rebuild,
+        )
+        click.echo(render(advice), err=True)
+        raise click.exceptions.Exit(1)
+    if outcome == "no-record":
+        _exit_no_record()
+    identity_hash = str(verification.identity_hash)
+    if outcome == "index-drift":
+        click.echo(
+            "index drift — plugin resolved-index identity hash "
+            f"{str(verification.declared_hash)[:8]} differs from on-disk record "
+            f"{identity_hash[:8]}",
+            err=True,
+        )
+        raise click.exceptions.Exit(1)
+    if outcome == "attrs-drift":
+        advice = Message(
+            "attrs drift — root attr diverges from on-disk record; "
+            "`{rebuild}` refuses this state. "
+            "Remove the root attr `firecube_resolved_index_identity_hash`, "
+            "then run `{rebuild}`: it writes the attr again "
+            "from the record.",
+            rebuild=rebuild,
+        )
+        click.echo(render(advice), err=True)
+        raise click.exceptions.Exit(1)
+    if verification.attrs_hash is None:
+        click.echo(
+            "root attr will be re-mirrored on next `ensure` — this is the "
+            "expected repair path when only the on-disk record exists, not drift"
+        )
+    click.echo(f"VERIFIED resolved index {identity_hash[:16]}")
 
 
 @index.command("rebuild")
@@ -323,122 +372,29 @@ def verify_cmd(target: str, product_name: str, plugin: str | None) -> None:
 def rebuild_cmd(target: str, plugin: str, product_name: str) -> None:
     """Rebuild the resolved-index record from a plugin declaration."""
 
+    from firecube.ingestor.runtime.index_record import IndexRecordError, rebuild_index_record
+
     manager = _manager(target, product_name)
-    run_id = f"rebuild-{uuid.uuid4()}"
-    run_meta = {"run_id": run_id, "command": "index_rebuild"}
-    index_event_run_created = False
-    completed = False
     try:
         ingestor = _load_plugin(plugin, manager)
         try:
-            spec = ingestor.index_spec(_plugin_context(target, run_id=run_id))
-        except Exception as exc:
-            raise click.ClickException(
-                f"Plugin '{plugin}' failed to resolve index_spec: {exc}"
-            ) from exc
-        if spec is None:
-            raise click.ClickException(
-                f"Plugin '{plugin}' does not opt into parallel ingestion "
-                f"(index_spec() returned None). Nothing to rebuild."
+            rebuild_index_record(
+                ingestor=ingestor,
+                plugin_name=plugin,
+                chunk_manager=manager,
+                target=target,
+                product_name=product_name,
+                logger=logger,
+                report=echo_rendered,
+                warn=functools.partial(echo_rendered, err=True),
             )
-        try:
-            resolved = resolve_index_spec(
-                spec,
-                time_dim_name=str(getattr(ingestor, "time_dim_name", "timestamp")),
-            )
-        except Exception as exc:
-            raise click.ClickException(
-                f"Plugin '{plugin}' failed to resolve index_spec: {exc}"
-            ) from exc
-        legacy_model = resolved.as_legacy_slot_index_model()
-        if legacy_model is not None:
-            persisted_legacy_hash = manager.read_slot_index_attrs_hash(product=product_name)
-            declared_legacy_hash = legacy_model.identity_hash
-            if persisted_legacy_hash is not None and persisted_legacy_hash != declared_legacy_hash:
-                raise click.ClickException(
-                    f"Refusing to rebuild: persisted legacy slot-index identity hash "
-                    f"({persisted_legacy_hash[:16]}) differs from plugin's declared hash "
-                    f"({declared_legacy_hash[:16]}). Rebuilding would silently re-anchor "
-                    f"slot positions and disagree with data already on disk. To override: "
-                    f"(1) remove the `firecube_slot_index_model_identity_hash` root attr from the Zarr store, "
-                    f"AND (2) delete `.firecube/slot_index/current.json`. Both steps required."
-                )
-        # An unbounded group serializes as ``size: null`` rather than raising,
-        # so ``as_resolved_index_record`` cannot signal the refusal; probe each
-        # group's extent explicitly before persisting anything.
-        unbounded_groups: list[str] = []
-        for group in resolved.groups:
-            try:
-                resolved.size(group)
-            except ExtentUnknownError:
-                unbounded_groups.append(group)
-        if unbounded_groups:
-            groups = ", ".join(repr(group) for group in unbounded_groups)
-            raise click.ClickException(
-                f"Plugin '{plugin}' failed to create resolved index record for "
-                f"unbounded group(s) {groups}: set end_date or slot_count to "
-                "materialize the group's coord"
-            )
-        record = resolved.as_resolved_index_record(run_id=run_id)
-        try:
-            persisted_record, outcome = manager.ensure_resolved_index(
-                product=product_name,
-                record=record,
-                run_id=run_id,
-            )
-            index_event_run_created = True
+        except IndexRecordError as exc:
+            raise click.ClickException(render(exc)) from exc
         except ResolvedIndexConflictError as exc:
-            index_event_run_created = True
-            click.echo(str(exc), err=True)
+            # The library has already echoed the conflict through ``warn``.
             raise click.exceptions.Exit(1) from exc
-        telemetry = TelemetryService(
-            observability.create_ingestion_telemetry(
-                plugin=plugin,
-                product=product_name,
-                output_format="zarr",
-                write_mode="rebuild",
-                run_id=run_id,
-            ),
-            plugin,
-        )
-        emit_index_ensured_full(
-            manager,
-            telemetry,
-            product=product_name,
-            run_id=run_id,
-            record=persisted_record,
-            outcome="rebuilt",
-            logger=logger,
-        )
-        completed = True
-        if outcome == "created":
-            click.echo(f"Rebuilt index record: identity_hash={persisted_record.identity_hash[:16]}")
-            return
-        click.echo(f"Index record unchanged: identity_hash={persisted_record.identity_hash[:16]}")
+        except ResolvedIndexAttrsConflictError as exc:
+            raise click.ClickException(render(exc)) from exc
     finally:
-        if index_event_run_created:
-            try:
-                if completed:
-                    manager.record_run_terminal(
-                        product=product_name,
-                        run_id=run_id,
-                        output_path=target,
-                        output_format="zarr",
-                        size=0,
-                        meta=run_meta,
-                        status="complete",
-                    )
-                else:
-                    manager.record_run_failed(
-                        product=product_name,
-                        run_id=run_id,
-                        output_path=target,
-                        output_format="zarr",
-                        size=0,
-                        meta=run_meta,
-                        error="rebuild aborted",
-                    )
-            except Exception as exc:
-                logger.error("rebuild run termination failed: %s", exc)
         with contextlib.suppress(Exception):
             manager.close()

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,7 @@ from firecube.ingestor.templates.direct_zarr import (
     ZarrGroupSpec,
     _compute_schema_hash,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -124,59 +126,25 @@ def test_normalizes_nan_fill_value() -> None:
     )
 
 
-def test_shards_changes_hash() -> None:
-    """shards change → different hash."""
-    spec_a = ZarrGroupSpec(
-        group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
-    )
-    spec_b = ZarrGroupSpec(
-        group="g",
-        arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32", shards=(5, 4))],
-    )
-    assert _compute_schema_hash([spec_a], {"g": 10}) != _compute_schema_hash([spec_b], {"g": 10})
-
-
-def test_attrs_changes_hash() -> None:
-    """attrs change → different hash."""
-    spec_a = ZarrGroupSpec(
-        group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
-    )
-    spec_b = ZarrGroupSpec(
-        group="g",
-        arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32", attrs={"units": "K"})],
-    )
-    assert _compute_schema_hash([spec_a], {"g": 10}) != _compute_schema_hash([spec_b], {"g": 10})
-
-
-def test_dimension_names_changes_hash() -> None:
-    """dimension_names change → different hash."""
-    spec_a = ZarrGroupSpec(
-        group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
-    )
-    spec_b = ZarrGroupSpec(
-        group="g",
-        arrays=[
-            ZarrArraySpec(
-                name="d",
-                shape=(10, 4),
-                dtype="float32",
-                dimension_names=("time", "y"),
+def test_declared_field_changes_hash(subtests, tmp_path: Path) -> None:
+    rows = {
+        "shards_changes_hash": {"shards": (5, 4)},
+        "attrs_changes_hash": {"attrs": {"units": "K"}},
+        "dimension_names_changes_hash": {"dimension_names": ("time", "y")},
+        "time_indexed_changes_hash": {"time_indexed": False},
+    }
+    for row_id, fields in rows.items():
+        with table_row(subtests, row_id, tmp_path):
+            spec_a = ZarrGroupSpec(
+                group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
             )
-        ],
-    )
-    assert _compute_schema_hash([spec_a], {"g": 10}) != _compute_schema_hash([spec_b], {"g": 10})
-
-
-def test_time_indexed_changes_hash() -> None:
-    """time_indexed=False changes hash."""
-    spec_a = ZarrGroupSpec(
-        group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
-    )
-    spec_b = ZarrGroupSpec(
-        group="g",
-        arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32", time_indexed=False)],
-    )
-    assert _compute_schema_hash([spec_a], {"g": 10}) != _compute_schema_hash([spec_b], {"g": 10})
+            spec_b = ZarrGroupSpec(
+                group="g",
+                arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32", **fields)],
+            )
+            assert _compute_schema_hash([spec_a], {"g": 10}) != _compute_schema_hash(
+                [spec_b], {"g": 10}
+            )
 
 
 def test_attrs_order_insensitive() -> None:
@@ -204,11 +172,3 @@ def test_attrs_order_insensitive() -> None:
         ],
     )
     assert _compute_schema_hash([spec_a], {"g": 10}) == _compute_schema_hash([spec_b], {"g": 10})
-
-
-def test_default_fields_deterministic() -> None:
-    """Two calls with identical default-field specs return the SAME hash."""
-    spec = ZarrGroupSpec(
-        group="g", arrays=[ZarrArraySpec(name="d", shape=(10, 4), dtype="float32")]
-    )
-    assert _compute_schema_hash([spec], {"g": 10}) == _compute_schema_hash([spec], {"g": 10})

@@ -28,12 +28,14 @@ import xarray as xr
 import zarr
 
 from firecube.core.controlplane.manager import ChunkManager
+from firecube.core.errors import ConfigurationError
 from firecube.core.filesystem.ops import _open_fsspec_url
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
 from firecube.core.storage.uri import StorageUri
+from firecube.core.time.calendar import is_calendar_valued, is_gregorian_like
 from firecube.core.uris import is_remote_target, local_path_from_target, parse_target
 
 from ._compat import require_tensogram
@@ -55,6 +57,55 @@ def _is_encodable_dtype(dtype) -> bool:
     import numpy as np
 
     return np.dtype(dtype).kind not in _UNENCODABLE_DTYPE_KINDS
+
+
+class CalendarArchiveError(ConfigurationError):
+    """A time coordinate on a non-Gregorian calendar cannot be archived to Tensogram.
+
+    The archive carries no CF time encoding, so skipping the coordinate would drop the axis.
+
+    Attributes:
+        coordinate: The name of the time coordinate.
+        calendar: The calendar of its values.
+    """
+
+    def __init__(self, coordinate: str, calendar: str) -> None:
+        """Build the error and its sentence.
+
+        Args:
+            coordinate: The name of the time coordinate.
+            calendar: The calendar of its values.
+        """
+        self.coordinate = coordinate
+        self.calendar = calendar
+        super().__init__(
+            f"Cannot archive time coordinate {coordinate!r}: calendar={calendar!r} is "
+            "not Gregorian-like. Archiving a time coordinate on a non-Gregorian calendar is "
+            "not supported yet, because the .tgm archive does not carry CF time encoding "
+            "(units/calendar); silently dropping the coordinate would produce an archive "
+            "with no time axis for this group."
+        )
+
+
+def _raise_if_non_gregorian_time_coordinate(coord_name: str, coordinate: xr.Variable) -> None:
+    """Raise CalendarArchiveError when a skipped coordinate is a non-Gregorian time axis.
+
+    Object-dtype variables are skipped by the archive, which would silently drop a time
+    coordinate. Other skipped variables, and Gregorian-like calendars, are left to the caller.
+    """
+    if coordinate.dtype.kind != "O":
+        return
+    if coordinate.ndim != 1 or coordinate.dims != (coord_name,):
+        return
+    values = np.asarray(coordinate.values).reshape(-1)
+    if values.size == 0:
+        return
+    first = values[0]
+    if not is_calendar_valued(first):
+        return
+    if is_gregorian_like(first.calendar):
+        return
+    raise CalendarArchiveError(coord_name, first.calendar)
 
 
 def zarr_to_tgm(
@@ -101,9 +152,10 @@ def zarr_to_tgm(
         groups_to_archive: list[str | None] = [group]
     else:
         zroot = session.zarr.open_group(source_uri, mode="r")
-        groups_to_archive = [
-            name for name, member in zroot.members() if isinstance(member, zarr.Group)
-        ]
+        groups_to_archive = sorted(
+            (name for name, member in zroot.members() if isinstance(member, zarr.Group)),
+            key=str,
+        )
         if not groups_to_archive:
             groups_to_archive = [None]
 
@@ -143,7 +195,7 @@ def zarr_to_tgm(
                         )
                     ds = ds[variables]
 
-                coord_names = [str(name) for name in ds.coords]
+                coord_names = sorted(str(name) for name in ds.coords)
                 zarr_meta = extract_zarr_array_metadata(
                     source,
                     group_name,
@@ -153,7 +205,7 @@ def zarr_to_tgm(
                 objects: list[tuple[dict[str, Any], np.ndarray]] = []
                 base: list[dict[str, Any]] = []
 
-                for var_name in ds.data_vars:
+                for var_name in sorted(ds.data_vars, key=str):
                     variable = ds[var_name].variable
                     if not _is_encodable_dtype(variable.dtype):
                         logger.warning(
@@ -180,9 +232,10 @@ def zarr_to_tgm(
                         )
                     )
 
-                for coord_name in ds.coords:
+                for coord_name in sorted(ds.coords, key=str):
                     coordinate = ds.coords[coord_name].variable
                     if not _is_encodable_dtype(coordinate.dtype):
+                        _raise_if_non_gregorian_time_coordinate(str(coord_name), coordinate)
                         logger.warning(
                             "Skipping variable '%s': unsupported dtype %s",
                             coord_name,

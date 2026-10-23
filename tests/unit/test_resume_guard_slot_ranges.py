@@ -69,22 +69,50 @@ def _make_chunk_manager(runs: list[RunInfo]) -> MagicMock:
 
 
 @pytest.mark.unit
-def test_no_active_runs_allows():
-    chunk_manager = _make_chunk_manager([])
+@pytest.mark.parametrize(
+    ("runs", "slot_range"),
+    [
+        pytest.param([], (0, 100), id="no_active_runs_allows"),
+        pytest.param([_make_run(slot_range=(0, 100))], (100, 200), id="disjoint_ranges_allowed"),
+        pytest.param(
+            [_make_run(slot_range=None, stale=True)], (0, 100), id="stale_non_range_allows_range"
+        ),
+        pytest.param([_make_run(slot_range=(0, 1))], (1, 2), id="single_slot_adjacent_ranges"),
+    ],
+)
+def test_range_invocation_allowed(runs: list[RunInfo], slot_range: tuple[int, int]) -> None:
+    chunk_manager = _make_chunk_manager(runs)
     guard = _make_guard(chunk_manager)
 
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group=None)
+    guard.enforce(ctx=_make_ctx(), product="P", slot_range=slot_range, slot_group=None)
 
     chunk_manager.list_chunks.assert_called_once()
 
 
 @pytest.mark.unit
-def test_same_range_no_resume_blocks():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=(0, 100))])
+@pytest.mark.parametrize(
+    ("run_range", "requested", "error", "match"),
+    [
+        pytest.param(
+            (0, 100), (0, 100), ResumeConflictError, "same slot_range", id="same_range_no_resume"
+        ),
+        pytest.param(
+            (0, 100), (50, 150), RangeOverlapError, "overlaps", id="overlapping_different_range"
+        ),
+        pytest.param(None, (0, 100), ResumeConflictError, "Non-range run", id="non_range_active"),
+    ],
+)
+def test_range_invocation_blocked(
+    run_range: tuple[int, int] | None,
+    requested: tuple[int, int],
+    error: type[Exception],
+    match: str,
+) -> None:
+    chunk_manager = _make_chunk_manager([_make_run(slot_range=run_range)])
     guard = _make_guard(chunk_manager)
 
-    with pytest.raises(ResumeConflictError, match="same slot_range"):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group=None)
+    with pytest.raises(error, match=match):
+        guard.enforce(ctx=_make_ctx(), product="P", slot_range=requested, slot_group=None)
 
     chunk_manager.list_chunks.assert_not_called()
 
@@ -117,48 +145,6 @@ def test_same_range_with_force_reingest_allows_without_run_scan():
 
 
 @pytest.mark.unit
-def test_overlapping_different_range_blocks():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=(0, 100))])
-    guard = _make_guard(chunk_manager)
-
-    with pytest.raises(RangeOverlapError, match="overlaps"):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(50, 150), slot_group=None)
-
-    chunk_manager.list_chunks.assert_not_called()
-
-
-@pytest.mark.unit
-def test_disjoint_ranges_allowed():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=(0, 100))])
-    guard = _make_guard(chunk_manager)
-
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(100, 200), slot_group=None)
-
-    chunk_manager.list_chunks.assert_called_once()
-
-
-@pytest.mark.unit
-def test_non_range_active_blocks_range_invocation():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=None)])
-    guard = _make_guard(chunk_manager)
-
-    with pytest.raises(ResumeConflictError, match="Non-range run"):
-        guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group=None)
-
-    chunk_manager.list_chunks.assert_not_called()
-
-
-@pytest.mark.unit
-def test_stale_non_range_allows_range_invocation():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=None, stale=True)])
-    guard = _make_guard(chunk_manager)
-
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(0, 100), slot_group=None)
-
-    chunk_manager.list_chunks.assert_called_once()
-
-
-@pytest.mark.unit
 def test_single_pod_mode_blocks_as_before():
     chunk_manager = _make_chunk_manager([_make_run(slot_range=None)])
     guard = _make_guard(chunk_manager)
@@ -167,23 +153,3 @@ def test_single_pod_mode_blocks_as_before():
         guard.enforce(ctx=_make_ctx(), product="P", slot_range=None)
 
     chunk_manager.list_chunks.assert_not_called()
-
-
-@pytest.mark.unit
-def test_back_to_back_ranges_are_disjoint():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=(0, 100))])
-    guard = _make_guard(chunk_manager)
-
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(100, 200), slot_group=None)
-
-    chunk_manager.list_chunks.assert_called_once()
-
-
-@pytest.mark.unit
-def test_single_slot_adjacent_ranges():
-    chunk_manager = _make_chunk_manager([_make_run(slot_range=(0, 1))])
-    guard = _make_guard(chunk_manager)
-
-    guard.enforce(ctx=_make_ctx(), product="P", slot_range=(1, 2), slot_group=None)
-
-    chunk_manager.list_chunks.assert_called_once()

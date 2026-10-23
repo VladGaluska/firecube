@@ -59,6 +59,7 @@ from firecube.ingestor.api import (
     ZarrArraySpec,
     ZarrGroupSpec,
 )
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_context
 
 pytestmark = pytest.mark.integration
@@ -372,120 +373,39 @@ def test_staged_mode_preserves_cumulative_state(
     )
 
 
-@pytest.mark.parametrize(("ingestor_cls", "product_filename"), _TEMPLATE_PARAMS)
-def test_staged_mode_fresh_target_is_noop(
-    tmp_path: Path,
-    ingestor_cls: type,
-    product_filename: str,
-) -> None:
-    """Fresh staged ingest (no prior target) must not raise a seeding error.
-
-    Seeding is a no-op when the final target does not exist yet.
-    This invariant must hold both before and after the runtime hook (T5) lands.
-    """
-    # Do NOT pre-create the target — fresh ingest scenario
-    _run_staged_ingest(
-        ingestor_cls,
-        tmp_path,
-        product_filename=product_filename,
-        ts_iso=_T1,
-        sentinel=_SENTINEL_A,
-        resume_existing=False,
-    )
-
-    final_zarr = tmp_path / product_filename
-    assert final_zarr.exists(), f"Fresh staged ingest produced no output at {final_zarr}"
-
-    timestamp_arr = zarr.open_array(str(final_zarr / "data" / "timestamp"), mode="r")
-    assert timestamp_arr.shape == (1,), (
-        f"{ingestor_cls.__name__}: expected shape (1,) after fresh ingest, "
-        f"got {timestamp_arr.shape}"
-    )
+# Value-dedup rows: (old test name, timestamps of the resume runs after a fresh T1 run,
+# expected stored timestamps). Re-ingesting T1 must keep one slot; T2 must append.
+_VALUE_DEDUP_ROWS = [
+    ("test_value_dedup_idempotent_reingest", [_T1, _T1], [_T1]),
+    ("test_value_dedup_distinct_append", [_T2], [_T1, _T2]),
+]
 
 
 @pytest.mark.parametrize("write_mode", _VALUE_DEDUP_PARAMS)
-def test_value_dedup_idempotent_reingest(tmp_path: Path, write_mode: str) -> None:
-    """Re-ingesting the same timestamp ≥2 times in both modes must stay shape==(1,).
-
-    staged mode is RED until coord-chunk seeding lands (T6).
-    direct mode must always pass.
-    """
-    _run_staged_ingest(
-        _ValueDedupParityIngestor,
-        tmp_path,
-        product_filename="value_dedup_parity.zarr",
-        ts_iso=_T1,
-        sentinel=_SENTINEL_A,
-        resume_existing=False,
-        write_mode=write_mode,
-    )
-    _run_staged_ingest(
-        _ValueDedupParityIngestor,
-        tmp_path,
-        product_filename="value_dedup_parity.zarr",
-        ts_iso=_T1,
-        sentinel=_SENTINEL_A,
-        resume_existing=True,
-        write_mode=write_mode,
-    )
-    _run_staged_ingest(
-        _ValueDedupParityIngestor,
-        tmp_path,
-        product_filename="value_dedup_parity.zarr",
-        ts_iso=_T1,
-        sentinel=_SENTINEL_A,
-        resume_existing=True,
-        write_mode=write_mode,
-    )
-
-    final_zarr = tmp_path / "value_dedup_parity.zarr"
-    ts_arr = zarr.open_array(str(final_zarr / "data" / "timestamp"), mode="r")
-    timestamps = _decode_timestamp_array(ts_arr)
-
-    assert ts_arr.shape == (1,), (
-        f"[{write_mode}] Expected shape (1,) after 2 re-ingests, got {ts_arr.shape}. "
-        "Value-based dedup failed — timestamp coordinate chunks not seeded to workspace."
-    )
-    assert len(set(timestamps.astype(str))) == 1, (
-        f"[{write_mode}] Expected 1 distinct timestamp, got {set(timestamps.astype(str))}"
-    )
-
-
-@pytest.mark.parametrize("write_mode", _VALUE_DEDUP_PARAMS)
-def test_value_dedup_distinct_append(tmp_path: Path, write_mode: str) -> None:
-    """Appending a DIFFERENT timestamp must still produce shape==(2,) in both modes."""
-    _run_staged_ingest(
-        ingestor_cls=_ValueDedupParityIngestor,
-        tmp_path=tmp_path,
-        product_filename="value_dedup_parity.zarr",
-        ts_iso=_T1,
-        sentinel=_SENTINEL_A,
-        write_mode=write_mode,
-        resume_existing=False,
-    )
-    _run_staged_ingest(
-        ingestor_cls=_ValueDedupParityIngestor,
-        tmp_path=tmp_path,
-        product_filename="value_dedup_parity.zarr",
-        ts_iso=_T2,
-        sentinel=_SENTINEL_B,
-        write_mode=write_mode,
-        resume_existing=True,
-    )
-
-    final_zarr = tmp_path / "value_dedup_parity.zarr"
-    ts_arr = zarr.open_array(str(final_zarr / "data" / "timestamp"), mode="r")
-    timestamps = _decode_timestamp_array(ts_arr)
-
-    assert ts_arr.shape == (2,), (
-        f"[{write_mode}] Expected shape (2,) after distinct-timestamp append, got {ts_arr.shape}."
-    )
-    assert timestamps[0] == np.datetime64(_T1, "s"), (
-        f"[{write_mode}] Slot 0 should be T1 ({_T1}), got {timestamps[0]}"
-    )
-    assert timestamps[1] == np.datetime64(_T2, "s"), (
-        f"[{write_mode}] Slot 1 should be T2 ({_T2}), got {timestamps[1]}"
-    )
+def test_value_dedup_reingest(tmp_path: Path, subtests: pytest.Subtests, write_mode: str) -> None:
+    """Value-based dedup keeps one slot per timestamp in both write modes."""
+    for row_id, resumed, expected in _VALUE_DEDUP_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            for run, ts_iso in enumerate([_T1, *resumed]):
+                _run_staged_ingest(
+                    _ValueDedupParityIngestor,
+                    workdir,
+                    product_filename="value_dedup_parity.zarr",
+                    ts_iso=ts_iso,
+                    sentinel=_SENTINEL_A if ts_iso == _T1 else _SENTINEL_B,
+                    resume_existing=run > 0,
+                    write_mode=write_mode,
+                )
+            final_zarr = workdir / "value_dedup_parity.zarr"
+            ts_arr = zarr.open_array(str(final_zarr / "data" / "timestamp"), mode="r")
+            timestamps = _decode_timestamp_array(ts_arr)
+            assert ts_arr.shape == (len(expected),), (
+                f"[{write_mode}] Expected shape ({len(expected)},), got {ts_arr.shape}. "
+                "Value-based dedup failed: timestamp coordinate chunks not seeded to workspace."
+            )
+            assert list(timestamps) == [np.datetime64(t, "s") for t in expected], (
+                f"[{write_mode}] Expected timestamps {expected}, got {list(timestamps)}"
+            )
 
 
 def test_staged_hook_does_not_fire_for_non_zarr_outputs(tmp_path: Path) -> None:

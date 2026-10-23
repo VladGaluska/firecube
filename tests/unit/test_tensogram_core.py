@@ -16,7 +16,15 @@
 
 from __future__ import annotations
 
+import json
+
+import numpy as np
 import pytest
+import zarr
+
+from firecube.core.config import StorageConfig
+
+_LOCAL = StorageConfig(storage_type="local")
 
 
 class TestDatasetToGlobalMeta:
@@ -115,6 +123,51 @@ class TestZarrToTgm:
         assert result["file_size_bytes"] > 0
         assert result["compression"] == "zstd"
 
+    @pytest.mark.parametrize("snapshot", ["root", "G"])
+    def test_archives_live_variable_size_under_a_stale_snapshot(self, tmp_path, snapshot):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import zarr_to_tgm
+
+        path = _store_with_stale_snapshot(tmp_path, snapshot)
+        zarr_to_tgm(str(path), str(tmp_path / "o.tgm"), group="G", storage_config=_LOCAL)
+        assert xr.open_dataset(str(tmp_path / "o.tgm"), engine="tensogram")["v"].size == 6
+
+    def test_archives_a_group_created_after_the_root_snapshot(self, tmp_path):
+        from firecube.core.tensogram.converter import zarr_to_tgm
+
+        path = str(tmp_path / "s.zarr")
+        zarr.open_group(path, mode="w", zarr_format=3).create_group("old")
+        zarr.consolidate_metadata(path)
+        live = zarr.open_group(path, mode="r+", use_consolidated=False)
+        live.create_group("new").create_array("v", data=np.zeros(2), dimension_names=["v"])
+        assert "new" in zarr_to_tgm(path, str(tmp_path / "o.tgm"), storage_config=_LOCAL)["groups"]
+
+    def test_archive_lists_groups_variables_and_coordinates_in_name_order(self, tmp_path, subtests):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import zarr_to_tgm
+        from firecube.core.tensogram.inspection import open_tgm_listing, tgm_info
+
+        src, tgt = str(tmp_path / "s.zarr"), str(tmp_path / "o.tgm")
+        names = ["temp", "alpha", "wind", "cloud", "rain"]
+        for g in ["Zeta", "Alpha", "Mid", "Beta"]:
+            data = {v: (("x", "y", "t"), np.zeros((2, 2, 2))) for v in names}
+            coords = {"x": [0, 1], "y": [0, 1], "t": [0, 1]}
+            xr.Dataset(data, coords=coords).to_zarr(src, group=g, mode="a")
+        zarr_to_tgm(src, tgt, storage_config=_LOCAL)
+        with open_tgm_listing(tgt, operation="test") as listing:
+            seen = {m.group_name: [o.name for o in m.objects()] for m in listing.messages()}
+        details = tgm_info(tgt, operation="test")["group_details"]
+        info = {d["group"]: list(d["variables"]) for d in details}
+        with subtests.test(msg="group_order"):
+            assert list(seen) == ["Alpha", "Beta", "Mid", "Zeta"]
+        for group in ["Alpha", "Beta", "Mid", "Zeta"]:
+            with subtests.test(msg=f"{group}_objects"):
+                assert seen[group] == [*sorted(names), "t", "x", "y"]
+            with subtests.test(msg=f"{group}_variables"):
+                assert info[group] == sorted(names)
+
     def test_produces_xarray_openable_file(self, tmp_path):
         """The produced .tgm is openable with xr.open_dataset(engine='tensogram')."""
         import numpy as np
@@ -179,20 +232,6 @@ class TestZarrToTgm:
         np.testing.assert_array_equal(loaded["timestamp"].values, np.array([2, 3, 4]))
         np.testing.assert_array_equal(loaded["FWI"].values, values[1:4])
 
-    def test_variable_names_preserved_in_v3(self, tmp_path):
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "test.zarr")
-        tgt = str(tmp_path / "test.tgm")
-        ds = xr.Dataset({"FWI": (["t"], np.ones(3, dtype="float32"))})
-        ds.to_zarr(src)
-        zarr_to_tgm(src, tgt)
-        loaded = xr.open_dataset(tgt, engine="tensogram")
-        assert "FWI" in loaded.data_vars
-
     def test_allow_nan_true_accepts_nan_data(self, tmp_path):
         import numpy as np
         import xarray as xr
@@ -220,41 +259,6 @@ class TestZarrToTgm:
         with pytest.raises(ValueError, match="strict-NaN check"):
             zarr_to_tgm(src, tgt, allow_nan=False)
 
-    def test_default_compression_is_zstd(self, tmp_path):
-        """zarr_to_tgm default compression is zstd."""
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "test.zarr")
-        tgt = str(tmp_path / "test.tgm")
-        ds = xr.Dataset({"X": (["t"], np.ones(3, dtype="float32"))})
-        ds.to_zarr(src)
-        result = zarr_to_tgm(src, tgt)
-        assert result["compression"] == "zstd"
-
-    def test_skipped_string_variables(self, tmp_path):
-        """zarr_to_tgm skips string variables and reports them."""
-        import numpy as np
-        import xarray as xr
-
-        from firecube.core.tensogram.converter import zarr_to_tgm
-
-        src = str(tmp_path / "mixed.zarr")
-        tgt = str(tmp_path / "mixed.tgm")
-        ds = xr.Dataset(
-            {
-                "temp": (["t"], np.array([1.0, 2.0], dtype="float32")),
-                "name": (["t"], np.array(["a", "b"], dtype="<U1")),
-            }
-        )
-        ds.to_zarr(src)
-        result = zarr_to_tgm(src, tgt)
-        assert "temp" in result["variables"]
-        assert "name" not in result["variables"]
-        assert "name" in result["skipped"]
-
     def test_variables_excludes_skipped(self, tmp_path):
         """zarr_to_tgm return dict 'variables' only includes actually archived vars."""
         import numpy as np
@@ -274,6 +278,22 @@ class TestZarrToTgm:
         result = zarr_to_tgm(src, tgt)
         assert result["variables"] == ["val"]
         assert result["skipped"] == ["label"]
+
+    def test_refuses_a_360_day_time_coordinate_instead_of_dropping_it(self, tmp_path):
+        import xarray as xr
+
+        from firecube.core.tensogram.converter import CalendarArchiveError, zarr_to_tgm
+
+        src = str(tmp_path / "cal.zarr")
+        times = xr.date_range(
+            "2020-01-01", periods=5, freq="D", calendar="360_day", use_cftime=True
+        )
+        xr.Dataset({"X": (["time"], np.arange(5.0))}, coords={"time": times}).to_zarr(src)
+
+        with pytest.raises(CalendarArchiveError) as excinfo:
+            zarr_to_tgm(src, str(tmp_path / "cal.tgm"))
+
+        assert (excinfo.value.coordinate, excinfo.value.calendar) == ("time", "360_day")
 
 
 class TestTgmToZarr:
@@ -351,6 +371,85 @@ class TestRequireTensogram:
             _compat.require_tensogram("test operation")
 
 
+def _archive(tmp_path, *, controlplane=False):
+    import numpy as np
+    import xarray as xr
+
+    from firecube.core.tensogram.converter import zarr_to_tgm
+
+    src = tmp_path / "src.zarr"
+    xr.Dataset({"FWI": (["t"], np.ones(3, dtype="float32"))}).to_zarr(str(src))
+    if controlplane:
+        (src / ".firecube").mkdir()
+    zarr_to_tgm(str(src), str(tmp_path / "a.tgm"))
+    return str(tmp_path / "a.tgm")
+
+
+class TestTgmInspection:
+    @pytest.mark.integration
+    @pytest.mark.parametrize("controlplane", [True, False])
+    def test_info_reports_variables_and_controlplane_presence(self, tmp_path, controlplane):
+        from firecube.core.tensogram.inspection import tgm_info
+
+        path = _archive(tmp_path, controlplane=controlplane)
+        info = tgm_info(path, operation="firecube archive info")
+        size = (tmp_path / "a.tgm").stat().st_size
+        keys = ["path", "format", "size_bytes", "groups", "has_controlplane", "group_details"]
+        assert list(info) == keys
+        assert [info[k] for k in keys[:5]] == [path, "v1", size, [""], controlplane]
+        assert list(info["group_details"][0]["variables"]) == ["FWI"]
+
+    @pytest.mark.integration
+    def test_info_refuses_unsupported_version_naming_the_path(self, tmp_path):
+        import tensogram
+
+        from firecube.core.tensogram.inspection import TensogramArchiveError, tgm_info
+
+        path = str(tmp_path / "old.tgm")
+        with tensogram.TensogramFile.create(path) as f:  # pyright: ignore[reportAttributeAccessIssue]
+            f.append({"firecube": {"role": "data", "archive_version": "v0"}}, [])
+        with pytest.raises(TensogramArchiveError, match="Unsupported") as exc:
+            tgm_info(path, operation="firecube archive info")
+        assert exc.value.path == path
+
+    @pytest.mark.integration
+    def test_listing_yields_controlplane_and_data_messages_with_objects(self, tmp_path):
+        from firecube.core.tensogram.inspection import open_tgm_listing
+
+        path = _archive(tmp_path, controlplane=True)
+        with open_tgm_listing(path, operation="firecube archive list") as listing:
+            messages = list(listing.messages())
+            assert listing.message_count == len(messages) == 2
+            data, controlplane = messages
+            assert [o.name for o in data.objects()] == ["FWI"]
+            assert (data.is_controlplane, controlplane.is_controlplane) == (False, True)
+            assert controlplane.objects() == ()
+
+    @pytest.mark.integration
+    def test_validate_flags_a_truncated_archive_but_not_an_intact_one(self, tmp_path):
+        from firecube.core.tensogram.inspection import validate_tgm
+
+        path = _archive(tmp_path, controlplane=True)
+        intact = validate_tgm(path, operation="firecube archive validate")
+        assert (intact.message_count, intact.issues) == (2, ())
+        (tmp_path / "cut.tgm").write_bytes((tmp_path / "a.tgm").read_bytes()[:200])
+        cut = validate_tgm(str(tmp_path / "cut.tgm"), operation="firecube archive validate")
+        assert cut.issues
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("name", ["tgm_info", "open_tgm_listing", "validate_tgm"])
+    def test_missing_extras_names_the_operation(self, monkeypatch, name):
+        from firecube.core.tensogram import _compat, inspection
+
+        monkeypatch.setattr(_compat, "HAS_TENSOGRAM", False)
+        call = getattr(inspection, name)
+        with pytest.raises(ImportError) as exc:
+            result = call("missing.tgm", operation="firecube archive probe")
+            if name == "open_tgm_listing":
+                result.__enter__()
+        assert str(exc.value).startswith("firecube archive probe")
+
+
 class TestSchemaHelpers:
     """Tests for archive schema constants and helpers."""
 
@@ -383,8 +482,38 @@ class TestSchemaHelpers:
         assert meta["firecube"]["archive_version"] == "v1"
 
 
+def _store_with_stale_snapshot(tmp_path, snapshot, *, group=True, reencode=False):
+    """A store whose snapshot (at ``snapshot``: "root" or "G") predates v growing 4 to 6."""
+    path = tmp_path / "s.zarr"
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    parent = root.create_group("G") if group else root
+    parent.create_array("v", data=np.arange(4, dtype="float32"), chunks=(2,), dimension_names=["v"])
+    zarr.consolidate_metadata(str(path))
+    if snapshot == "G":
+        zarr.consolidate_metadata(str(path / "G"))
+    name = "G/v" if group else "v"
+    live = zarr.open_array(str(path / name), mode="r+")
+    live.resize((6,))
+    live[4:] = [4, 5]
+    if reencode:
+        doc = path / name / "zarr.json"
+        meta = json.loads(doc.read_text())
+        meta["fill_value"] = 7.0
+        meta["chunk_grid"]["configuration"]["chunk_shape"] = [3]
+        doc.write_text(json.dumps(meta))
+    return path
+
+
 class TestExtractZarrArrayMetadata:
     """Tests for extract_zarr_array_metadata."""
+
+    @pytest.mark.parametrize(("snap", "grp"), [("root", None), ("G", "G")])
+    def test_reads_live_chunks_and_fill_value_under_a_stale_snapshot(self, tmp_path, snap, grp):
+        from firecube.core.tensogram.metadata import extract_zarr_array_metadata
+
+        path = _store_with_stale_snapshot(tmp_path, snap, group=grp is not None, reencode=True)
+        meta = extract_zarr_array_metadata(str(path), grp, storage_config=_LOCAL)
+        assert (meta["v"]["chunks"], meta["v"]["fill_value"]) == ((3,), 7.0)
 
     def test_extracts_chunk_shapes(self, tmp_path):
         import zarr

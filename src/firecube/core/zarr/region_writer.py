@@ -27,26 +27,56 @@ coordinate axes and should be skipped by `ensure_timestamp_slot`.
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime as dt
 import logging
 import math
+import operator
 import struct
-from collections.abc import Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 import zarr
+from zarr.abc.store import Store
 from zarr.errors import GroupNotFoundError, NodeNotFoundError
-from zarr.storage import LocalStore
+from zarr.storage import FsspecStore, LocalStore
 
-from firecube.core.errors import SchemaDriftError
+from firecube.core.errors import Message, Placeholder, SchemaDriftError
+from firecube.core.time.calendar import is_calendar_valued
+from firecube.core.time.gregorian import gregorian_to_datetime64_ns
+from firecube.core.time.guard import reject_non_gregorian_calendar_value
 from firecube.core.uris import is_remote_target, local_path_from_target
 from firecube.core.zarr._coord_lifecycle import (
     CoordLifecycleState,
     raise_if_invalid,
     resolve_coord_lifecycle,
 )
+from firecube.core.zarr._fill import _array_is_all_fill, _fill_value_is_missing
 from firecube.core.zarr._reserved_attrs import _FILL_VALUE_ATTR, assert_attrs_safe
+from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED
+from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.chunk_geometry import Bounds
+from firecube.core.zarr.guard.engine_owned import preallocate_operation
+from firecube.core.zarr.guard.guarded_write import (
+    ArrayHold,
+    WriteFootprint,
+    WriteResult,
+    current_hold,
+    guarded_write,
+    hold_array,
+)
+from firecube.core.zarr.guard.metadata_authority import (
+    MetadataAuthority,
+    MetadataScope,
+    create_or_open_array,
+    set_attributes,
+)
+from firecube.core.zarr.guard.metadata_authority import ensure_group as _authorized_ensure_group
+from firecube.core.zarr.guard.unit_ownership import _axis_index
 
 log = logging.getLogger("firecube.core.zarr.region_writer")
 
@@ -67,22 +97,6 @@ def _raise_time_capacity_error(
     )
 
 
-def _fill_value_is_missing(value: Any) -> bool:
-    """Return True when *value* is a not-a-value sentinel for its dtype.
-
-    Covers floating/complex ``NaN`` and datetime64/timedelta64 ``NaT`` — the fill
-    sentinels that are never equal to themselves under ``==``. Dispatch is by
-    numpy dtype kind so every such type is handled uniformly; all other kinds
-    (ints, bytes, object, ``None``) are never "missing".
-    """
-    arr = np.asarray(value)
-    if arr.dtype.kind in ("f", "c"):  # floating, complex
-        return bool(np.isnan(arr))
-    if arr.dtype.kind in ("M", "m"):  # datetime64, timedelta64
-        return bool(np.isnat(arr))
-    return False
-
-
 def _fill_values_equal(existing: Any, spec: Any) -> bool:
     # Missing-value fills (NaN, NaT) are never == themselves, so compare them by
     # "both missing" rather than by value; otherwise fall back to plain equality.
@@ -91,30 +105,6 @@ def _fill_values_equal(existing: Any, spec: Any) -> bool:
     if existing_missing or spec_missing:
         return existing_missing and spec_missing
     return bool(existing == spec)
-
-
-def _array_is_all_fill(arr: np.ndarray, fill_value: Any) -> bool:
-    """Return True iff every element of *arr* equals *fill_value* under
-    missing-aware equality.
-
-    Mirrors `_fill_value_is_missing` semantics:
-      - float / complex NaN fill: every element must be NaN
-      - datetime64 / timedelta64 NaT fill: every element must be NaT
-      - all other dtypes (int, bool, bytes/string): plain element-wise equality
-
-    Empty arrays return True (consistent with ``np.all([])`` semantics; an
-    empty static array trivially satisfies "all elements equal fill".
-
-    Out of contract: object dtype, structured/record dtypes. Callers MUST
-    not pass these.
-    """
-    if _fill_value_is_missing(fill_value):
-        kind = np.asarray(fill_value).dtype.kind
-        if kind in ("f", "c"):
-            return bool(np.all(np.isnan(arr)))
-        if kind in ("M", "m"):
-            return bool(np.all(np.isnat(arr)))
-    return bool(np.all(arr == fill_value))
 
 
 def _fill_value_attr_value(fill_value: Any, dtype: Any) -> Any:
@@ -164,13 +154,40 @@ def _array_path_exists(root: Any, group_path: str) -> bool:
 
 def _open_root_read_only(writer: RegionZarrWriter) -> Any | None:
     """Open the root group without creating missing Zarr metadata."""
+    return open_root_read_only(writer._store_uri, store=writer._store)
+
+
+def open_root_read_only(
+    store_uri: str,
+    *,
+    store: object | None = None,
+    storage_options: Mapping[str, Any] | None = None,
+) -> Any | None:
+    """Open a store's root group read-only; ``None`` when the store has no root group.
+
+    Any failure other than a missing store or root group propagates.
+
+    Args:
+        store_uri: Store URI or local path, used when ``store`` is not given.
+        store: A pre-built zarr store (for example from a storage session), or a
+            store URI that ``storage_options`` belongs to.
+        storage_options: Filesystem options for a ``store`` given as a URI.
+    """
     try:
-        if writer._store is not None:
-            return zarr.open_group(store=writer._store, mode="r", zarr_format=3)
-        if not is_remote_target(writer._store_uri):
-            store = LocalStore(str(local_path_from_target(writer._store_uri)))
-            return zarr.open_group(store=store, mode="r", zarr_format=3)
-        return zarr.open_group(store=writer._store_uri, mode="r", zarr_format=3)
+        if store is not None:
+            if storage_options is not None:
+                return zarr.open_group(
+                    store=store,
+                    storage_options=dict(storage_options),
+                    mode="r",
+                    zarr_format=3,
+                    use_consolidated=False,
+                )
+            return zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
+        if not is_remote_target(store_uri):
+            local = LocalStore(str(local_path_from_target(store_uri)))
+            return zarr.open_group(store=local, mode="r", zarr_format=3, use_consolidated=False)
+        return zarr.open_group(store=store_uri, mode="r", zarr_format=3, use_consolidated=False)
     except (FileNotFoundError, GroupNotFoundError, NodeNotFoundError):
         return None
 
@@ -402,6 +419,32 @@ class RegionZarrWriter:
         coord_names: Array names treated as coordinate axes.  These are
             skipped by `ensure_timestamp_slot` when resizing timestamped
             arrays.  Defaults to ``{"y", "x", "channel"}``.
+        write_empty_chunks: Applied to each array this writer writes a
+            payload to, never to ``zarr.config``. ``None`` keeps the setting
+            the array was opened with.
+        on_write: Called on the writing thread with the `WriteResult` of
+            every payload write, while the locks that write took (its stored
+            units, or a whole-array hold) are still held, so the results of
+            writes to one unit arrive in the order of the writes. It must not
+            take a stored-unit lock or wait for another writer.
+        track_units: Report in each `WriteResult` which touched units hold no
+            object after the write and which the write deleted (two
+            ``exists`` calls per unit). Requires ``on_write``.
+        authority: The authority every ``zarr.json`` change of this writer is
+            made under (`firecube.core.zarr.guard.metadata_authority`), the root
+            group's creation included. ``None`` means a ``PROCESS_LOCAL``
+            authority over the writer's whole store: the threads of this
+            process are excluded per node, other processes are not. Only an
+            authority over the whole store can create a missing root group.
+        fixed_extent: Make `write_region` write through one handle per array,
+            read once, so its writes read no metadata. Set it only when no
+            array this writer writes changes shape while the writer is alive.
+            This writer's own metadata changes still drop the handles. Growth
+            by another writer goes unseen, and a write may then erase cells
+            that writer wrote. `write_1d` and the other methods ignore it.
+
+    Raises:
+        ValueError: ``track_units`` is set without ``on_write``.
     """
 
     def __init__(
@@ -411,32 +454,159 @@ class RegionZarrWriter:
         store: object | None = None,
         coord_names: frozenset[str] = _DEFAULT_COORD_NAMES,
         time_coord_name: str = "timestamp",
+        write_empty_chunks: bool | None = None,
+        on_write: Callable[[WriteResult], None] | None = None,
+        track_units: bool = False,
+        authority: MetadataAuthority | None = None,
+        fixed_extent: bool = False,
     ) -> None:
+        if track_units and on_write is None:
+            raise ValueError("track_units=True reports to on_write; pass on_write as well")
         self._store_uri = store_uri
         self._store = store  # pre-built store (e.g., zarr.storage.ObjectStore for obstore)
         self._coord_names = coord_names
         self._time_coord_name = time_coord_name
+        self._write_empty_chunks = write_empty_chunks
+        self._on_write = on_write
+        self._track_units = track_units
         self._root: Any | None = None
+        # Built on first use, once: the store and the default authority bound to it.
+        self._bind_lock = threading.Lock()
+        self._backing: Store | None = None
+        self._identity: str | None = None
+        self._authority = authority
+        self._fixed_extent = fixed_extent
+        # One handle per array path for its rank, non-time axes and layout;
+        # dropped by this writer's own metadata changes.
+        self._handles_lock = threading.Lock()
+        self._handles: dict[str, Any] = {}
+
+    def _cached_array(self, array_path: str) -> Any:
+        """Return this writer's handle of ``array_path``, opening it on first use.
+
+        Never read the time-axis length from it unless ``fixed_extent`` is
+        set: another writer may have grown the array since it was opened.
+        """
+        with self._handles_lock:
+            arr = self._handles.get(array_path)
+            if arr is None:
+                arr = self._handles[array_path] = self._opened_root()[array_path]
+            return arr
+
+    def _opened_root(self) -> Any:
+        """Return the memoized root, opening it only when no caller has.
+
+        Concurrent region writers open the root before they fan out, so their
+        worker threads read it here and never initialize it.
+        """
+        return self._root if self._root is not None else self._open_root()
+
+    @contextlib.contextmanager
+    def _dropping_handles(self) -> Iterator[None]:
+        """Drop the cached handles when the block returns or raises."""
+        try:
+            yield
+        finally:
+            with self._handles_lock:
+                self._handles.clear()
+
+    def _reopen_at(self, array_path: str, slot: int) -> Callable[[], Any]:
+        """Return a reader of ``array_path`` that refuses a handle without ``slot`` on axis 0."""
+
+        def reopen() -> Any:
+            arr = self._opened_root()[array_path]
+            _axis_index(slot, int(arr.shape[0]))
+            return arr
+
+        return reopen
+
+    def _slot_before_locks(self, array_path: str, ts_index: int) -> int:
+        """Return ``ts_index`` as given, or normalised against a fresh read when negative."""
+        index = operator.index(ts_index)
+        if index >= 0:
+            return index
+        return _axis_index(index, int(self._opened_root()[array_path].shape[0]))
+
+    def _backing_store(self) -> Store:
+        """The store this writer reads and writes, built once.
+
+        Raises:
+            TypeError: ``store`` is neither a zarr ``Store`` nor a URI string.
+        """
+        with self._bind_lock:
+            if self._backing is None:
+                target = self._store if self._store is not None else self._store_uri
+                if isinstance(target, Store):
+                    self._backing = target
+                elif not isinstance(target, str):
+                    raise TypeError(
+                        f"store must be a zarr Store or a URI string, got {type(target).__name__}"
+                    )
+                elif is_remote_target(target):
+                    self._backing = FsspecStore.from_url(target, read_only=False)
+                else:
+                    self._backing = LocalStore(str(local_path_from_target(target)))
+            return self._backing
+
+    def _store_key(self) -> str:
+        """Return `_store_identity` of this writer's store, resolved once like the store."""
+        if self._identity is None:
+            self._identity = _store_identity(self._store_uri, self._store)
+        return self._identity
+
+    def metadata_scope(self, prefix: str = "") -> MetadataScope:
+        """The scope of an authority over *prefix* of this writer's store, bound to that store."""
+        return MetadataScope(self._store_key(), prefix, backing=self._backing_store())
+
+    @property
+    def authority(self) -> MetadataAuthority:
+        """The authority this writer changes ``zarr.json`` under when a call names none.
+
+        The one given at construction, else a ``PROCESS_LOCAL`` authority over
+        the whole store (scope prefix ``""``), so it may create the root group.
+        """
+        if self._authority is None:
+            scope = self.metadata_scope()
+            with self._bind_lock:
+                if self._authority is None:
+                    self._authority = MetadataAuthority.process_local(scope)
+        return self._authority
 
     def _open_root(self) -> Any:
-        """Open and memoize the root group in append mode."""
+        """Open and memoize the root group; a missing one is created under `authority`."""
+        return self._open_root_under(None)
+
+    def _open_root_under(self, authority: MetadataAuthority | None) -> Any:
+        """Open and memoize the root group; a missing one is created under *authority*.
+
+        Opening writes no metadata: a store without a root ``zarr.json`` gets
+        one only through `metadata_authority.ensure_group`, under *authority*
+        (the writer's `authority` when ``None``), which refuses a released,
+        foreign or group-scoped authority before it touches the store.
+
+        Raises:
+            MetadataAuthorityError: The root is missing and the authority may
+                not create it.
+        """
         if self._root is not None:
             return self._root
-
-        if self._store is not None:
-            self._root = zarr.open_group(store=self._store, mode="a", zarr_format=3)
-            return self._root
-
-        if not is_remote_target(self._store_uri):
-            store = LocalStore(str(local_path_from_target(self._store_uri)))
-            self._root = zarr.open_group(store=store, mode="a", zarr_format=3)
-        else:
-            self._root = zarr.open_group(store=self._store_uri, mode="a", zarr_format=3)
-        return self._root
+        store = self._backing_store()
+        try:
+            root = zarr.open_group(store=store, mode="r+", zarr_format=3, use_consolidated=False)
+        except (FileNotFoundError, GroupNotFoundError, NodeNotFoundError):
+            auth = authority if authority is not None else self.authority
+            root = _authorized_ensure_group(auth, store, "")
+        self._root = root
+        return root
 
     @staticmethod
     def _normalize_timestamp_value(timestamp_val: Any) -> np.datetime64:
-        """Normalize timestamp-like values to ``datetime64[s]``."""
+        """Normalize timestamp-like values to ``datetime64[s]``.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+        """
+        reject_non_gregorian_calendar_value(timestamp_val)
         if isinstance(timestamp_val, np.datetime64):
             return timestamp_val.astype("datetime64[s]")
         if hasattr(timestamp_val, "isoformat"):
@@ -445,12 +615,14 @@ class RegionZarrWriter:
 
     @staticmethod
     def _normalize_timestamp_value_ns(timestamp_val: Any) -> np.datetime64:
-        """Normalize timestamp-like values to ``datetime64[ns]`` for equality checks."""
-        if isinstance(timestamp_val, np.datetime64):
-            return timestamp_val.astype("datetime64[ns]")
-        if hasattr(timestamp_val, "isoformat"):
-            return np.datetime64(str(timestamp_val.isoformat()), "ns")
-        return np.datetime64(str(timestamp_val), "ns")
+        """Normalize timestamp-like values to ``datetime64[ns]`` for equality checks.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+            Datetime64RangeError: *timestamp_val* lies outside the ``datetime64[ns]`` range.
+        """
+        reject_non_gregorian_calendar_value(timestamp_val)
+        return gregorian_to_datetime64_ns(timestamp_val)
 
     @staticmethod
     def _normalize_for_coord_compare(
@@ -497,6 +669,11 @@ class RegionZarrWriter:
                 "_normalize_for_coord_compare requires a datetime64 target dtype; "
                 f"got {target_dtype!r}"
             )
+        if np.datetime_data(target_dtype) == ("ns", 1) and (
+            isinstance(value, str | dt.datetime | np.datetime64) or is_calendar_valued(value)
+        ):
+            # NumPy wraps a value outside the ns range; this conversion refuses it.
+            return gregorian_to_datetime64_ns(value)
         arr = np.asarray(value)
         if arr.dtype.kind == "M" and bool(np.isnat(arr)):
             return cast(np.datetime64, np.array(np.datetime64("NaT", "ns"), dtype=target_dtype)[()])
@@ -516,6 +693,9 @@ class RegionZarrWriter:
         filters: Sequence[Any] | None = None,
         serializer: Any | None = None,
         compressors: Sequence[Any] | None = None,
+        on_create: Callable[[Any], None] | None = None,
+        engine_attrs: Mapping[str, Any] | None = None,
+        authority: MetadataAuthority | None = None,
     ) -> Any:
         """Ensure a group or array path exists.
 
@@ -537,49 +717,50 @@ class RegionZarrWriter:
                 created arrays. On resume, a mismatch against an existing
                 array raises `SchemaDriftError`; firecube does not
                 perform in-place dimension renames.
+            on_create: Optional callback invoked with the array only when this
+                call creates it; never invoked for an existing array.
+            engine_attrs: Engine-supplied attributes, reserved keys allowed,
+                written in the same metadata write that creates the array
+                (unlike *on_create*, which runs after it); ignored for an
+                existing array. Never pass plugin-supplied attributes here.
+            authority: The authority to create, grow and stamp under; the
+                writer's `authority` when ``None``. The node is read from the
+                store under it, never through an older handle; a new array
+                gets its attributes and ``_FillValue`` in the one write that
+                creates it. A missing root group is created under it too, so
+                only an authority over the whole store may meet a fresh store.
 
         Returns:
-            Existing or newly created group/array.
+            Existing or newly created group/array; an array handle is freshly
+            read, for payload I/O.
 
         Raises:
             ValueError: If array creation is requested without *shape*/*dtype*,
                 or if *attrs* contains reserved keys.
             SchemaDriftError: If *dimension_names* differs from the existing
                 array's ``dimension_names`` on resume.
+            MetadataAuthorityError: The authority is released, names another
+                store, or does not cover *group*.
         """
-        if attrs is not None:
-            assert_attrs_safe(attrs)
+        with self._dropping_handles():
+            if attrs is not None:
+                assert_attrs_safe(attrs)
 
-        root = self._open_root()
-        parts = [p for p in Path(group).parts if p not in ("", "/")]
-        if not parts:
-            return root
+            auth = authority if authority is not None else self.authority
+            root = self._open_root_under(auth)
+            parts = [p for p in Path(group).parts if p not in ("", "/")]
+            if not parts:
+                return _authorized_ensure_group(auth, root, "")
 
-        if len(parts) == 1 and shape is None:
-            return root.require_group(parts[0])
+            if len(parts) == 1 and shape is None:
+                return _authorized_ensure_group(auth, root, parts[0])
 
-        if shape is None or dtype is None:
-            raise ValueError("shape and dtype are required when ensuring an array path")
+            if shape is None or dtype is None:
+                raise ValueError("shape and dtype are required when ensuring an array path")
 
-        grp_path = "/".join(parts[:-1])
-        arr_name = parts[-1]
-        target_group = root if not grp_path else root.require_group(grp_path)
-        if arr_name in target_group:
-            arr = target_group[arr_name]
-            if (
-                allow_grow
-                and len(arr.shape) == len(shape)
-                and any(
-                    current < requested for current, requested in zip(arr.shape, shape, strict=True)
-                )
-            ):
-                arr.resize(
-                    tuple(
-                        max(current, requested)
-                        for current, requested in zip(arr.shape, shape, strict=True)
-                    )
-                )
-            if dimension_names is not None:
+            def _check_dimension_names(arr: Any) -> None:
+                if dimension_names is None:
+                    return
                 existing_dimnames = getattr(getattr(arr, "metadata", None), "dimension_names", None)
                 if existing_dimnames is not None and tuple(existing_dimnames) != tuple(
                     dimension_names
@@ -589,52 +770,95 @@ class RegionZarrWriter:
                         f"existing={tuple(existing_dimnames)!r} spec={tuple(dimension_names)!r}. "
                         "Re-ingest from scratch; no in-place migration is provided."
                     )
+
+            kwargs: dict[str, Any] = {"shape": shape, "dtype": dtype, "fill_value": fill_value}
+            if chunks is not None:
+                kwargs["chunks"] = chunks
+            if shards is not None:
+                kwargs["shards"] = shards
+            if attrs is not None or engine_attrs is not None:
+                kwargs["attributes"] = {**(attrs or {}), **(engine_attrs or {})}
+            if dimension_names is not None:
+                kwargs["dimension_names"] = list(dimension_names)
+            if filters is not None:
+                kwargs["filters"] = list(filters)
+            if serializer is not None:
+                kwargs["serializer"] = serializer
+            if compressors is not None:
+                kwargs["compressors"] = list(compressors)
             _fv_attr = _fill_value_attr_value(fill_value, dtype)
-            if _fv_attr is not None and _FILL_VALUE_ATTR not in dict(arr.attrs):
-                arr.attrs[_FILL_VALUE_ATTR] = _fv_attr
+            arr, created = create_or_open_array(
+                auth,
+                root,
+                "/".join(parts),
+                create_kwargs=kwargs,
+                grow_to=tuple(shape) if allow_grow else None,
+                default_attrs={_FILL_VALUE_ATTR: _fv_attr} if _fv_attr is not None else None,
+                validate=_check_dimension_names,
+            )
+            if created and on_create is not None:
+                on_create(arr)
             return arr
 
-        kwargs: dict[str, Any] = {
-            "name": arr_name,
-            "shape": shape,
-            "dtype": dtype,
-            "fill_value": fill_value,
-        }
-        if chunks is not None:
-            kwargs["chunks"] = chunks
-        if shards is not None:
-            kwargs["shards"] = shards
-        if attrs is not None:
-            kwargs["attributes"] = dict(attrs)
-        if dimension_names is not None:
-            kwargs["dimension_names"] = list(dimension_names)
-        if filters is not None:
-            kwargs["filters"] = list(filters)
-        if serializer is not None:
-            kwargs["serializer"] = serializer
-        if compressors is not None:
-            kwargs["compressors"] = list(compressors)
-        arr = target_group.create_array(**kwargs)
-        _fv_attr = _fill_value_attr_value(fill_value, dtype)
-        if _fv_attr is not None and _FILL_VALUE_ATTR not in dict(arr.attrs):
-            arr.attrs[_FILL_VALUE_ATTR] = _fv_attr
-        return arr
-
-    def set_group_attrs(self, group: str, attrs: Mapping[str, Any] | None) -> None:
+    def set_group_attrs(
+        self,
+        group: str,
+        attrs: Mapping[str, Any] | None,
+        *,
+        authority: MetadataAuthority | None = None,
+    ) -> None:
         """Stamp convention-agnostic group-level attributes onto the group metadata.
 
         Writes ``attrs`` verbatim onto the Zarr group's ``zarr.json``; the writer
         does not interpret the mapping. Reserved firecube-internal attribute names
         are rejected (see `assert_attrs_safe`). A falsy ``attrs`` is a no-op.
-        Idempotent — re-stamping the same attrs is safe.
+        Idempotent — re-stamping the same attrs is safe. The group is created
+        when missing; both changes are made under *authority* (the writer's
+        `authority` when ``None``), reading the group from the store first.
         """
-        if not attrs:
-            return
-        assert_attrs_safe(attrs)
-        root = self._open_root()
-        parts = [p for p in Path(group).parts if p not in ("", "/")]
-        target = root if not parts else root.require_group("/".join(parts))
-        target.attrs.update(dict(attrs))
+        with self._dropping_handles():
+            if not attrs:
+                return
+            assert_attrs_safe(attrs)
+            auth = authority if authority is not None else self.authority
+            root = self._open_root_under(auth)
+            path = "/".join(p for p in Path(group).parts if p not in ("", "/"))
+            _authorized_ensure_group(auth, root, path)
+            written = set_attributes(auth, root, path, attrs)
+            if not path:
+                self._root = written  # the memoized root carries what was just written
+
+    def update_array_attrs(
+        self,
+        array_path: str,
+        attrs: Mapping[str, Any],
+        *,
+        authority: MetadataAuthority | None = None,
+    ) -> Any:
+        """Add or replace attributes of an existing node, engine markers included, in one write.
+
+        The node is read from the store under *authority* (the writer's
+        `authority` when ``None``), so a handle opened earlier is never
+        written and a newer shape or marker is never reverted. Reserved names
+        are allowed: never pass plugin-supplied attributes here.
+
+        Args:
+            array_path: Path of the array (or group) below the root.
+            attrs: The attributes to add or replace.
+            authority: The authority to change the node under.
+
+        Returns:
+            The node as written; read attributes back from it, not from an
+            older handle.
+
+        Raises:
+            MetadataAuthorityError: The authority is released, names another
+                store, or does not cover *array_path*.
+            zarr.errors.GroupNotFoundError: No node at *array_path*.
+        """
+        with self._dropping_handles():
+            auth = authority if authority is not None else self.authority
+            return set_attributes(auth, self._open_root_under(auth), array_path, attrs)
 
     def verify_array_spec(self, group_path: str, spec: Any, expected_time_count: int) -> None:
         root = self._open_root()
@@ -810,6 +1034,12 @@ class RegionZarrWriter:
     ) -> None:
         """Write one spatial region for one timestamp.
 
+        Rank, spatial axes and layout come from this writer's cached handle.
+        The write goes through the array read again under its unit locks,
+        which must hold the slot. A negative *ts_index* counts from the end
+        of the array as read before the locks. With ``fixed_extent`` the
+        write goes through the cached handle, which must hold the slot.
+
         Args:
             group: Data group path.
             array_name: Target array name inside *group*.
@@ -820,19 +1050,90 @@ class RegionZarrWriter:
 
         Raises:
             ValueError: If target array rank is unsupported.
+            IndexError: The slot lies outside the array's time axis.
         """
-        root = self._root if self._root is not None else self._open_root()
-        arr = root[f"{group}/{array_name}"]
+        array_path = f"{group}/{array_name}"
+        arr = self._cached_array(array_path)
+        if arr.ndim not in (3, 4):
+            raise ValueError(f"Unsupported array rank for write_region: {arr.ndim}")
+        y_len = int(arr.shape[1])
+        # Any other row selector: lock every row (never fewer than written).
+        start, stop, step = y_slice.indices(y_len) if isinstance(y_slice, slice) else (0, y_len, 1)
+        rows = (start, max(start, stop)) if step > 0 else (max(stop + 1, 0), start + 1)
+        # Integer selections normalised as zarr does (-1 is the last), so two
+        # spellings of one cell take one lock.
+        slot = (
+            _axis_index(ts_index, int(arr.shape[0]))
+            if self._fixed_extent
+            else self._slot_before_locks(array_path, ts_index)
+        )
+        bounds: list[tuple[int, int]] = [(slot, slot + 1), rows, (0, int(arr.shape[2]))]
         if arr.ndim == 4:
             if channel_index is None:
-                arr[ts_index, y_slice, :, :] = data
+                bounds.append((0, int(arr.shape[3])))
             else:
-                arr[ts_index, y_slice, :, channel_index] = data
-            return
-        if arr.ndim == 3:
-            arr[ts_index, y_slice, :] = data
-            return
-        raise ValueError(f"Unsupported array rank for write_region: {arr.ndim}")
+                channel = _axis_index(channel_index, int(arr.shape[3]))
+                bounds.append((channel, channel + 1))
+        # Write the normalised indices the locks were taken for.
+        selection: tuple[Any, ...] = (slot, y_slice, slice(None))
+        if arr.ndim == 4:
+            selection += (slice(None) if channel_index is None else bounds[3][0],)
+        self._write_payload(
+            arr,
+            array_path,
+            tuple(bounds),
+            selection,
+            data,
+            reopen=None if self._fixed_extent else self._reopen_at(array_path, slot),
+        )
+
+    def _hold_array(self, array_path: str) -> AbstractContextManager[ArrayHold]:
+        """Hold this process's lock on the whole array at ``array_path`` (`hold_array`)."""
+        return hold_array(self._store_key(), array_path)
+
+    def _write_payload(
+        self,
+        arr: Any,
+        array_path: str,
+        bounds: Bounds,
+        selection: Any,
+        payload: Any,
+        *,
+        reopen: Callable[[], Any] | None = None,
+    ) -> None:
+        """Write ``arr[selection] = payload`` through `guarded_write`, reporting to ``on_write``.
+
+        The locks are taken for ``arr``'s stored layout. With ``reopen`` the
+        write goes through the handle it reads under those locks, not ``arr``.
+        ``on_write`` is called by `guarded_write` before the locks of the
+        write are released, so results for one unit reach it in write order.
+        Concurrent batches of one run (``pipeline_workers``) may write slots
+        that share a stored chunk or shard; each write reads the object,
+        merges and writes it back, so writes touching one unit of ``bounds``
+        take it in turn and disjoint units never wait for each other. Inside
+        a `hold_array` of the array on this thread the held lock is reused. A
+        time coordinate reaching here has no marker, so ``write_timestamp``
+        may create or grow it: every write to it takes the whole-array lock.
+        """
+        store = self._store_key()
+        footprint = WriteFootprint(array_path, bounds)
+        hold: AbstractContextManager[Any] = contextlib.nullcontext()
+        if current_hold(store, footprint.array_path) is None and (
+            footprint.array_path.rsplit("/", 1)[-1] == self._time_coord_name
+        ):
+            hold = hold_array(store, footprint.array_path)
+        with hold:
+            guarded_write(
+                arr,
+                footprint,
+                selection,
+                payload,
+                store=store,
+                write_empty_chunks=self._write_empty_chunks,
+                track_units=self._track_units,
+                on_result=self._on_write,
+                reopen=reopen,
+            )
 
     def write_1d(
         self,
@@ -857,6 +1158,11 @@ class RegionZarrWriter:
         at ``(group, ts_index)`` granularity only (see DESIGN.md §"Risks To
         Avoid"), so multi-slot payloads would create silent data-integrity gaps.
 
+        Rank, non-time axes and layout come from this writer's cached handle.
+        The write goes through the array read again under its unit locks,
+        which must hold the slot. A negative *ts_index* counts from the end
+        of the array as read before the locks.
+
         Args:
             group: Data group path.
             array_name: Target array name.
@@ -868,30 +1174,92 @@ class RegionZarrWriter:
             ValueError: If a 1-D target receives a payload with ``size != 1``,
                 or if a higher-rank target receives a payload whose shape does
                 not match ``arr.shape[1:]``.
+            IndexError: The slot lies outside the array's time axis.
         """
-        arr = self._open_root()[f"{group}/{array_name}"]
+        array_path = f"{group}/{array_name}"
+        if self.verify_engine_written_coordinate(group, array_name, data, ts_index=ts_index):
+            return
+        arr = self._cached_array(array_path)
         payload = np.asarray(data)
 
         if arr.ndim == 1:
-            if payload.ndim == 0:
-                arr[ts_index : ts_index + 1] = payload.reshape(1)
-                return
-            if payload.size != 1:
+            if payload.ndim != 0 and payload.size != 1:
                 raise ValueError(
                     f"write_1d writes exactly one slot for 1-D targets; got "
                     f"payload with size={payload.size} for "
                     f"{group}/{array_name}"
                 )
-            arr[ts_index : ts_index + 1] = payload.reshape(1)
-            return
-
-        if payload.shape != tuple(arr.shape[1:]):
+        elif payload.shape != tuple(arr.shape[1:]):
             raise ValueError(
                 f"write_1d payload shape {payload.shape} does not match "
                 f"target arr.shape[1:]={tuple(arr.shape[1:])} for "
                 f"{group}/{array_name}"
             )
-        arr[ts_index] = payload
+        slot = self._slot_before_locks(array_path, ts_index)
+        bounds = ((slot, slot + 1), *((0, int(n)) for n in arr.shape[1:]))
+        reopen = self._reopen_at(array_path, slot)
+        if arr.ndim == 1:
+            self._write_payload(
+                arr, array_path, bounds, slice(slot, slot + 1), payload.reshape(1), reopen=reopen
+            )
+        else:
+            self._write_payload(arr, array_path, bounds, slot, payload, reopen=reopen)
+
+    def verify_engine_written_coordinate(
+        self,
+        group: str,
+        array_name: str,
+        data: Any,
+        *,
+        ts_index: int | None = None,
+    ) -> bool:
+        """Verify, instead of writing, a payload aimed at an engine-written time coordinate.
+
+        A time coordinate whose lifecycle is ``PREALLOCATED`` or
+        ``COORD_MANAGED`` is written by ``firecube zarr preallocate`` alone;
+        pods only verify it, whatever the intent kind (mirrors
+        ``write_timestamp``). Compares *data*, cast to the stored dtype as a
+        write would cast it, with slot *ts_index* (or the whole array when
+        ``None``); NaT equals NaT.
+
+        Returns:
+            ``True`` when the target is such a coordinate and the values match
+            (the caller writes nothing); ``False`` for any other array, a
+            coordinate without a marker included, which the caller writes.
+
+        Raises:
+            SchemaDriftError: The stored values differ, or the coordinate
+                carries inconsistent markers.
+        """
+        if array_name != self._time_coord_name:
+            return False
+        array_path = f"{group}/{array_name}"
+        try:
+            arr = self._open_root()[array_path]
+        except KeyError:
+            return False
+        state = resolve_coord_lifecycle(dict(arr.attrs))
+        raise_if_invalid(state, array_path)
+        if state not in (CoordLifecycleState.PREALLOCATED, CoordLifecycleState.COORD_MANAGED):
+            return False
+        where = "every slot" if ts_index is None else f"slot {ts_index}"
+        stored = np.asarray(
+            arr[...] if ts_index is None else arr[_axis_index(ts_index, int(arr.shape[0]))]
+        )
+        try:
+            incoming = np.asarray(data() if callable(data) else data).astype(arr.dtype)
+            incoming = incoming.reshape(stored.shape)
+        except (TypeError, ValueError) as exc:
+            raise SchemaDriftError(
+                f"time coordinate {array_path!r} is written by preallocate; a write intent "
+                f"for {where} cannot be compared with it: {exc}"
+            ) from exc
+        if np.array_equal(stored, incoming, equal_nan=stored.dtype.kind in "fcmM"):
+            return True
+        raise SchemaDriftError(
+            f"time coordinate {array_path!r} ({where}) diverged: stored {stored}, incoming "
+            f"{incoming}. Preallocate writes it; pods only verify it and never overwrite it."
+        )
 
     def resolve_timestamp_index(self, group: str, timestamp_val: Any) -> int:
         """Return the existing or next compact timestamp index for *group*.
@@ -899,18 +1267,30 @@ class RegionZarrWriter:
         If a matching timestamp already exists in the ``timestamp`` array,
         its index is returned (idempotent).  Otherwise the next available
         slot (== current length) is returned.
+
+        An encoded (calendar) coordinate encodes *timestamp_val* with the
+        array's own ``units`` and ``calendar`` before the lookup.
         """
         root = self._open_root()
         self.ensure_group(group)
         path = f"{group}/{self._time_coord_name}"
-        normalized = self._normalize_timestamp_value(timestamp_val)
 
-        if path not in root:
+        if path not in root or root[path].shape[0] == 0:
+            # No coordinate to dispatch on: validate as a datetime64 value, so a
+            # malformed or non-Gregorian value fails instead of resolving to slot 0.
+            self._normalize_timestamp_value(timestamp_val)
             return 0
 
         timestamp_arr = root[path]
-        if timestamp_arr.shape[0] == 0:
-            return 0
+        # Imported here: firecube.core.time.encoding imports firecube.core.zarr.
+        from firecube.core.time.encoding import coordinate_encoding_from_array
+
+        encoding = coordinate_encoding_from_array(timestamp_arr.dtype, dict(timestamp_arr.attrs))
+        normalized: Any = (
+            encoding.encode_scalar(timestamp_val)
+            if encoding.extra_attrs
+            else self._normalize_timestamp_value(timestamp_val)
+        )
 
         existing = np.asarray(timestamp_arr[:])
         matches = np.nonzero(existing == normalized)[0]
@@ -942,6 +1322,10 @@ class RegionZarrWriter:
         - ``INVALID_BOTH_MARKERS``: the two lifecycles are mutually exclusive;
           combined presence is a corrupted state surfaced by
           ``raise_if_invalid`` before any read or write.
+
+        An encoded (calendar) coordinate is checked before these branches: a
+        ``PREALLOCATED`` one is verified and never written, and any other
+        state is refused.
         """
         root = self._open_root()
         timestamp_path = f"{group}/{self._time_coord_name}"
@@ -953,6 +1337,27 @@ class RegionZarrWriter:
         attrs: dict[str, Any] = dict(timestamp_arr.attrs) if timestamp_arr is not None else {}
         state = resolve_coord_lifecycle(attrs)
         raise_if_invalid(state, timestamp_path)
+
+        if timestamp_arr is not None:
+            # Imported here: firecube.core.time.encoding imports firecube.core.zarr.
+            from firecube.core.time.encoding import coordinate_encoding_from_array
+
+            encoding = coordinate_encoding_from_array(timestamp_arr.dtype, attrs)
+            if encoding.extra_attrs:
+                if state is not CoordLifecycleState.PREALLOCATED:
+                    self._raise_encoded_unreachable_state(
+                        timestamp_path=timestamp_path, attrs=attrs, state=state
+                    )
+                self._verify_preallocated_encoded_slot(
+                    group=group,
+                    ts_index=ts_index,
+                    timestamp_val=timestamp_val,
+                    timestamp_arr=timestamp_arr,
+                    timestamp_path=timestamp_path,
+                    encoding=encoding,
+                    attrs=attrs,
+                )
+                return
 
         if state is CoordLifecycleState.PREALLOCATED and timestamp_arr is not None:
             current_ns = self._normalize_timestamp_value_ns(timestamp_arr[ts_index])
@@ -970,12 +1375,17 @@ class RegionZarrWriter:
             incoming_norm = self._normalize_for_coord_compare(timestamp_val, target_dtype)
             if np.isnat(current_norm):
                 raise SchemaDriftError(
-                    f"coord array {timestamp_path} slot {ts_index} is NaT under "
-                    "firecube_coord_managed marker; the materialization step "
-                    "must run first. Invoke: firecube zarr preallocate "
-                    "<plugin> --target <uri> --product-name <name> "
-                    "--write-mode <mode> --input-data <path> "
-                    "--slot-start=<n> --slot-end=<m>"
+                    Message(
+                        "coord array {array_path} slot {ts_index} is NaT under "
+                        "firecube_coord_managed marker; the materialization step "
+                        "must run first. Invoke: {preallocate}",
+                        array_path=timestamp_path,
+                        group=group,
+                        ts_index=ts_index,
+                        preallocate=preallocate_operation(
+                            slot_start=Placeholder("<n>"), slot_end=Placeholder("<m>")
+                        ),
+                    )
                 )
             if current_norm == incoming_norm:
                 return
@@ -984,7 +1394,28 @@ class RegionZarrWriter:
                 f"slot {ts_index} diverged: current={current_norm!r} incoming={incoming_norm!r}."
             )
 
+        # Pre-marker coordinate: create, grow and element write all rewrite
+        # shared objects, so concurrent batches of one run take them in turn.
+        with self._hold_array(timestamp_path):
+            self._write_legacy_timestamp(group, ts_index, timestamp_val)
+
+    def _write_legacy_timestamp(self, group: str, ts_index: int, timestamp_val: Any) -> None:
+        """Create or grow the unmarked time coordinate and write one slot.
+
+        Raises:
+            ValueError: *timestamp_val* is calendar-valued on a non-Gregorian calendar.
+            Datetime64RangeError: The stored coordinate is ``datetime64[ns]`` and the
+                value lies outside its range; nothing is written.
+        """
         normalized = self._normalize_timestamp_value(timestamp_val)
+        try:
+            stored = self._open_root()[f"{group}/{self._time_coord_name}"]
+        except KeyError:
+            stored = None
+        if getattr(stored, "dtype", None) == np.dtype("datetime64[ns]"):
+            # The element write casts to ns, and NumPy wraps a value outside that range.
+            gregorian_to_datetime64_ns(timestamp_val)
+            gregorian_to_datetime64_ns(normalized)
         timestamp_arr = self.ensure_group(
             f"{group}/{self._time_coord_name}",
             shape=(ts_index + 1,),
@@ -1004,7 +1435,106 @@ class RegionZarrWriter:
                     length=int(timestamp_arr.shape[0]),
                     ts_index=ts_index,
                 )
-            timestamp_arr[ts_index] = normalized
+            slot = _axis_index(ts_index, int(timestamp_arr.shape[0]))
+            self._write_payload(
+                timestamp_arr,
+                f"{group}/{self._time_coord_name}",
+                ((slot, slot + 1),),
+                slot,
+                normalized,
+            )
+
+    def _raise_encoded_unreachable_state(
+        self, *, timestamp_path: str, attrs: dict[str, Any], state: CoordLifecycleState
+    ) -> None:
+        """Refuse an encoded (calendar) coordinate that preallocate did not mark.
+
+        Only preallocate writes a calendar coordinate, so any other lifecycle state
+        means an out-of-band edit or a skipped preallocate.
+
+        Raises:
+            SchemaDriftError: Always; the message names the path, units, calendar and state.
+        """
+        marker = (
+            ATTR_COORD_MANAGED
+            if state is CoordLifecycleState.COORD_MANAGED
+            else "no sealing marker (legacy)"
+        )
+        raise SchemaDriftError(
+            Message(
+                "coordinate array {array_path!r} carries encoded time attrs "
+                "(units={units!r}, calendar={calendar!r}) but its lifecycle state is "
+                "{marker}; this should be unreachable because calendar axes only "
+                "support the preallocated (grid) regime. Preallocate it first: {preallocate}",
+                array_path=timestamp_path,
+                units=str(attrs["units"]),
+                calendar=str(attrs["calendar"]),
+                marker=marker,
+                preallocate=preallocate_operation(),
+            )
+        )
+
+    def _verify_preallocated_encoded_slot(
+        self,
+        *,
+        group: str,
+        ts_index: int,
+        timestamp_val: Any,
+        timestamp_arr: Any,
+        timestamp_path: str,
+        encoding: Any,
+        attrs: dict[str, Any],
+    ) -> None:
+        """Compare one slot of a preallocated encoded coordinate with the incoming value.
+
+        A match returns and writes nothing.
+
+        Args:
+            group: Data group path.
+            ts_index: Slot to verify.
+            timestamp_val: Incoming value: a calendar-valued object or an encoded number.
+            timestamp_arr: The opened coordinate array.
+            timestamp_path: The coordinate's path, for messages.
+            encoding: The array's ``CoordinateEncoding``.
+            attrs: The array's attributes, carrying ``units`` and ``calendar``.
+
+        Raises:
+            SchemaDriftError: The slot holds the fill sentinel, or another value.
+            ValueError: *timestamp_val* is on another calendar.
+            TypeError: *timestamp_val* is a Gregorian-typed value.
+        """
+        units = str(attrs["units"])
+        calendar = str(attrs["calendar"])
+        incoming = encoding.encode_scalar(timestamp_val)
+        stored_raw = timestamp_arr[ts_index]
+        stored = stored_raw.item() if isinstance(stored_raw, np.generic) else stored_raw
+        if stored == incoming:
+            return
+        fill_value = timestamp_arr.fill_value
+        if _array_is_all_fill(np.atleast_1d(np.asarray(stored_raw)), fill_value):
+            # A marked coordinate that still holds the fill sentinel was never filled:
+            # report the missing preallocate, not a drift.
+            raise SchemaDriftError(
+                Message(
+                    "Preallocated encoded timestamp coordinate {array_path!r} in group "
+                    "{group!r} slot {ts_index}: preallocation incomplete (unwritten slot); "
+                    "stored value equals the encoded fill sentinel {fill_value!r} "
+                    "(units={units!r}, calendar={calendar!r}). Preallocate the coord array "
+                    "first: {preallocate}",
+                    array_path=timestamp_path,
+                    group=group,
+                    ts_index=ts_index,
+                    fill_value=fill_value,
+                    units=units,
+                    calendar=calendar,
+                    preallocate=preallocate_operation(),
+                )
+            )
+        raise SchemaDriftError(
+            f"Preallocated encoded timestamp coordinate {timestamp_path!r} in group "
+            f"{group!r} slot {ts_index} diverged: stored={stored!r} incoming={incoming!r} "
+            f"(units={units!r}, calendar={calendar!r})."
+        )
 
     def write_static(
         self,
@@ -1015,7 +1545,9 @@ class RegionZarrWriter:
         """Write a static (non-time-indexed) array at its declared shape.
 
         The array must already exist (created by schema setup).
-        This method performs a full overwrite: ``arr[...] = data``.
+        This method performs a full overwrite: ``arr[...] = data``, under this
+        process's whole-array lock (`hold_array`; a hold of it the calling
+        thread already has is reused).
         It does NOT call ``ensure_timestamp_slot`` — static arrays have no time axis.
 
         Args:
@@ -1028,7 +1560,12 @@ class RegionZarrWriter:
             KeyError: If the array does not exist in the store.
             ValueError: If ``data.ndim`` or ``data.shape`` does not match the
                 stored array.
+            SchemaDriftError: The target is a preallocated or coord-managed
+                time coordinate holding other values (see
+                ``verify_engine_written_coordinate``).
         """
+        if self.verify_engine_written_coordinate(group, array_name, data):
+            return
         root = self._open_root()
         arr_path = f"{group}/{array_name}"
         if arr_path not in root:
@@ -1044,4 +1581,7 @@ class RegionZarrWriter:
             raise ValueError(
                 f"Array {arr_path!r} shape mismatch: stored={arr.shape}, data={data.shape}"
             )
-        arr[...] = data
+        # Static arrays are written under the whole-array lock only (reused
+        # inside the static dispatch transaction), never under unit locks.
+        with self._hold_array(arr_path):
+            self._write_payload(arr, arr_path, tuple((0, int(n)) for n in arr.shape), ..., data)

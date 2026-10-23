@@ -18,26 +18,37 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
+import re
 import tempfile
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 import xarray as xr
+from zarr.errors import ZarrUserWarning
 
 from firecube.core.config import StorageConfig
+from firecube.core.controlplane.types import CONTROL_DIRNAME
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
-from firecube.core.uris import is_remote_target, local_path_from_target, parse_target
+from firecube.core.uris import (
+    is_remote_target,
+    local_path_from_target,
+    parse_target,
+    require_target_is_product,
+)
+from firecube.core.zarr.zip_archive import _clear_target
 
 from ._compat import require_tensogram
 from .controlplane_codec import deserialize_controlplane, restore_controlplane
 from .schema import ARCHIVE_VERSION, KEY_ARCHIVE_VERSION, ROLE_CONTROLPLANE, ROLE_DATA
 
 logger = logging.getLogger(__name__)
+
+_CONTROL_NOT_RECOGNIZED = f"Object at {re.escape(CONTROL_DIRNAME)} is not recognized"
 
 
 def _make_archive_session(target: str, storage_config: Any | None) -> StorageSession:
@@ -56,12 +67,12 @@ def _make_archive_session(target: str, storage_config: Any | None) -> StorageSes
     )
 
 
-def _prepare_target(target: str, *, overwrite: bool) -> None:
+def _prepare_target(target: str, *, overwrite: bool, keep_run_id: str | None) -> None:
     if is_remote_target(target):
         return
 
-    target_uri = parse_target(target)
-    local_target_path = Path(target_uri.path).resolve()
+    parse_target(target)  # refuse a relative target before anything is removed
+    local_target_path = local_path_from_target(target)
     if not local_target_path.exists():
         return
 
@@ -81,9 +92,25 @@ def _prepare_target(target: str, *, overwrite: bool) -> None:
         )
 
     if local_target_path.is_dir():
-        shutil.rmtree(local_target_path)
+        _clear_target(local_target_path, keep_run_id=keep_run_id)
     else:
         local_target_path.unlink()
+
+
+def _refuse_structural_issues(tensogram: Any, source_path: str) -> None:
+    """Raise ValueError when the quick check of ``archive validate`` reports an issue."""
+    report = tensogram.validate_file(source_path, level="quick")
+    issues = [
+        f"[file] offset={issue.get('byte_offset')}: {issue.get('description')}"
+        for issue in report.get("file_issues", [])
+    ]
+    issues.extend(
+        f"[msg {index}] {issue}"
+        for index, message in enumerate(report.get("messages", []))
+        for issue in message.get("issues", [])
+    )
+    if issues:
+        raise ValueError(f"Invalid Tensogram archive {source_path}: {'; '.join(issues)}")
 
 
 def _reconstruct_compressor(config: dict[str, Any] | None) -> Any | None:
@@ -166,17 +193,29 @@ def _restore_data_message(
         coord_names=coord_names,
     )
     try:
-        mode = "w" if first_group else "a"
+        # Mode "w" clears the group's path. At the root of a local target that is the whole
+        # store, .firecube/ included, so the root group is added to the target the restore has
+        # already prepared. A remote target is never prepared and keeps "w".
+        local_root = group_name is None and not is_remote_target(target)
+        mode = "w" if first_group and not local_root else "a"
 
         valid_names = set(ds.data_vars) | set(ds.coords)
         encoding = {k: v for k, v in encoding.items() if k in valid_names}
-        session.zarr.write_dataset(
-            ds,
-            parse_target(target),
-            mode=mode,
-            group=group_name,
-            encoding=encoding,
-        )
+        with warnings.catch_warnings():
+            if local_root:
+                # the kept control plane (.firecube/) is not part of the zarr hierarchy
+                warnings.filterwarnings(
+                    "ignore",
+                    message=_CONTROL_NOT_RECOGNIZED,
+                    category=ZarrUserWarning,
+                )
+            session.zarr.write_dataset(
+                ds,
+                parse_target(target),
+                mode=mode,
+                group=group_name,
+                encoding=encoding,
+            )
         return {
             "group": group_name,
             "variables": list(ds.data_vars),
@@ -195,11 +234,25 @@ def tgm_to_zarr(
     storage_config: Any | None = None,
     session: StorageSession | None = None,
     on_group_restored: Callable[[str | None], None] | None = None,
+    keep_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Restore a Tensogram .tgm archive to a Zarr store.
 
     ``source`` and ``target`` accept either a bare absolute path or a
     canonical URI (e.g. ``file:///…``, ``s3://…``).
+
+    The restore validates the archive before it touches the target. It reads
+    the message count and checks the archive version of the first message.
+    It then runs the quick structural check of every message. An archive
+    without messages returns an empty summary and leaves the target untouched.
+
+    An overwrite of a local target then removes the existing store. It keeps
+    ``.firecube/claims/``, ``.firecube/schema.json`` and
+    ``.firecube/runs/<keep_run_id>/``. No write to a local target removes
+    anything under ``.firecube/``.
+
+    A remote target is never cleared. The first group's write replaces that
+    group's path, and at the root that is the whole store.
 
     Args:
         source: Path to .tgm file (local only for now).
@@ -207,21 +260,30 @@ def tgm_to_zarr(
         overwrite: If True, overwrite an existing Zarr store.
         storage_config: Optional storage config used to derive remote
             ``storage_options``.
+        session: Storage session bound to the target product; built from
+            ``target`` and ``storage_config`` when omitted.
+        on_group_restored: Called with each restored group name, ``None``
+            for the root group.
+        keep_run_id: Run whose records an overwrite keeps; pass the restore's
+            own run so its records survive.
 
     Returns:
         Summary dict describing the restore outcome.
 
     Raises:
         ImportError: If tensogram extras are not installed.
+        ConfigurationError: If ``session`` is passed and ``target`` is not its
+            product, or an overwrite finds a symlink on a kept local path.
+        ValueError: If the archive version is unsupported or the structural
+            check reports an issue.
         FileExistsError: If target exists and overwrite is False.
     """
     require_tensogram("tgm_to_zarr")
+    if session is not None:
+        require_target_is_product(target, session.product.product_uri)
     import tensogram as _tensogram  # pyright: ignore[reportMissingImports]
 
     tensogram = cast(Any, _tensogram)
-    _prepare_target(target, overwrite=overwrite)
-    session = session or _make_archive_session(target, storage_config)
-
     source_path = str(local_path_from_target(source))
 
     with tensogram.TensogramFile.open(source_path) as tensogram_file:  # pyright: ignore[reportAttributeAccessIssue]
@@ -248,6 +310,10 @@ def tgm_to_zarr(
                 f"Unsupported Firecube archive version: {archive_version!r}. "
                 f"Expected {ARCHIVE_VERSION!r}."
             )
+        _refuse_structural_issues(tensogram, source_path)
+
+        _prepare_target(target, overwrite=overwrite, keep_run_id=keep_run_id)
+        session = session or _make_archive_session(target, storage_config)
 
         restored_groups: list[str] = []
         restored_variables: list[str] = []
@@ -289,6 +355,9 @@ def tgm_to_zarr(
 
             if on_group_restored is not None:
                 on_group_restored(cast(str | None, restored["group"]))
+
+        if not first_group:
+            session.zarr.refresh_consolidated_metadata(parse_target(target))
 
         return {
             "source": source,

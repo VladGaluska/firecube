@@ -44,7 +44,7 @@ from typing import Any
 from firecube.core.controlplane._event_processor import apply_events, sorted_complete_runs
 from firecube.core.controlplane.metrics import record_wal_corruption
 from firecube.core.controlplane.types import LATEST_POINTER, SCHEMA_VERSION
-from firecube.core.errors import ControlPlaneCorruptionError, ManifestError
+from firecube.core.errors import ControlPlaneCorruptionError, ManifestError, Message, Operation
 from firecube.core.filesystem import StorageFilesystem
 from firecube.core.storage.uri import StorageUri
 
@@ -149,12 +149,14 @@ def load_current_state(
         snapshot_age_s = time.time() - cutoff_ts if cutoff_ts > 0 else 0.0
         if snapshot_age_s > 86400:
             log.warning(
-                "Snapshot for %s is %.1f hours old (cutoff: %s). "
-                "Consider running: firecube chunks snapshots rebuild --product %s",
-                product,
-                snapshot_age_s / 3600,
-                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(cutoff_ts)),
-                product,
+                Message(
+                    "Snapshot for {product} is {hours:.1f} hours old (cutoff: {cutoff}). "
+                    "Consider rebuilding it: {rebuild}",
+                    product=product,
+                    hours=snapshot_age_s / 3600,
+                    cutoff=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(cutoff_ts)),
+                    rebuild=Operation("rebuild_snapshot"),
+                )
             )
 
     current: dict[str, dict[str, Any]] = {}

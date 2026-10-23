@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 from firecube.core.credentials import Credentials  # pyright: ignore[reportMissingImports]
+from tests.helpers.rows import table_row
 
 
 def test_equal_credentials_have_equal_fingerprint() -> None:
@@ -22,25 +25,22 @@ def test_equal_credentials_have_equal_fingerprint() -> None:
     assert left.fingerprint() == right.fingerprint()
 
 
-def test_different_access_key_changes_fingerprint() -> None:
-    left = Credentials(access_key="a", secret_key="b")
-    right = Credentials(access_key="x", secret_key="b")
-
-    assert left.fingerprint() != right.fingerprint()
-
-
-def test_different_secret_key_changes_fingerprint() -> None:
-    left = Credentials(access_key="a", secret_key="b")
-    right = Credentials(access_key="a", secret_key="x")
-
-    assert left.fingerprint() != right.fingerprint()
-
-
-def test_different_session_token_changes_fingerprint() -> None:
-    left = Credentials(access_key="a", secret_key="b", session_token="c")
-    right = Credentials(access_key="a", secret_key="b", session_token="x")
-
-    assert left.fingerprint() != right.fingerprint()
+def test_differing_credential_field_changes_fingerprint(subtests, tmp_path: Path) -> None:
+    rows = [
+        ("different_access_key", {"access_key": "a", "secret_key": "b"}, {"access_key": "x"}),
+        ("different_secret_key", {"access_key": "a", "secret_key": "b"}, {"secret_key": "x"}),
+        (
+            "different_session_token",
+            {"access_key": "a", "secret_key": "b", "session_token": "c"},
+            {"session_token": "x"},
+        ),
+        ("none_access_key", {"access_key": "a", "secret_key": "b"}, {"access_key": None}),
+    ]
+    for row_id, left, change in rows:
+        with table_row(subtests, row_id, tmp_path):
+            assert (
+                Credentials(**left).fingerprint() != Credentials(**{**left, **change}).fingerprint()
+            )
 
 
 def test_repr_hides_raw_credential_values() -> None:
@@ -51,13 +51,6 @@ def test_repr_hides_raw_credential_values() -> None:
     assert "AK" not in text
     assert "SK" not in text
     assert "ST" not in text
-
-
-def test_none_access_key_differs_from_real_value_in_fingerprint() -> None:
-    anonymous = Credentials(access_key=None, secret_key="b")
-    named = Credentials(access_key="a", secret_key="b")
-
-    assert anonymous.fingerprint() != named.fingerprint()
 
 
 def test_is_anonymous_requires_both_access_and_secret_to_be_none() -> None:

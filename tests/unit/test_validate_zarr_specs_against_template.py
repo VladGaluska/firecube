@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from firecube.core.errors import ConfigurationError
@@ -23,102 +25,53 @@ from firecube.ingestor.templates.config import (
 )
 from firecube.ingestor.templates.direct_zarr import ZarrArraySpec
 
+_RAISES: tuple[tuple[str, str, Any], ...] = (
+    (
+        "test_compression_false_with_per_array_compressors_raises",
+        "compressors",
+        ({"name": "blosc"},),
+    ),
+    (
+        "test_compression_false_with_per_array_filters_raises",
+        "filters",
+        ({"name": "bitround", "configuration": {"keepbits": 8}},),
+    ),
+    ("test_compression_false_with_per_array_serializer_raises", "serializer", {"name": "bytes"}),
+    ("test_compression_false_with_empty_compressors_raises", "compressors", ()),
+)
+_SUCCEEDS: tuple[tuple[str, bool, dict[str, Any]], ...] = (
+    ("test_compression_false_without_any_codec_fields_succeeds", False, {}),
+    ("test_compression_true_with_empty_compressors_succeeds", True, {"compressors": ()}),
+    (
+        "test_compression_true_with_per_array_compressors_succeeds",
+        True,
+        {"compressors": ({"name": "blosc"},)},
+    ),
+    ("test_compression_true_without_any_codec_fields_succeeds", True, {}),
+)
+
 
 @pytest.mark.unit
-def test_compression_false_with_per_array_compressors_raises() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-        compressors=({"name": "blosc"},),
-    )
+def test_compression_false_with_per_array_codec_raises(subtests: pytest.Subtests) -> None:
     template = ZarrTemplateConfig(zarr_compression=False)
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    message = str(excinfo.value)
-    assert "'counts'" in message
-    assert "compressors" in message
-    assert "zarr_compression=False" in message
+    for row_id, field, value in _RAISES:
+        with subtests.test(msg=row_id):
+            spec = ZarrArraySpec(name="counts", shape=(10, 10), dtype="i4", **{field: value})
+            with pytest.raises(ConfigurationError) as excinfo:
+                validate_zarr_specs_against_template([spec], template)
+            message = str(excinfo.value)
+            assert "'counts'" in message
+            assert field in message
+            assert "zarr_compression=False" in message
 
 
 @pytest.mark.unit
-def test_compression_false_with_per_array_filters_raises() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-        filters=({"name": "bitround", "configuration": {"keepbits": 8}},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=False)
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    message = str(excinfo.value)
-    assert "'counts'" in message
-    assert "filters" in message
-    assert "zarr_compression=False" in message
-
-
-@pytest.mark.unit
-def test_compression_false_with_per_array_serializer_raises() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-        serializer={"name": "bytes"},
-    )
-    template = ZarrTemplateConfig(zarr_compression=False)
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    message = str(excinfo.value)
-    assert "'counts'" in message
-    assert "serializer" in message
-    assert "zarr_compression=False" in message
-
-
-@pytest.mark.unit
-def test_compression_false_without_any_codec_fields_succeeds() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-    )
-    template = ZarrTemplateConfig(zarr_compression=False)
-    validate_zarr_specs_against_template([spec], template)
-
-
-@pytest.mark.unit
-def test_compression_true_with_empty_compressors_succeeds() -> None:
-    spec = ZarrArraySpec(
-        name="mask",
-        shape=(10, 10),
-        dtype="u1",
-        compressors=(),
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    validate_zarr_specs_against_template([spec], template)
-
-
-@pytest.mark.unit
-def test_compression_true_with_per_array_compressors_succeeds() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-        compressors=({"name": "blosc"},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    validate_zarr_specs_against_template([spec], template)
-
-
-@pytest.mark.unit
-def test_compression_true_without_any_codec_fields_succeeds() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    validate_zarr_specs_against_template([spec], template)
+def test_compatible_codec_declarations_succeed(subtests: pytest.Subtests) -> None:
+    for row_id, compression, codecs in _SUCCEEDS:
+        with subtests.test(msg=row_id):
+            spec = ZarrArraySpec(name="counts", shape=(10, 10), dtype="i4", **codecs)
+            template = ZarrTemplateConfig(zarr_compression=compression)
+            validate_zarr_specs_against_template([spec], template)
 
 
 @pytest.mark.unit
@@ -141,16 +94,3 @@ def test_multiple_specs_only_offender_name_in_error() -> None:
     assert "'radiance'" in message
     assert "'latitude'" not in message
     assert "'longitude'" not in message
-
-
-@pytest.mark.unit
-def test_error_message_mentions_zarr_compression_false() -> None:
-    spec = ZarrArraySpec(
-        name="counts",
-        shape=(10, 10),
-        dtype="i4",
-        compressors=({"name": "blosc"},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=False)
-    with pytest.raises(ConfigurationError, match="zarr_compression=False"):
-        validate_zarr_specs_against_template([spec], template)

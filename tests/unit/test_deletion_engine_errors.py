@@ -14,12 +14,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from firecube.core.controlplane.deletion import DeletionEngine
 from firecube.core.controlplane.repo import ManifestRepository
 from firecube.core.controlplane.types import ChunkInfo
 from firecube.core.errors import ManifestError
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 
@@ -36,28 +40,29 @@ def _span_chunk(*, product: str) -> ChunkInfo:
 
 
 @pytest.mark.unit
-def test_delete_spans_raises_for_mixed_products(temp_workspace):
-    repo = ManifestRepository(binding=make_test_binding(temp_workspace), workspace=temp_workspace)
-    engine = DeletionEngine(repo)
+def test_delete_spans_refusals(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "delete_spans_raises_for_mixed_products", tmp_path) as (workdir, _):
+        repo = ManifestRepository(binding=make_test_binding(workdir), workspace=workdir)
+        engine = DeletionEngine(repo)
 
-    spans = [_span_chunk(product="p1"), _span_chunk(product="p2")]
-    with pytest.raises(ManifestError) as exc:
-        engine.delete_spans(spans, dry_run=True)
+        spans = [_span_chunk(product="p1"), _span_chunk(product="p2")]
+        with pytest.raises(ManifestError) as exc:
+            engine.delete_spans(spans, dry_run=True)
 
-    assert "single product" in str(exc.value)
+        assert "single product" in str(exc.value)
 
+    with table_row(
+        subtests, "delete_spans_raises_when_repository_filesystem_is_missing", tmp_path
+    ) as (workdir, _):
+        repo = ManifestRepository(binding=make_test_binding(workdir), workspace=workdir)
 
-@pytest.mark.unit
-def test_delete_spans_raises_when_repository_filesystem_is_missing(temp_workspace):
-    repo = ManifestRepository(binding=make_test_binding(temp_workspace), workspace=temp_workspace)
+        def _missing_fs(_base_uri: str):
+            raise ManifestError("filesystem is not available")
 
-    def _missing_fs(_base_uri: str):
-        raise ManifestError("filesystem is not available")
+        repo._get_fs = _missing_fs  # type: ignore[method-assign]
+        engine = DeletionEngine(repo)
 
-    repo._get_fs = _missing_fs  # type: ignore[method-assign]
-    engine = DeletionEngine(repo)
+        with pytest.raises(ManifestError) as exc:
+            engine.delete_spans([_span_chunk(product="p1")], dry_run=True)
 
-    with pytest.raises(ManifestError) as exc:
-        engine.delete_spans([_span_chunk(product="p1")], dry_run=True)
-
-    assert "filesystem is not available" in str(exc.value)
+        assert "filesystem is not available" in str(exc.value)

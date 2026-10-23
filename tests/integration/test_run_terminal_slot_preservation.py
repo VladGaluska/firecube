@@ -196,11 +196,11 @@ def test_record_run_terminal_recovers_slot_fields_after_torn_run_json(
         repo.close()
 
 
-@pytest.mark.parametrize("status", ["complete", "failed", "abandoned"])
+@pytest.mark.parametrize("status", ["failed", "abandoned"])
 def test_record_run_terminal_accepts_slot_kwargs_for_all_terminal_statuses(
     tmp_path: Path, status: str
 ) -> None:
-    """All three terminal statuses accept and persist slot kwargs."""
+    """Failed and abandoned terminals persist slot kwargs (complete: the first test above)."""
     binding, product = _make_binding(tmp_path)
     repo = ManifestRepository(binding=binding, workspace=tmp_path)
     try:

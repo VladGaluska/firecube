@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +37,7 @@ from firecube.ingestor.types.context import (
     PipelineRunState,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding, make_test_context
 
 
@@ -209,80 +211,60 @@ def test_run_sequential_is_resilient_to_on_batch_failure_errors():
     assert "on_batch_failure hook failed" in host._log.error.call_args[0][0]
 
 
-def test_finalize_ignores_plugin_reserved_pipeline_metrics_key():
-    executor = PipelineExecutor()
-    executor._log = MagicMock(spec=logging.Logger)
-
-    host = MagicMock(spec=PipelineHost)
-    host._aggregate_metrics.return_value = {"pipeline": {"workers": 999}, "custom": 1}
-    host.name = "dummy"
-    host._chunk_manager = None
-
-    batch = PipelineBatch(batch_id="b1", data_path=Path("."), items=[], size_bytes=0, files_count=0)
-    result = PipelineResult(
-        batch=batch, outputs=OutputPaths(primary="s3://bucket/product"), success=True
+def test_finalize_tolerates_bad_aggregate_metrics(subtests: Any, tmp_path: Path) -> None:
+    # (row id, plugin aggregate metrics, expected warning substring)
+    rows: tuple[tuple[str, object, str], ...] = (
+        (
+            "test_finalize_ignores_plugin_reserved_pipeline_metrics_key",
+            {"pipeline": {"workers": 999}, "custom": 1},
+            "reserved aggregate metrics key",
+        ),
+        (
+            "test_finalize_handles_non_mapping_aggregate_metrics",
+            ["bad", "metrics"],
+            "non-mapping aggregate metrics",
+        ),
     )
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=3,
-        batch_size=10,
-        batches=(batch,),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-        results=(result,),
-    )
-    ctx = RuntimeIngestContext.from_ingest_context(
-        IngestContext(source=".", target="fallback.zarr", output_format="zarr"),
-        run_id="run-001",
-        temp_root=Path("."),
-        materializer=lambda p: Path(p),
-    )
+    for row_id, aggregate, warning in rows:
+        with table_row(subtests, row_id, tmp_path):
+            executor = PipelineExecutor()
+            executor._log = MagicMock(spec=logging.Logger)
 
-    final_result = executor.finalize(ctx, state, host)
+            host = MagicMock(spec=PipelineHost)
+            host._aggregate_metrics.return_value = aggregate
+            host.name = "dummy"
+            host._chunk_manager = None
 
-    assert final_result.metrics["pipeline"]["workers"] == 3
-    warning_calls = list(executor._log.warning.call_args_list)
-    assert warning_calls
-    assert "reserved aggregate metrics key" in warning_calls[0][0][0]
+            batch = PipelineBatch(
+                batch_id="b1", data_path=Path("."), items=[], size_bytes=0, files_count=0
+            )
+            result = PipelineResult(
+                batch=batch, outputs=OutputPaths(primary="s3://bucket/product"), success=True
+            )
+            state = PipelineRunState(
+                product="dummy",
+                pipeline_workers=3,
+                batch_size=10,
+                batches=(batch,),
+                ingestion_start_time=0.0,
+                batch_creation_duration=0.0,
+                processing_start_time=0.0,
+                results=(result,),
+            )
+            ctx = RuntimeIngestContext.from_ingest_context(
+                IngestContext(source=".", target="fallback.zarr", output_format="zarr"),
+                run_id="run-001",
+                temp_root=Path("."),
+                materializer=lambda p: Path(p),
+            )
 
+            final_result = executor.finalize(ctx, state, host)
 
-def test_finalize_handles_non_mapping_aggregate_metrics():
-    executor = PipelineExecutor()
-    executor._log = MagicMock(spec=logging.Logger)
-
-    host = MagicMock(spec=PipelineHost)
-    host._aggregate_metrics.return_value = ["bad", "metrics"]
-    host.name = "dummy"
-    host._chunk_manager = None
-
-    batch = PipelineBatch(batch_id="b1", data_path=Path("."), items=[], size_bytes=0, files_count=0)
-    result = PipelineResult(
-        batch=batch, outputs=OutputPaths(primary="s3://bucket/product"), success=True
-    )
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=1,
-        batch_size=1,
-        batches=(batch,),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-        results=(result,),
-    )
-    ctx = RuntimeIngestContext.from_ingest_context(
-        IngestContext(source=".", target="fallback.zarr", output_format="zarr"),
-        run_id="run-001",
-        temp_root=Path("."),
-        materializer=lambda p: Path(p),
-    )
-
-    final_result = executor.finalize(ctx, state, host)
-
-    assert "pipeline" in final_result.metrics
-    warning_calls = list(executor._log.warning.call_args_list)
-    assert warning_calls
-    assert "non-mapping aggregate metrics" in warning_calls[0][0][0]
+            # the engine's own pipeline metrics win over whatever the plugin returned
+            assert final_result.metrics["pipeline"]["workers"] == 3
+            warning_calls = list(executor._log.warning.call_args_list)
+            assert warning_calls
+            assert warning in warning_calls[0][0][0]
 
 
 def test_finalize_injects_control_plane_storage_metrics(tmp_path):

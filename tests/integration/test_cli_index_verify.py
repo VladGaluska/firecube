@@ -25,10 +25,12 @@ import hashlib
 import json
 from pathlib import Path
 
+import click
 import pytest
 import zarr
 from click.testing import CliRunner
 
+from firecube.cli.index import _manager
 from firecube.cli.main import cli
 from firecube.core.controlplane.types import (
     INDEX_CURRENT_FILENAME,
@@ -39,6 +41,9 @@ from firecube.core.controlplane.types import (
     ResolvedIndexRecord,
     canonical_index_bytes,
 )
+from firecube.ingestor.runtime.index_record import verify_index_record
+from tests.helpers.cli_hints import parse_hint
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.integration
 
@@ -153,17 +158,27 @@ def test_verify_help_lists_required_flags() -> None:
     assert "--plugin" in result.output
 
 
-def test_verify_valid_record_exits_zero(tmp_path: Path) -> None:
+def test_verify_valid_record_is_read_only(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """One verify of a valid record: exit 0 with the hash, and nothing written."""
     cube = tmp_path / "valid_cube"
     cube.mkdir()
     record = _seed_record(cube)
+    current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
+    original_bytes = current_json.read_bytes()
+    original_mtime = current_json.stat().st_mtime_ns
 
     result = CliRunner().invoke(cli, _verify_args(cube))
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    # Truncated identity_hash prefix helps operators grep logs.
-    assert record.identity_hash[:16] in result.stdout
+    with subtests.test(msg="test_verify_valid_record_exits_zero"):
+        assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        assert "VERIFIED" in result.stdout
+        # Truncated identity_hash prefix helps operators grep logs.
+        assert record.identity_hash[:16] in result.stdout
+
+    with subtests.test(msg="test_verify_valid_record_does_not_write_to_disk"):
+        assert current_json.read_bytes() == original_bytes
+        assert current_json.stat().st_mtime_ns == original_mtime
+        assert record.identity_hash[:16] in result.stdout
 
 
 def test_verify_corrupt_record_exits_one_with_identity_hash_mismatch(tmp_path: Path) -> None:
@@ -200,18 +215,25 @@ def test_verify_no_record_exits_3(tmp_path: Path) -> None:
     assert "No index record" in result.stderr
 
 
-def test_verify_plugin_match_exits_0(tmp_path: Path) -> None:
-    cube = tmp_path / "plugin_match_cube"
-    cube.mkdir()
-    record = _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+# (row id = former test name, plugin that both rebuilds and verifies the cube)
+_PLUGIN_MATCH_ROWS = (
+    ("test_verify_plugin_match_exits_0", "index_spec_single"),
+    ("test_verify_plugin_uses_lowercase_time_dim_name", "index_spec_custom_dim"),
+)
 
-    result = CliRunner().invoke(
-        cli, _verify_args(cube, "index_spec_single", "--plugin", "index_spec_single")
-    )
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    assert record.identity_hash[:16] in result.stdout
+def test_verify_plugin_match_exits_0(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    for row_id, plugin in _PLUGIN_MATCH_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            cube = workdir / "plugin_match_cube"
+            cube.mkdir()
+            record = _rebuild_cube(cube, plugin, plugin)
+
+            result = CliRunner().invoke(cli, _verify_args(cube, plugin, "--plugin", plugin))
+
+            assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            assert "VERIFIED" in result.stdout
+            assert record.identity_hash[:16] in result.stdout
 
 
 def test_verify_plugin_mismatch_exits_1(tmp_path: Path) -> None:
@@ -255,21 +277,6 @@ def test_verify_attrs_absent_exits_0(tmp_path: Path) -> None:
     assert record.identity_hash[:16] in result.stdout
 
 
-def test_verify_plugin_uses_lowercase_time_dim_name(tmp_path: Path) -> None:
-    cube = tmp_path / "custom_dim_cube"
-    cube.mkdir()
-    record = _rebuild_cube(cube, "index_spec_custom_dim", "index_spec_custom_dim")
-
-    result = CliRunner().invoke(
-        cli,
-        _verify_args(cube, "index_spec_custom_dim", "--plugin", "index_spec_custom_dim"),
-    )
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "VERIFIED" in result.stdout
-    assert record.identity_hash[:16] in result.stdout
-
-
 def test_verify_missing_product_name_raises_click_usage_error(tmp_path: Path) -> None:
     cube = tmp_path / "any_cube"
     cube.mkdir()
@@ -282,17 +289,122 @@ def test_verify_missing_product_name_raises_click_usage_error(tmp_path: Path) ->
     assert "--product-name" in result.stderr
 
 
-def test_verify_valid_record_does_not_write_to_disk(tmp_path: Path) -> None:
-    cube = tmp_path / "readonly_cube"
+def test_verify_library_valid_record_never_calls_plugin_loader(tmp_path: Path) -> None:
+    cube = tmp_path / "library_valid_cube"
     cube.mkdir()
     record = _seed_record(cube)
-    current_json = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
-    original_bytes = current_json.read_bytes()
-    original_mtime = current_json.stat().st_mtime_ns
 
-    result = CliRunner().invoke(cli, _verify_args(cube))
+    def loader() -> object:
+        raise AssertionError("plugin loaded for a verify without a plugin")
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert current_json.read_bytes() == original_bytes
-    assert current_json.stat().st_mtime_ns == original_mtime
-    assert record.identity_hash[:16] in result.stdout
+    manager = _manager(f"file://{cube}", "test_product")
+    kwargs = {"product_name": "test_product", "target": f"file://{cube}", "load_plugin": loader}
+    try:
+        verdict = verify_index_record(chunk_manager=manager, **kwargs)
+    finally:
+        manager.close()
+
+    assert verdict.outcome == "verified"
+    assert verdict.identity_hash == record.identity_hash
+
+
+def test_verify_library_attrs_drift_result_carries_no_cli_text(tmp_path: Path) -> None:
+    cube = tmp_path / "library_drift_cube"
+    cube.mkdir()
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    _set_resolved_index_attr(cube, "f" * 64)
+
+    manager = _manager(f"file://{cube}", "index_spec_single")
+    try:
+        verdict = verify_index_record(
+            chunk_manager=manager, product_name="index_spec_single", target=f"file://{cube}"
+        )
+    finally:
+        manager.close()
+
+    assert verdict.outcome == "attrs-drift"
+    assert verdict.attrs_hash == "f" * 64
+    assert "firecube" not in repr(verdict)
+
+
+def test_verify_plugin_click_exception_from_index_spec_is_reraised_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cube = tmp_path / "click_exception_cube"
+    cube.mkdir()
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+
+    class _RaisingPlugin:
+        time_dim_name = "time"
+
+        def index_spec(self, ctx: object) -> None:
+            raise click.ClickException("plugin says no")
+
+    monkeypatch.setattr("firecube.cli.index._load_plugin", lambda plugin, manager: _RaisingPlugin())
+
+    result = CliRunner().invoke(
+        cli, _verify_args(cube, "index_spec_single", "--plugin", "index_spec_single")
+    )
+
+    assert result.exit_code == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.stderr == "Error: plugin says no\n"
+
+
+def test_verify_attrs_without_record_advice_recovers_both_ways(tmp_path: Path) -> None:
+    cube = tmp_path / "attrs_without_record_cube"
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    current = cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME
+    saved = current.read_bytes()
+    current.unlink()
+    verify = _verify_args(cube, "index_spec_single")
+    refused = CliRunner().invoke(cli, verify)
+    assert refused.exit_code == 1
+    rebuild = f"firecube zarr index rebuild --target file://{cube} --plugin <plugin> --product-name"
+    assert (
+        "attrs drift \u2014 root attr has resolved-index identity hash but no on-disk record; "
+        f"`{rebuild} index_spec_single` refuses this state. Restore "
+        "`.firecube/index/current.json`, or remove the root attrs "
+        "`firecube_resolved_index_identity_hash` and `firecube_resolved_index` and run "
+        f"`{rebuild} index_spec_single` with the plugin that wrote the data."
+    ) in refused.stderr
+    current.write_bytes(saved)
+    restored = CliRunner().invoke(cli, verify)
+    assert restored.exit_code == 0 and "VERIFIED" in restored.stdout
+    current.unlink()
+    for attr in (RESOLVED_INDEX_IDENTITY_HASH_ATTR, "firecube_resolved_index"):
+        zarr.open(str(cube), mode="a").attrs.pop(attr, None)
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    rebuilt = CliRunner().invoke(cli, verify)
+    assert rebuilt.exit_code == 0 and "VERIFIED" in rebuilt.stdout
+
+
+def test_verify_attrs_drift_advice_recovers_by_removing_hash_attr(tmp_path: Path) -> None:
+    cube = tmp_path / "attrs_drift_advice_cube"
+    record = _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    _set_resolved_index_attr(cube, "f" * 64)
+    refused = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
+    assert refused.exit_code == 1
+    rebuild = f"firecube zarr index rebuild --target file://{cube} --plugin <plugin> --product-name"
+    assert (
+        "attrs drift \u2014 root attr diverges from on-disk record; "
+        f"`{rebuild} index_spec_single` refuses this state. Remove the root attr "
+        "`firecube_resolved_index_identity_hash`, then run "
+        f"`{rebuild} index_spec_single`: it writes the attr again from the record."
+    ) in refused.stderr
+    _delete_resolved_index_attr(cube)
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    assert zarr.open(str(cube)).attrs[RESOLVED_INDEX_IDENTITY_HASH_ATTR] == record.identity_hash
+    verified = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
+    assert verified.exit_code == 0 and "VERIFIED" in verified.stdout
+
+
+@pytest.mark.parametrize("state", ["without-record", "drift"])
+def test_repro_verify_attrs_advice_prints_runnable_rebuild_command(tmp_path: Path, state: str):
+    cube = tmp_path / "cube"
+    _rebuild_cube(cube, "index_spec_single", "index_spec_single")
+    if state == "drift":
+        _set_resolved_index_attr(cube, "f" * 64)
+    else:
+        (cube / ".firecube" / INDEX_DIRNAME / INDEX_CURRENT_FILENAME).unlink()
+    refused = CliRunner().invoke(cli, _verify_args(cube, "index_spec_single"))
+    assert parse_hint(refused.stderr, "firecube zarr index rebuild")

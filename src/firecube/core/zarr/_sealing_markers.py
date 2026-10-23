@@ -23,7 +23,14 @@ from __future__ import annotations
 
 from typing import Final
 
-__all__ = ["ATTR_CONSOLIDATED_AT", "ATTR_COORD_MANAGED", "ATTR_PREALLOCATED"]
+__all__ = [
+    "ATTR_CONSOLIDATED_AT",
+    "ATTR_COORD_MANAGED",
+    "ATTR_ENGINE_OWNED",
+    "ATTR_ENGINE_OWNED_COMPLETE",
+    "ATTR_ENGINE_OWNED_SLOTS",
+    "ATTR_PREALLOCATED",
+]
 
 ATTR_PREALLOCATED: Final[str] = "firecube_preallocated"
 """Zarr array attr stamped on a time coord array after dense preallocate materialization.
@@ -47,4 +54,30 @@ ATTR_CONSOLIDATED_AT: Final[str] = "firecube_consolidated_at"
 Value is an ISO 8601 UTC timestamp string recording when consolidation ran.
 A ``ConsolidatedTimeCoord`` WAL event accompanies this attr; ``ResumeGuard``
 reads that event to block further ingest on the sealed cube.
+"""
+
+ATTR_ENGINE_OWNED: Final[str] = "firecube_engine_owned"
+"""Zarr array attr reserving an engine-owned per-slot array for preallocate.
+
+Presence of this attr (with value ``True``) means ``firecube zarr preallocate``
+owns the array: ingest pods never write it, and a declaration that disagrees
+with it is an ownership change, refused. Stamped before any value is written;
+whether the values are complete is ``ATTR_ENGINE_OWNED_COMPLETE``. It never
+appears on a time coordinate array.
+"""
+
+ATTR_ENGINE_OWNED_COMPLETE: Final[str] = "firecube_engine_owned_complete"
+"""Zarr array attr stamped once preallocate finished writing an engine-owned array.
+
+Value ``True`` is written only after the values and the slot list
+(``ATTR_ENGINE_OWNED_SLOTS``) are stored, and set to ``False`` before a later
+preallocate changes them. Ingest pods refuse a target where it is not ``True``.
+"""
+
+ATTR_ENGINE_OWNED_SLOTS: Final[str] = "firecube_engine_owned_slots"
+"""Zarr array attr listing the slots preallocate has written on an engine-owned array.
+
+Value: sorted, merged ``[start, end)`` slot ranges. A listed slot is stored data,
+even when it equals the fill value, and a later preallocate must replay the same
+value there. Only unlisted slots (no source item seen yet) may still be filled.
 """

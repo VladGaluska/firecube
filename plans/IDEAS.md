@@ -328,6 +328,18 @@ File upstream at `https://github.com/ecmwf/tensogram` if Phase 1 implementation 
 - **Blocked on:** Nothing structural; ready when someone reports a memory issue at scale.
 - **Cross-links:** §40 (named source/target contexts); §41 (obstore async prefetch).
 
+### §44 Encoded time-coordinate storage for every calendar
+
+- DEFERRED-V2+
+
+- **Origin:** Follow-up to the 2026-09-23 calendar decision (see DONE.md). Only a non-Gregorian calendar stores its time coordinate as an encoded number with `units` and `calendar` attributes. A Gregorian axis keeps the `datetime64` representation, so that every store written so far stays byte-identical.
+- **Goal:** One storage representation for every calendar. Then the coordinate-materialization and write-verification code does not branch on Gregorian versus not.
+- **Direction:** Move the Gregorian path onto the CF-encoded storage that the non-Gregorian path uses. Two identities are involved. Keep them apart.
+  - The group identity hash (`_compute_group_identity_hash`) is stored on the coordinate array as `firecube_group_identity_hash`. It already includes the dtype string. A Gregorian group on `int64` gets a different hash from the same group on `datetime64[ns]`. It needs no new field. The change moves the stored value of every existing Gregorian group. That needs a migration of the stored attribute, and a period in which ingest accepts both the old and the new value.
+  - The resolved-index record (`as_resolved_index_record`) holds a payload from `canonical_index_payload`. The payload has no dtype and no group hash. The record hash comes from that payload and the items. The change does not alter this record. Adding the encoding identity to the record is a proposed schema change. It is not an existing relationship. Only that proposal needs a schema version bump for the record.
+- **Blocked on:** The schema-version and dual-acceptance mechanism does not exist. Build it in general form first, not for this one field.
+- **Cross-links:** The calendar follow-ups in TODO.md.
+
 ## Notes
 
 Move an idea to [TODO.md](TODO.md) only after the workflow, constraints, and tradeoffs are agreed and the decision is recorded in [DONE.md](DONE.md) with a date.

@@ -24,7 +24,16 @@ class _RecordingWriter:
     instances: ClassVar[list["_RecordingWriter"]] = []
 
     def __init__(
-        self, store_uri, *, store=None, coord_names=frozenset(), time_coord_name="timestamp"
+        self,
+        store_uri,
+        *,
+        store=None,
+        coord_names=frozenset(),
+        time_coord_name="timestamp",
+        write_empty_chunks=None,
+        on_write=None,
+        track_units=False,
+        fixed_extent=False,
     ):
         self.store_uri = store_uri
         self.store = store

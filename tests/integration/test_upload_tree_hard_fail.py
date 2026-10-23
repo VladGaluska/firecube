@@ -42,6 +42,9 @@ class _MultipartFailingFs:
         self.put_file_calls: list[tuple[str, str]] = []
         self.open_calls: list[tuple[str, str]] = []
 
+    def capabilities(self) -> set[type]:
+        return set()
+
     def _local_path(self, path: Any) -> Path:
         rel_str = path.to_str() if hasattr(path, "to_str") else str(path)
         if "://" in rel_str:

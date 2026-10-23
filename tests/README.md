@@ -32,38 +32,55 @@ fixture plugins installed from `tests/fixtures/`.
 
 ## Setup
 
-Install test dependencies and fixture plugins before running the full suite:
+Install test dependencies and the fixture plugins before running the suite:
 
 ```bash
 uv sync --extra test
-uv pip install -e tests/fixtures/cli_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_capable_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_non_capable_test_plugin
-uv pip install -e tests/fixtures/multi_group_capable_test_plugin
-uv pip install -e tests/fixtures/cf_time_dim_test_plugin
+uv pip install -e tests/fixtures/firecube_test_plugins
 ```
+
+That single editable distribution installs every fixture module and entry point.
 
 ## Common Commands
 
+Every lane command (fast, docs/static, S3, slow, full run, race) is stated once,
+in [plans/TEST.md](../plans/TEST.md#lanes). Do not copy them here. Two shortcuts:
+
 ```bash
-# Local full suite
+# Local full suite (pyproject addopts excludes the race-marked tests)
 uv run pytest -q
-
-# Strict dependency gate
-uv run pytest --strict-deps -q --tb=short
-
-# Warning gate used before merge/release
-uv run pytest --strict-deps -q --tb=short -W error::DeprecationWarning
-
-# Focused development loop
-uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot" -q --tb=short
-
-# Docs/help/static lane
-uv run pytest --strict-deps -m "docs_static or snapshot" -q --tb=short
 
 # Single file
 uv run pytest tests/unit/test_chunk_manager.py -q
 ```
+
+## Calendar Time Axes
+
+Non-Gregorian calendar behavior (360_day, noleap) has no test directory of
+its own. Each test lives with the unit it exercises:
+
+- `unit/`, calendar names and axis declaration: `test_time_encode.py`,
+  `test_time_axis_declaration.py`.
+- `unit/`, resolution: `test_index_resolve_irregular.py`.
+- `unit/`, coordinate materialization: `test_materialize_regular_coord_array.py`.
+- `unit/`, relabel refusals: `test_coord_rematerialization.py`.
+- `unit/`, `chunks list` and `chunks delete` refusals: `test_chunks_list_cli.py`,
+  `test_cli_chunks_delete.py`.
+- `unit/`, also: hashes, persisted payload, decode, writer, startup, archive,
+  append order and coverage, chunk queries.
+- `integration/`: preallocate and ingest round trips
+  (`test_preallocate_regular_axis_dense.py`, `test_irregular_axis_pipeline.py`)
+  and append over a February 30 span (`test_cf_time_dim_value_dedup.py`).
+- `cli/`: the `archive create` refusal (`test_archive_create_contract.py`).
+
+Three fixture plugins in `tests/fixtures/firecube_test_plugins` drive them.
+Pass the calendar as an option:
+
+| plugin name | options |
+|---|---|
+| `regular_axis_calendar` | `--option calendar=360_day`, `--option slot_count=90` |
+| `irregular_axis_calendar` | `--option calendar=360_day` (five fixed values) |
+| `cf_time_dim_calendar` | `--option x_calendar=360_day`, `--option x_start=2049-01-29` |
 
 ## Markers
 
@@ -79,6 +96,8 @@ Markers are defined in `pyproject.toml`; use only registered markers.
 - `s3`: live or mocked S3 endpoint coverage
 - `slow`: long-running tests
 - `concurrency`: parallel or concurrent behavior
+- `race`: red-by-design legacy race characterization; excluded by default, run with `-m race`
+- `gate`: promoted regression gates that must stay green
 
 Markers select lanes; they do not make weak tests acceptable.
 

@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from firecube.core.zarr.time_decode import decode_time_array
 from firecube.ingestor.runtime.zarr.append_services import AppendCoverageBuilder
 
 
@@ -125,3 +126,48 @@ def test_subsecond_bounds_not_collapsed() -> None:
     assert entry is not None
     assert entry["time_min"] != entry["time_max"]
     assert ".1" in str(entry["time_min"]) or "00.100" in str(entry["time_min"])
+
+
+def _360_day(day_offsets: list[int]) -> np.ndarray:
+    encoded = np.asarray(day_offsets, dtype="int64") * 86400
+    return decode_time_array(encoded, {"units": "seconds since 2049-01-01", "calendar": "360_day"})
+
+
+def _coord_ds(values: np.ndarray) -> xr.Dataset:
+    return xr.Dataset(coords={"time": xr.DataArray(values, dims=["time"])})
+
+
+def _bounds(builder: AppendCoverageBuilder) -> tuple[object, object]:
+    entry = builder.build_entry(
+        group="g", coverage_arrays=["g/v"], state_var_name="s", state_deleted_value=2
+    )
+    assert entry is not None
+    return entry["time_min"], entry["time_max"]
+
+
+def test_calendar_batches_merge_into_one_range_whatever_their_order() -> None:
+    builder = AppendCoverageBuilder(time_dim_name="time")
+    builder.record_batch(start_i=2, count=2, ds=_coord_ds(_360_day([29, 30])), aligned=True)
+    builder.record_batch(start_i=0, count=2, ds=_coord_ds(_360_day([0, 1])), aligned=True)
+
+    assert _bounds(builder) == ("2049-01-01T00:00:00", "2049-02-01T00:00:00")
+
+
+def test_calendar_missing_value_is_excluded_from_bounds() -> None:
+    real, builder = _360_day([0, 5]), AppendCoverageBuilder(time_dim_name="time")
+    values = np.array([real[0], None, real[1]], dtype=object)
+    builder.record_batch(start_i=0, count=3, ds=_coord_ds(values), aligned=True)
+    assert _bounds(builder) == ("2049-01-01T00:00:00", "2049-01-06T00:00:00")
+
+
+@pytest.mark.parametrize(
+    "calendar_first", [False, True], ids=["datetime64-first", "calendar-first"]
+)
+def test_mixing_datetime64_and_calendar_batches_is_refused(calendar_first: bool) -> None:
+    builder = AppendCoverageBuilder(time_dim_name="time")
+    batches = [_coord_ds(np.array(["2024-01-01"], dtype="datetime64[s]")), _coord_ds(_360_day([0]))]
+    first, second = batches[::-1] if calendar_first else batches
+    builder.record_batch(start_i=0, count=1, ds=first, aligned=True)
+
+    with pytest.raises(ValueError, match="mixes"):
+        builder.record_batch(start_i=1, count=1, ds=second, aligned=True)

@@ -16,41 +16,23 @@ from typing import Any
 
 import pytest
 
-
-@pytest.mark.unit
-def test_shards_default_is_none():
-    from firecube.ingestor.api import ZarrArraySpec
-
-    spec = ZarrArraySpec(name="x", shape=(10, 4, 5), dtype="float32")
-
-    assert spec.shards is None
+from tests.helpers.rows import table_row
 
 
 @pytest.mark.unit
-def test_attrs_default_is_none():
+def test_field_defaults(subtests, tmp_path):
     from firecube.ingestor.api import ZarrArraySpec
 
-    spec = ZarrArraySpec(name="x", shape=(10, 4, 5), dtype="float32")
+    for row_id, field, expected in [
+        ("test_shards_default_is_none", "shards", None),
+        ("test_attrs_default_is_none", "attrs", None),
+        ("test_dimension_names_default_is_none", "dimension_names", None),
+        ("test_time_indexed_default_is_true", "time_indexed", True),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            spec = ZarrArraySpec(name="x", shape=(10, 4, 5), dtype="float32")
 
-    assert spec.attrs is None
-
-
-@pytest.mark.unit
-def test_dimension_names_default_is_none():
-    from firecube.ingestor.api import ZarrArraySpec
-
-    spec = ZarrArraySpec(name="x", shape=(10, 4, 5), dtype="float32")
-
-    assert spec.dimension_names is None
-
-
-@pytest.mark.unit
-def test_time_indexed_default_is_true():
-    from firecube.ingestor.api import ZarrArraySpec
-
-    spec = ZarrArraySpec(name="x", shape=(10, 4, 5), dtype="float32")
-
-    assert spec.time_indexed is True
+            assert getattr(spec, field) is expected
 
 
 @pytest.mark.unit

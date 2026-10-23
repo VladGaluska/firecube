@@ -28,6 +28,7 @@ import numpy as np
 import xarray as xr
 
 import firecube
+from firecube.core.errors import Message, Param
 
 if TYPE_CHECKING:
     from firecube.core.storage.session import StorageSession
@@ -190,7 +191,13 @@ def extract_zarr_array_metadata(
     if session is None:
         if storage_config is None:
             raise ValueError(
-                "storage_config is required for zarr metadata extraction; pass --storage-type and --storage-driver"
+                Message(
+                    "storage_config is required for zarr metadata extraction; pass {storage_type} and {storage_driver}",
+                    storage_type=Param("storage_type"),
+                    storage_driver=Param("storage_driver"),
+                    group=group,
+                    product_uri=str(store_uri),
+                )
             )
         effective_config = storage_config
         session = StorageSession(
@@ -209,7 +216,7 @@ def extract_zarr_array_metadata(
     if group is not None:
         open_kwargs["path"] = group
 
-    zgroup = zarr.open_group(**open_kwargs)
+    zgroup = zarr.open_group(**open_kwargs, use_consolidated=False)
 
     result: dict[str, dict[str, Any]] = {}
     for name, item in zgroup.members():

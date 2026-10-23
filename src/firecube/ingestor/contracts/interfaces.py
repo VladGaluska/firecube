@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Protocol, runtime_checkable
 
 from firecube.core.observability.telemetry import IngestionTelemetry
 from firecube.ingestor.runtime.zarr.contracts import AppendWriteStrategy, RegionWriteStrategy
@@ -47,6 +47,13 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+
+if TYPE_CHECKING:
+    from firecube.core.api import IndexSpec, ItemInfo, ResolvedIndex
+    from firecube.core.storage.completion import StagedPromotionUnits
+    from firecube.core.zarr.guard.metadata_authority import MetadataAuthority
+    from firecube.ingestor.templates.config import TemplateConfig
+    from firecube.ingestor.templates.direct_zarr import ZarrGroupSpec
 
 
 @runtime_checkable
@@ -277,6 +284,90 @@ class PipelineHost(Protocol):
         ...
 
 
+class PreallocateHost(Protocol):
+    """Protocol for a plugin that `preallocate_product` and `plan_slots` can operate on.
+
+    A host declares an index spec and a Zarr schema, and resolves its index.
+    `DirectZarrIngestor` subclasses satisfy it.
+    """
+
+    time_dim_name: ClassVar[str]
+    """The name of the time coordinate array."""
+
+    template_config: TemplateConfig | None
+    """The resolved template configuration, or `None` before configuration."""
+
+    def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+        """Return the Zarr groups and arrays the host declares."""
+        ...
+
+    def index_spec(self, ctx: PluginContext) -> IndexSpec | None:
+        """Return the host's index spec, or `None` for a serial-only host."""
+        ...
+
+    def resolved_index(self, ctx: PluginContext) -> ResolvedIndex:
+        """Return the resolved index, cached per context."""
+        ...
+
+    def bind_index_at_startup(self, ctx: PluginContext) -> None:
+        """Resolve and store the host's index binding for `ctx`."""
+        ...
+
+    def discover_source_files(self, ctx: PluginContext) -> Iterable[Any]:
+        """Return the source items of the run."""
+        ...
+
+    def filter_item(self, item: Any, ctx: PluginContext) -> bool:
+        """Return whether one discovered item proceeds."""
+        ...
+
+    def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo | None:
+        """Return the item's slot coordinate, or `None` to drop it."""
+        ...
+
+
+@runtime_checkable
+class _SparseWindowRefusal(Protocol):
+    """Internal: a host that refuses a staged window covering a unit only partly."""
+
+    def _refuse_sparse_staged_window(
+        self,
+        ctx: PluginContext,
+        planned_slots: frozenset[int],
+        *,
+        window: tuple[int, int],
+        slot_group: str | None,
+    ) -> None: ...
+
+
+@runtime_checkable
+class _IncompleteUnitsRefusal(Protocol):
+    """Internal: a host that refuses to promote a half-written staged unit."""
+
+    def _refuse_incomplete_staged_units(self) -> None: ...
+
+
+@runtime_checkable
+class _StagedSeedingAuthority(Protocol):
+    """Internal: a host that seeds its staged workspace metadata under its own authority."""
+
+    def _staged_seeding_authority(self) -> MetadataAuthority | None: ...
+
+
+@runtime_checkable
+class _SeededCoordinates(Protocol):
+    """Internal: a host told which coordinate arrays seeding left in its staged workspace."""
+
+    def _note_seeded_coordinates(self, workspace: str, paths: Collection[str]) -> None: ...
+
+
+@runtime_checkable
+class _StagedPromotionUnits(Protocol):
+    """Internal: a host that reports what its staged run wrote, for a delta promotion."""
+
+    def _staged_promotion_units(self) -> StagedPromotionUnits | None: ...
+
+
 __all__ = [
     "AppendWriteStrategy",
     "DatasetProducer",
@@ -289,6 +380,7 @@ __all__ = [
     "PipelineResult",
     "PipelineRunState",
     "PluginContext",
+    "PreallocateHost",
     "RegionWriteStrategy",
     "RuntimeIngestContext",
     "SourceFile",

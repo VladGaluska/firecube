@@ -31,23 +31,28 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from enum import Enum, auto
 from typing import Any
 
-import click
-
 from firecube.core.config import DATABASE_DUCKDB_KEYS
 from firecube.core.controlplane import ChunkManager
-from firecube.core.formats._input_filters import reject_legacy_input_patterns
+from firecube.core.errors import Message, Param
+from firecube.core.formats.input_filters import reject_legacy_input_patterns
 from firecube.ingestor.config.engine import (
     SYSTEM_KEYS,
     EngineConfig,
     config_keys,
     is_experimental_option_key,
 )
+from firecube.ingestor.errors import RemovedConfigKeyError
 from firecube.ingestor.templates.config import TemplateConfig
 from firecube.ingestor.types.config import PluginConfig
-from firecube.ingestor.types.context import IngestContext
+from firecube.ingestor.types.context import (
+    IngestContext,
+    PluginContext,
+    RuntimeIngestContext,
+)
 
 
 class ExecutionMode(Enum):
@@ -98,11 +103,7 @@ class TierConfigurator:
         reject_legacy_input_patterns(options)
 
         if "output_name" in options:
-            raise click.UsageError(
-                "Config key 'output_name' is no longer accepted. "
-                "Use '--product-name' or 'default_product_name' instead.\n"
-                "Edit the CLI invocation or the config file passed via --config-file."
-            )
+            raise RemovedConfigKeyError("output_name")
 
         engine_keys = config_keys(EngineConfig)
         template_keys = (
@@ -117,9 +118,14 @@ class TierConfigurator:
         }
         if unknown:
             raise ValueError(
-                f"Unknown configuration options for {self._plugin_name}: "
-                f"{', '.join(sorted(unknown))}. Use --show-options to see valid keys. "
-                f"Experimental options must use the x_ prefix (e.g. x_foo=...)."
+                Message(
+                    "Unknown configuration options for {plugin}: {unknown}. "
+                    "Use {show_options} to see valid keys. "
+                    "Experimental options must use the x_ prefix (e.g. x_foo=...).",
+                    plugin=self._plugin_name,
+                    unknown=", ".join(sorted(unknown)),
+                    show_options=Param("show_options"),
+                )
             )
 
         engine_opts = {k: options[k] for k in engine_keys if k in options}
@@ -139,6 +145,67 @@ class TierConfigurator:
         )
 
         return engine_config, template_config, plugin_config
+
+
+def configure_ingestor(
+    ingestor: Any,
+    *,
+    target: str,
+    options: Mapping[str, object],
+    run_id: str,
+    source: str = "",
+    storage: Any = None,
+    input_filters: list[str] | None = None,
+) -> PluginContext:
+    """Configure an ingestor without the CLI and return its plugin context.
+
+    Run this before ``preallocate_product`` or ``plan_slots``. It splits
+    ``options`` into tiers, assigns the three configs to ``ingestor``, and returns the context.
+
+    Args:
+        ingestor: Ingestor instance. It receives ``engine_config``,
+            ``template_config`` and ``plugin_config``.
+        target: Product URI the operation writes to.
+        options: Already-typed option values, keyed by option name. The mapping is not mutated.
+        run_id: Run identifier recorded in the context.
+        source: Source URI. Empty when the operation reads no source.
+        storage: Storage context passed through unchanged; ``None`` leaves storage unbound.
+        input_filters: Input filter patterns added to ``options`` when given.
+
+    Returns:
+        The plugin context built for the configured ingestor.
+
+    Raises:
+        ValueError: If ``options`` holds a key no tier owns.
+        RemovedConfigKeyError: If ``options`` holds the removed ``output_name`` key.
+    """
+    resolved_options = dict(options)
+    if input_filters is not None:
+        resolved_options["input_filters"] = input_filters
+    ingest_ctx = IngestContext(
+        source=source,
+        target=target,
+        in_memory=True,
+        output_format="zarr",
+        options=resolved_options,
+        storage=storage,
+        run_id=run_id,
+    )
+    runtime_ctx = RuntimeIngestContext.from_ingest_context(
+        ingest_ctx,
+        run_id=run_id,
+        temp_root=None,
+        materializer=None,
+    )
+    configurator = TierConfigurator(
+        ingestor.template_config_class,
+        ingestor.plugin_config_class,
+        plugin_name=ingestor.name,
+    )
+    ingestor.engine_config, ingestor.template_config, ingestor.plugin_config = (
+        configurator.configure(runtime_ctx)
+    )
+    return PluginContext(runtime_ctx)
 
 
 def determine_execution_mode(engine_config: EngineConfig) -> ExecutionMode:
@@ -174,8 +241,12 @@ def _validate_storage_driver(storage_driver: Any, *, storage_type: str) -> None:
         require_obstore()
         if storage_type not in ("local", "s3"):
             raise ValueError(
-                f"Storage driver 'obstore' supports 'local' and 's3' storage types, "
-                f"got '{storage_type}'. Use --storage-driver fsspec instead."
+                Message(
+                    "Storage driver 'obstore' supports 'local' and 's3' storage types, "
+                    "got '{storage_type}'. Use {driver} instead.",
+                    storage_type=storage_type,
+                    driver=Param("storage_driver", "fsspec"),
+                )
             )
         log = logging.getLogger(__name__)
         log.info("Using obstore storage driver for all I/O (experimental)")

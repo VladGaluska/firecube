@@ -15,12 +15,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from firecube.cli.chunks._common import parse_time_range
 from firecube.cli.chunks._list import list_cmd
+from firecube.cli.main import cli
 from firecube.core.controlplane.types import ChunkInfo
+from tests.unit.test_chunk_manager_queries import feb_30_cli_args
 
 
 class _FakeManager:
@@ -179,3 +183,17 @@ def test_chunks_list_include_replaced_requests_history_from_manager(monkeypatch)
     result = runner.invoke(list_cmd, ["--format", "json"], obj={})
     assert result.exit_code == 0, result.output
     assert seen.get("include_replaced") is False
+
+
+def test_chunks_list_time_range_over_feb_30_span_exits_nonzero_naming_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    argv = feb_30_cli_args(
+        monkeypatch, tmp_path, "list", "--time-range", "2024-01-01:2024-12-31", "--format", "json"
+    )
+    result = CliRunner().invoke(cli, argv)
+
+    assert result.exit_code != 0, result.output
+    assert "G_360" in result.output and "02-30" in result.output, result.output
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)

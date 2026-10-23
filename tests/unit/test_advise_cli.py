@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -23,6 +24,7 @@ import zarr
 from click.testing import CliRunner, Result
 
 from firecube.cli.advise import advise
+from tests.helpers.rows import table_row
 
 
 @dataclass
@@ -71,32 +73,32 @@ def _invoke(tmp_path: Path, product: str, group: str) -> Result:
         return runner.invoke(advise, ["batch-size", "--product", product_arg, "--group", group])
 
 
-def test_batch_size_recommends_chunk_aligned(tmp_path: Path) -> None:
-    _make_zarr_store(tmp_path, time_chunk=10)
-    result = _invoke(tmp_path, "product.zarr", "SEVIRI_L15")
-    assert result.exit_code == 0
-    assert "pipeline_batch_size=10" in result.output
+def test_advise_batch_size(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "batch_size_recommends_chunk_aligned", tmp_path) as (workdir, _):
+        _make_zarr_store(workdir, time_chunk=10)
+        result = _invoke(workdir, "product.zarr", "SEVIRI_L15")
+        assert result.exit_code == 0
+        assert "pipeline_batch_size=10" in result.output
 
+    with table_row(subtests, "batch_size_chunk_one", tmp_path) as (workdir, _):
+        _make_zarr_store(workdir, time_chunk=1)
+        result = _invoke(workdir, "product.zarr", "SEVIRI_L15")
+        assert result.exit_code == 0
+        assert (
+            "any size works" in result.output.lower() or "any batch size" in result.output.lower()
+        )
 
-def test_batch_size_chunk_one(tmp_path: Path) -> None:
-    _make_zarr_store(tmp_path, time_chunk=1)
-    result = _invoke(tmp_path, "product.zarr", "SEVIRI_L15")
-    assert result.exit_code == 0
-    assert "any size works" in result.output.lower() or "any batch size" in result.output.lower()
+    with table_row(subtests, "batch_size_no_time_dim", tmp_path) as (workdir, _):
+        store_path = workdir / "product.zarr"
+        root = zarr.open_group(str(store_path), mode="w")
+        grp = root.require_group("COORDS")
+        grp.create_array("lat", shape=(100,), chunks=(100,), dtype=np.float32)
+        result = _invoke(workdir, "product.zarr", "COORDS")
+        assert result.exit_code == 0
+        assert "no time dimension" in result.output.lower()
 
-
-def test_batch_size_no_time_dim(tmp_path: Path) -> None:
-    store_path = tmp_path / "product.zarr"
-    root = zarr.open_group(str(store_path), mode="w")
-    grp = root.require_group("COORDS")
-    grp.create_array("lat", shape=(100,), chunks=(100,), dtype=np.float32)
-    result = _invoke(tmp_path, "product.zarr", "COORDS")
-    assert result.exit_code == 0
-    assert "no time dimension" in result.output.lower()
-
-
-def test_batch_size_nonexistent_store(tmp_path: Path) -> None:
-    result = _invoke(tmp_path, "nonexistent.zarr", "FOO")
-    assert result.exit_code != 0
-    assert "Error opening store:" in result.output
-    assert "nonexistent.zarr does not exist" in result.output
+    with table_row(subtests, "batch_size_nonexistent_store", tmp_path) as (workdir, _):
+        result = _invoke(workdir, "nonexistent.zarr", "FOO")
+        assert result.exit_code != 0
+        assert "Error opening store:" in result.output
+        assert "nonexistent.zarr does not exist" in result.output

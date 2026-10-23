@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import zipfile
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
@@ -133,6 +137,26 @@ def test_info_reports_archive_version_in_json(tmp_path, monkeypatch: pytest.Monk
     assert payload["format"] == "v1"
 
 
+@pytest.mark.contract
+def test_list_prints_earlier_messages_before_a_late_decode_failure(tmp_path, monkeypatch):
+    def decode(self, index):
+        if index:
+            raise ValueError("late decode failure")
+        return _FakeTensogramMetadata()
+
+    _install_fake_tensogram(monkeypatch)
+    monkeypatch.setattr(_FakeTensogramArchive, "message_count", lambda self: 2)
+    monkeypatch.setattr(_FakeTensogramArchive, "file_decode_metadata", decode)
+    archive = tmp_path / "archive.tgm"
+    archive.write_bytes(b"fake")
+    result = CliRunner().invoke(cli, ["archive", "list", "--archive", archive.as_uri()])
+    assert (result.exit_code, str(result.exception)) == (1, "late decode failure")
+    assert result.stdout == (
+        "Messages: 2\n\nGroup: F024\n  Source:  file:///tmp/product.zarr\n"
+        "  Codec:   zstd\n  Objects: 0\n"
+    )
+
+
 def test_create_overwrite_non_tty_without_yes_exits_nonzero(tmp_path):
     src = tmp_path / "src.zarr"
     src.mkdir()
@@ -179,6 +203,89 @@ def test_restore_overwrite_non_tty_without_yes_exits_nonzero(tmp_path):
         "yes-i-really-mean-it" in r.output.lower()
         or "overwritewithoutconfirmation" in r.output.lower()
     )
+
+
+def test_zip_restore_refuses_entry_outside_target(tmp_path):
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("zarr.json", json.dumps({"zarr_format": 3, "node_type": "group"}))
+        zf.writestr("../escape.txt", "evil")
+    args = ["archive", "restore", "--archive", archive.as_uri()]
+    args += ["--target", f"file://{tmp_path}/r.zarr", *_LOCAL_STORAGE_FLAGS]
+    r = CliRunner().invoke(cli, args)
+    assert r.exit_code != 0, r.output
+    assert "../escape.txt" in r.output + str(r.exception)
+    assert not (tmp_path / "escape.txt").exists()
+
+
+@pytest.mark.parametrize("kind", ["tgm", "zip-root", "zip-consolidated-child"])
+def test_overwrite_restore_of_an_invalid_archive_keeps_the_target(tmp_path, kind):
+    src = tmp_path / "src"
+    zarr.open_group(str(src), mode="w").create_array("a", data=np.arange(6.0))
+    zarr.consolidate_metadata(str(src))
+    entries = {p.relative_to(src).as_posix(): p.read_bytes() for p in src.rglob("*") if p.is_file()}
+    bad = b'{"zarr_format": 3, "node_type": "banana"}'
+    archive = tmp_path / ("a.tgm" if kind == "tgm" else "a.zip")
+    if kind == "tgm":
+        archive.write_bytes(b"not a tensogram archive")
+    else:
+        entries["zarr.json" if kind == "zip-root" else "a/zarr.json"] = bad
+        with zipfile.ZipFile(archive, "w") as zf:
+            for key, data in entries.items():
+                zf.writestr(key, data)
+    target = tmp_path / "t.zarr"
+    zarr.open_group(str(target), mode="w").create_array("keep", data=np.arange(3.0))
+    (target / ".firecube").mkdir()
+    (target / ".firecube" / "schema.json").write_text('{"kept": true}')
+
+    def tree() -> dict[str, bytes]:
+        files = (p for p in target.rglob("*") if p.is_file())
+        return {p.relative_to(target).as_posix(): p.read_bytes() for p in files}
+
+    before = tree()
+    args = ["archive", "restore", "--archive", archive.as_uri(), "--target", target.as_uri()]
+    r = CliRunner().invoke(
+        cli, [*args, "--overwrite", "--yes-i-really-mean-it", *_LOCAL_STORAGE_FLAGS]
+    )
+    after = {k: v for k, v in tree().items() if not k.startswith(".firecube/runs/archive-restore-")}
+    assert after == before
+    assert r.exit_code != 0, r.output
+
+
+@pytest.mark.parametrize(("snapshot", "child"), [(None, "G"), ("G", "G"), ("G/H", "G/H")])
+def test_validate_rejects_a_broken_child_the_snapshot_still_shows_valid(tmp_path, snapshot, child):
+    src = tmp_path / "src"
+    root = zarr.open_group(str(src), mode="w", zarr_format=3)
+    root.require_group(child).create_array("a", data=np.arange(4.0))
+    zarr.consolidate_metadata(str(src))
+    if snapshot:
+        zarr.consolidate_metadata(str(src / snapshot))
+    broken = src / child / "a" / "zarr.json"
+    broken.write_text(json.dumps({**json.loads(broken.read_text()), "node_type": "banana"}))
+    archive = shutil.make_archive(str(tmp_path / "a"), "zip", src)
+    r = CliRunner().invoke(cli, ["archive", "validate", "--archive", f"file://{archive}"])
+    assert r.exit_code == 1, r.output
+    assert "INVALID:" in r.output and "cannot open as Zarr:" in r.output
+
+
+def test_create_refuses_anonymous_storage(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECUBE_S3_ANONYMOUS", "false")  # the CLI exports it; teardown unsets
+    u = tmp_path.as_uri()
+    cmd = f"archive create --source {u}/s --archive {u}/o.zip --storage-anonymous"
+    r = CliRunner().invoke(cli, cmd.split())
+    assert r.exit_code == 2, r.output
+    assert not (tmp_path / "o.zip").exists()
+
+
+def test_zip_restore_cli_preserves_array_values(tmp_path):
+    u = tmp_path.as_uri()
+    zarr.open_group(str(tmp_path / "s"), mode="w").create_array("a", data=np.arange(6.0))
+    for cmd in (f"create --source {u}/s --archive-format zip", f"restore --target {u}/r"):
+        r = CliRunner().invoke(cli, ["archive", *cmd.split(), "--archive", f"{u}/a.zip"])
+        assert r.exit_code == 0, r.output
+    restored = zarr.open_group(str(tmp_path / "r"))["a"]
+    assert isinstance(restored, zarr.Array)
+    assert np.asarray(restored[:]).tolist() == np.arange(6.0).tolist()
 
 
 def test_create_without_overwrite_requires_no_confirmation(tmp_path, monkeypatch):

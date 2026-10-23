@@ -9,6 +9,34 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 
 ### Added
 
+- `ZarrArraySpec(engine_owned=True)` and `ItemInfo(values={...})` declare
+  rank-1 per-slot arrays in `DirectZarrIngestor` plugins. `firecube zarr
+  preallocate` inspects every source item, on any time axis, and requires
+  `--input-data`. It writes the array whole and marks it materialized. Ingest
+  workers only verify the array and raise `SchemaDriftError` on a mismatch.
+- `firecube zarr preallocate` refuses per-slot values that the array cannot
+  hold. It refuses them before it creates the array.
+  - For an integer array, it refuses NaN, infinity, a fraction and an
+    out-of-range number.
+  - For a bool array, it refuses any value other than `bool` or
+    `numpy.bool_`.
+  - For a float array, it refuses a finite number too large for the dtype.
+
+  It does not refuse other roundings, such as a large integer into `float32`.
+- Ingest into a target where the engine-owned array is not materialized is
+  refused with the preallocate command. Ingest into a slot that preallocate
+  did not see is refused in the same way.
+- Preallocate and ingest never take over an existing array that lacks the
+  engine-owned marker, whatever the array holds. Both refuse it. Delete the
+  array and run preallocate again.
+- If preallocate fails and handles the failure itself, run it again to finish
+  the work. If a run was killed outright, take these steps:
+  1. Clear its claim with `firecube chunks claims clear`.
+  2. Abandon its run with `firecube chunks runs abandon`.
+  3. Run `firecube zarr preallocate` again.
+- Ingest reads the engine-owned markers from the array's own metadata, so
+  stale consolidated metadata does not hide them. Append resume reads the
+  stored array metadata when it classifies slots, writes and fills.
 - `--archive-format [tensogram|zip]` option on `firecube archive create`.
   `--archive-format zip` packs a Zarr product into a single local
   `.zip` file that opens as a Zarr zip store. The default stays `tensogram`.
@@ -16,19 +44,461 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   `--end-date`, and `--variables` are rejected.
 - `firecube archive info`, `list`, `validate`, and `restore` accept local
   `.zip` archives.
-- `firecube archive create` records each run in the source product's control plane.
+- `firecube archive restore` writes a zip archive through the configured
+  storage driver. Before it deletes the target or restores any entry, it
+  refuses an archive that holds an entry outside the target. Such an entry has an absolute name,
+  a backslash, or an empty, `.` or `..` segment. The error reads `Unsafe entry
+  '<name>' in archive <path>`.
+  - The restore also refuses a corrupt entry, an archive without a root
+    `zarr.json`, and a `zarr.json` entry that is not valid Zarr v3 metadata.
+  - With `--overwrite`, the restore deletes the old store but keeps
+    `.firecube/claims/`, `.firecube/schema.json` and the records of its own
+    run.
+  - If the target, or a kept path inside it, is a symlink, the restore refuses
+    the overwrite and deletes nothing.
+- `firecube archive create` records each run in the source product's control
+  plane. The record holds the start time, group, date window, variables and
+  size of the archive.
+  - If the source has a `.firecube/schema.json` file, the command takes the
+    maintenance claim of the product. Use credentials with write access to the
+    source.
+  - The command refuses anonymous storage (`--storage-anonymous`) and exits
+    with code 2. Use credentials that can write to the source.
+  - If the command cannot write the record, it exits with code 1. The archive
+    file stays in place. The message names the archive path and the record
+    error. The run of the failed create can stay `started`. Abandon it with
+    `firecube chunks runs abandon` before you retry with `--overwrite
+    --yes-i-really-mean-it`.
+  - If the source has no `.firecube/schema.json` file, the command writes no claim and no
+    record, and does not modify the source.
+- Host code outside the engine can now bind the index of a plugin the way the
+  engine does, through the public method `BaseIngestor.bind_index_at_startup(ctx)`.
+  - When a run preallocates a product or plans slots, the engine calls the method itself.
+    A call before either operation is not a prerequisite.
+  - The method runs the same binding that ingest runs at start-up. Pass it the plugin context of the run.
+  - Each call resolves the index again.
+  - If the `index_spec` of a `DirectZarrIngestor` plugin returns `None`, the plugin has no binding.
+  - Call the method. Do not override it.
+- `PipelineResult.failure` holds the `FirecubeError` that failed a batch. It is
+  `None` on success and for any other exception. If the error carries a
+  structured message, read its `context` and `recovery`. Otherwise read
+  `PipelineResult.error`.
+- `TimeAxis.grid`, `TimeAxis.explicit` and `TimeAxis.discovered` accept a
+  `calendar` for a source that is not on the Gregorian calendar.
+  - The accepted names are `360_day`, `noleap` (alias `365_day`), `all_leap`
+    (alias `366_day`) and `julian`.
+  - An irregular axis on such a calendar also needs `units`.
+  - A regular axis on such a calendar needs `slot_count`. It does not accept
+    `mode="floor"` or `end_date`.
+  - A monthly `360_day` axis is a grid with `cadence_s=2592000`.
+- Firecube stores the time coordinate of a calendar axis as CF-encoded numbers
+  with `units` and `calendar` attributes. A reader decodes the numbers in that
+  calendar. Firecube refuses a value on any other calendar. It does not
+  relabel the value.
+- `calendar` defaults to `"proleptic_gregorian"`. The names `"standard"` and
+  `"gregorian"` are aliases of it. A Gregorian axis stores `datetime64` with
+  no `units` or `calendar` attribute, as before.
+- `firecube zarr preallocate` writes the whole coordinate of a calendar axis.
+  Run `firecube zarr preallocate` before the first ingest into a calendar
+  group.
+  - An ingest that runs earlier fails, in direct and in staged mode. The
+    error names the command.
+  - A new preallocate run that changes the epoch, `units` or calendar of a
+    stored coordinate fails. No Zarr data or metadata outside `.firecube/`
+    changes. Firecube records the failed run.
+  - On a regular calendar axis with a non-empty window, the dry run prints
+    `first` and `last` as calendar dates, followed by the calendar name in
+    parentheses.
+  - An irregular calendar axis prints no `first` or `last` date in the dry
+    run. An empty window on a regular calendar axis prints `None` for
+    `first` and for `last`.
+  - A slot window does not limit the grid of a regular calendar coordinate.
+    The dry run adds `; window not applied to calendar coordinate` to the
+    line.
+  - A regular calendar axis accepts an empty slot window.
+- `firecube zarr index show --derived` prints the first and last values of a
+  calendar axis as calendar dates. It decodes the dates in the same way as
+  the `firecube zarr preallocate` dry run.
+- `firecube chunks list --time-range` and `firecube chunks delete
+  --time-range` exit with a non-zero code if a recorded span bound does not
+  parse as a Gregorian date. An example is 30 February on a `360_day`
+  calendar. The error names each span, and `delete` deletes nothing. Spans
+  with ordinary bounds filter as before.
 
 ### Changed
+- The refusal for a legacy index record now names the library function that
+  rebuilds the index. A Python caller reads that name in the message. The CLI
+  prints the command `firecube zarr index rebuild` instead. The
+  `firecube zarr slots` warning about a legacy index record follows the same
+  rule. The exception type stays the same.
+- A refusal that asks you to run `firecube zarr preallocate` now names the
+  library function that does the same for a Python caller. The CLI prints the
+  command. Four refusals change:
+  - An engine-owned array is not materialized.
+  - An engine-owned slot holds no value.
+  - A managed time coordinate slot holds no value.
+  - A target array is shorter than the declared time axis.
 
+  The exception types stay the same.
+- Refusals now carry their facts and their recovery steps as data.
+  - A refusal printed by the CLI names only the command. The "from Python"
+    note is gone.
+  - A refusal raised to a Python caller names parameters and library
+    functions. It names no flag and no command. Text that you match on
+    changes.
+  - `FirecubeError.recovery` lists the operations that the message suggests.
+    `FirecubeError.message` holds the message. `FirecubeError.context` holds
+    its facts.
+  - These three hold data only for an error that carries a structured
+    message. For an error built from plain text, `message` is `None`, and
+    `context` and `recovery` are empty. The text stays in `str(error)`. Keep
+    reading `str(error)` as the fallback.
+  - The CLI quotes values that hold spaces in the commands that it prints.
+    This holds for the `firecube zarr preallocate` and `firecube ingest` hints.
+  - A run error that Firecube records, and `PipelineResult.error`, keep the
+    Python wording.
+  - If `firecube zarr preallocate` cannot record the end of a run or cannot
+    release its claim, it also prints the recovery command on stderr. The log
+    line names the library function.
+- Two config errors now raise `ConfigurationError` subclasses:
+  `ConfigFileError` and `RemovedConfigKeyError`. Before, they raised
+  `click.UsageError`. If you catch
+  `click.UsageError` around library code, catch `ConfigurationError` instead.
+  The CLI still prints the same text and exits with code 2.
+- `PipelineFailedBatchesError` and `AppendBatchFailed` are now subclasses of
+  `FirecubeError`. A handler for `FirecubeError` now catches them. They are
+  still subclasses of `RuntimeError`.
+- `firecube zarr slots` refuses a plan of more than 1,000,000 ranges. The
+  refusal names the range count, and the range count and slot size of each
+  group. It also names the smallest `--slot-size` that gives an executable plan
+  within the limit. If no such size exists, the refusal says so. To emit the plan anyway,
+  add `--yes-i-really-mean-it`. A plan of exactly 1,000,000 ranges is emitted.
+  The JSON costs about 390 bytes per range, so 44 million ranges are about
+  17 GB.
+- `firecube zarr slots` prints one hint on stderr for a plan of more than
+  100,000 ranges. The output format (`v1` JSON, table and CSV) is unchanged.
+- `firecube zarr slots` now plans one range per slot by default for a plugin
+  that declares neither chunks nor shards. This holds only if no
+  worker-written array of the target requires larger ranges. Version 0.1.7 planned the whole axis as one
+  range. To choose the range size, pass `--slot-size`.
+- A DirectZarr plan covers the stored chunk or shard of every worker-written
+  array that the target already has. Plans therefore fit stores that an
+  earlier release created. An explicit `--slot-size` that would split one is
+  refused. The refusal names the multiple that the slot size needs.
+- A `DirectZarrIngestor` run can time out at shutdown while it waits for
+  in-flight batches. If workspace cleanup is enabled, Firecube now keeps the
+  staged workspace and logs an error that names its path. Before, it deleted
+  the workspace under the running writes. Remove the workspace once the writes
+  have stopped.
+- A staged `DirectZarrIngestor` promotion now refuses a target array that has
+  grown into a chunk or shard where the workspace array ends. The target stays
+  untouched. Promoting that unit would overwrite cells the run never wrote. If promotion refuses, rerun after the other writer has
+  finished.
+- The target-growth check runs when promotion starts. If another process grows
+  the target after the check and before the files are published, promotion is
+  not refused. It can then overwrite cells the run never wrote.
+- A staged `DirectZarrIngestor` promotion now refuses a changed data chunk
+  that no recorded write of the run covers. The target stays untouched, and the
+  error names the chunks. An example is a reused `--workspace` that holds stale
+  chunks that differ from the target. Rerun with a fresh workspace. The
+  refusal does not apply to the seeded chunks of a managed time coordinate.
+- A time-indexed array that ingest workers write, and that declares neither
+  `chunks=` nor `shards=`, is now created with one slot per chunk. If Zarr's
+  own chunks for the whole array already hold one slot each, Firecube keeps
+  them without a warning. Otherwise the array gets time chunk 1, Zarr chooses
+  the other dimensions for one slot, and the array is unsharded. Firecube then
+  logs a warning that names the chosen chunks. Before, the array got one dense
+  chunk.
+- An array that declares `shards=` and no `chunks=` keeps its shards. The time
+  coordinate and engine-owned arrays keep dense chunks, and existing arrays
+  keep their layout.
+- Slot-window workers now check the chunk or shard layout stored in the
+  target. They refuse a window that covers a stored unit only in part. This
+  includes stores that an earlier version created with an undeclared array.
+- A slot-window worker now refuses a write to an engine-owned array at a slot
+  outside its window. The refusal comes before the worker dispatches the data
+  writes of the batch, in direct and staged mode.
+- A `DirectZarrIngestor` write intent aimed at an array that `zarr_schema()`
+  does not declare now raises `ConfigurationError` before the batch dispatches
+  its writes. This holds in direct and staged mode. Setup files under the
+  target and `.firecube/` can already exist. Timestamp intents are exempt.
+  Before, Firecube wrote such an intent unchecked. Declare the array in
+  `zarr_schema()` or stop emitting intents for it.
+- `firecube` now requires `zarr>=3.2.1`.
+- `firecube` now requires `xarray>=2026.2.0`. Older releases lose values in
+  region writes to sharded arrays.
+- The dev dependency group now requires pytest 9.0 or later. The test suite
+  uses the built-in `subtests` fixture of pytest 9. Update pytest in your
+  development environment.
+- A staged `DirectZarrIngestor` promotion now publishes a delta instead of the
+  workspace tree. It uploads the units the run rewrote and the changed
+  auxiliary objects. It neither uploads nor compares the seeded chunks of a
+  time coordinate that Firecube manages. The promotion plan marks them
+  `engine-managed`.
+- A staged `DirectZarrIngestor` promotion never shrinks an array.
+- A staged `DirectZarrIngestor` promotion keeps the existing attributes of
+  the target when it publishes array metadata.
+- A staged `GenericZarrIngestor` promotion is unchanged and still uploads the
+  whole workspace tree. A run can rewrite a whole stored unit with only fill
+  values. On a local target, the previous data of that unit stays in place.
+- A direct-mode `DirectZarrIngestor` run no longer keeps the written and absent unit
+  keys of every write in memory. Staged runs record them as before.
+- Slot-window (parallel) `DirectZarrIngestor` runs now open each array once
+  per writer for region writes, not once per write.
+- A slot-window run does not detect growth of an array by another process
+  while it runs. An example is `firecube zarr preallocate` run again with a
+  larger slot count. Do not change the slot count of a target while a
+  slot-window run writes to it.
+- On a local target, promotion now replaces each uploaded object whole. The
+  replacement is a new file. Its owner is the user that ran the promotion, and
+  a symbolic-link destination becomes a regular file.
+- A run killed during promotion can leave `.firecube-publish-*.tmp` files in
+  the target. Delete them.
+- Two failures of concurrent staged runs remain. Claim files that runs
+  rewrite while they heartbeat are not replaced whole. A peer that lists claims
+  at that moment can still fail with a control-plane corruption error. A
+  parallel upload in which one object fails can still hang instead of raising.
 - `firecube archive create` no longer prints the codec on the size line of
   its summary. The line now reads `Size: <n> MB`.
-- `firecube chunks delete-span` now exits 1 when it reports errors. It
-  previously printed them and exited 0. It also refuses a CF-encoded time
-  array whose dtype cannot represent NaT (any integer dtype other than
-  `int64`) unless the array declares a `_FillValue`.
+- `firecube chunks delete-span` now exits 1 when it reports errors. Before, it
+  printed them and exited 0.
+- `firecube chunks delete-span` now refuses a CF-encoded time array whose
+  dtype cannot represent NaT, unless the array declares a `_FillValue`. This
+  covers every integer dtype other than `int64`.
+- The dimension check of an existing cube now lists only the top level of each
+  group. It runs before every batch of an ingest into an existing cube. Before,
+  it listed every object under the group. Its cost no longer grows with the
+  number of chunk objects in the store. On a store of 173,283 objects, the
+  check fell from about 1.8 s per batch to under 0.01 s. No action is
+  required.
+- A claim-conflict error now names the owner of the claim. It prints the
+  `firecube chunks claims clear` command for the claim. If one recorded run
+  owns the claim, it also prints the run, its status and the
+  `firecube chunks runs abandon` command for that run. If no recorded run or
+  several runs own the claim, the error says so (#86).
+- Every `firecube chunks runs abandon` command that Firecube prints now runs
+  as printed. The command carries `--product-name` with the product URI and
+  `--run-id` with the run. Replace the `<reason>` placeholder. In a script,
+  add `--yes-i-really-mean-it` (#86).
+- The refusals of `firecube archive create`, `archive restore` and the
+  chunk deletion commands now print the `firecube chunks claims clear` command for
+  each blocking claim. Before, they named `firecube chunks runs abandon`
+  without arguments. If one recorded run owns the claim, they also print the
+  status of that run and the abandon command for that run (#86).
+- The claim that `firecube zarr preallocate` takes while it sets up the schema
+  now carries the id of the preallocate run. Its conflict error names that run.
+  If the run cannot record its terminal state, the log names the library
+  function that abandons the run, and stderr shows the command. If the run
+  cannot release the claim, the log names the library function that clears the
+  claim, and stderr shows the command (#86).
+- Ingest no longer builds the conflict detail when it retries a claim that
+  another writer holds. The intermediate retries of the schema setup skip the
+  detail. Its final attempt still builds it, even if the setup then converges
+  (#86).
+- The reason of `IndexedWriteCompilationError` now names the type and the
+  message of the underlying error when a coordinate does not resolve. Update
+  any code that matches the old reason text.
 
 ### Fixed
 
+- Refusals no longer print a recovery command that fails to run. Each command
+  now carries the options that it needs and names only options that the
+  command has.
+  - The refusal for a legacy index record names a working
+    `firecube zarr index rebuild` command. The `firecube zarr slots` warning
+    for a legacy index record does the same.
+  - The refusal of `firecube ingest` for a store shorter than the plugin
+    expects names a working `firecube zarr preallocate` command.
+  - The advice for an unsorted existing coordinate names a working
+    `firecube zarr validate` command.
+  - The force advice of `firecube chunks delete-span` names the options that
+    the command has.
+  - The slot group refusal of `firecube zarr preallocate` no longer names
+    `--slot-group`. That command has no such option.
+  - The advice of `firecube zarr index verify` names the `firecube zarr index
+    rebuild` command with the target, plugin and product name.
+  - The advice for a blocked range in `firecube zarr slots` names a working
+    `firecube chunks delete-span` command.
+- `firecube zarr index rebuild` now prints an error line and exits with code 1
+  for an index whose root attrs and record disagree. Before, it printed a
+  traceback.
+- `firecube zarr index verify` and `firecube zarr slots` now print a recovery
+  that works. Before, they told you to run `firecube zarr index rebuild`, and
+  that command refuses these states. Each state now has its own text.
+  - If the root attrs hold the resolved-index hash and
+    `.firecube/index/current.json` is absent, `verify` exits with code 1.
+    Restore the file. Or remove the root attrs
+    `firecube_resolved_index_identity_hash` and `firecube_resolved_index`,
+    then run `firecube zarr index rebuild` with the plugin that wrote the data.
+  - If the root attr `firecube_resolved_index_identity_hash` differs from the
+    record, `verify` exits with code 1. Remove that attr, then run
+    `firecube zarr index rebuild`. The command writes the attr again from the
+    record.
+  - If the plugin resolves an index that differs from the record,
+    `firecube zarr slots` warns. Use the plugin that wrote the product, or a
+    new target.
+- `firecube zarr consolidate-time-coord` now reports a backfilled
+  `ConsolidatedTimeCoord` event only after Firecube records the event. Before,
+  it reported the backfill before the record. A failed record could then leave
+  a report of work that did not happen.
+- `firecube zarr consolidate-time-coord` now refuses to rewrite and reseal a
+  coordinate that carries a `firecube_coord_managed` stamp. It refuses even when
+  consolidated metadata, at the root or in any group below it, predates the
+  stamp. The command now reads the live metadata of the root and of every group
+  below it. Before, it could read consolidated metadata that predated the stamp
+  and rewrite the coordinate.
+- `firecube archive restore` of a Tensogram archive no longer creates
+  consolidated metadata. `firecube zarr multires` no longer creates it either.
+  Before, both commands wrote it at the root of a store that had none.
+  - If the store already has consolidated metadata, both commands rewrite it
+    after the last write. The rewritten metadata lists every group and array
+    that they wrote.
+  - If you open a restored store with the xarray defaults, the open works.
+    xarray warns that it fell back to the slower read without consolidated
+    metadata. To silence the warning, pass `consolidated=False`.
+- These operations now read the own metadata of each array and each group. A
+  consolidated snapshot that is older than the store no longer decides what
+  they do. Append resume and `firecube archive create` have exceptions, which
+  the items below name:
+  - Append resume. It reads the live array metadata when it determines the
+    initial write cursor. An append into a store whose snapshot predates growth
+    no longer resumes at the old length and overwrites slots. Classification of
+    the slots can still use the own snapshot of a group.
+  - Staged resume. It no longer limits seeding to the length that a snapshot at
+    the root records. The own snapshot of a group no longer makes it skip
+    seeding. Before, a staged resume that skipped seeding could publish fill
+    values over target cells next to the new data.
+  - The state update of a span deletion.
+  - `firecube zarr validate` and `firecube zarr compare`.
+  - `firecube archive validate` on a zip archive. It now reports a child
+    document that does not parse.
+  - `firecube archive create`. A group whose arrays carry no dimension names
+    is still read through the own snapshot of that group, if it has one.
+  - The order of a new Tensogram archive. `firecube archive create` now writes
+    the groups in name order. In each group it writes the data variables in
+    name order, then the coordinates in name order. `firecube archive info` and
+    `firecube archive list` show the same order on every run. Archives made
+    before keep their order.
+  - `firecube advise compliance` and `firecube catalog intake`.
+
+  `firecube archive info` and `firecube archive list` of a zip archive show
+  the live metadata. Before, each of these operations could act on the
+  snapshot.
+- `firecube archive restore --overwrite` of a `.tgm` archive now checks the
+  archive before it deletes anything. It reads the archive version and runs the
+  quick structural check of every message. If the archive fails a check, the
+  command exits with an error. It deletes and replaces no existing data. It
+  can already have written the control-plane records of the restore: its claim,
+  its run under `.firecube/runs/archive-restore-*/`, and
+  `.firecube/schema.json` if that file was absent. Before, it deleted the
+  target first and then failed on a bad archive.
+  - On a local target, the overwrite keeps `.firecube/claims/`,
+    `.firecube/schema.json` and the records of its own run. It deletes the rest
+    of the old target. The restore releases its claim when it ends.
+  - If the command cannot record a failure or release the claim, it prints a
+    `Warning:` line. Before, such an error replaced the restore error. The
+    warning does not replace it now. A failure to record the start of the run
+    still surfaces as the error itself.
+  - If a symlink is the target, or lies on a kept path under `.firecube/`, the
+    command refuses the overwrite and deletes nothing.
+  - On a local target, a restore that stops during the replacement leaves its
+    run in the `started` state. Check the status with `firecube chunks runs
+    list`. Abandon the run with `firecube chunks runs abandon` only if it is
+    still `started`. Then run the restore again with `--overwrite
+    --yes-i-really-mean-it`.
+  - The command treats a remote target as before. A remote `.tgm` root restore
+    replaces the whole store.
+- `firecube chunks runs abandon` now releases the write claims that the run
+  alone owns. Before, the claims stayed and a resume after a killed writer
+  failed with a claim conflict (#86). The command prints `Released claim
+  <domain>` for each claim it deletes. It prints `Left claim <domain>` for a
+  claim it keeps, because the owner matches more than one run or the claim
+  changed. Clear such a claim with `firecube chunks claims clear`. Abandoning
+  a run that is still alive also removes its slot guards. Its heartbeat writes
+  the claim again at its next beat. The beat interval defaults to 30 s. The
+  claim can therefore return within seconds of the abandon. Stop the run
+  before you abandon it.
+- If `firecube chunks runs abandon` cannot list the claims, it now exits 1 and
+  prints the error. Before, it reported success and left the claims in place.
+  Firecube has already recorded the run as abandoned. Run the same command
+  again to release the claims (#86).
+- `firecube chunks runs abandon` on a run that is already terminal now
+  releases the claims that the run still owns. Before, it released nothing.
+  The run keeps its status (#86).
+- A committed `firecube chunks runs abandon --all-stale --yes-i-really-mean-it`
+  now releases the claims of runs that an earlier abandon ended and a crash
+  interrupted. It lists the claims once and prints each `Released claim` and
+  `Left claim` line, also when it abandons no run. If it cannot list the
+  claims, it exits 1 and abandons no run. Run it again (#86).
+- The `--all-stale` sweep releases a claim only when the claim is stale. A
+  claim is stale 120 s after its last heartbeat. The sweep checks this again
+  just before it deletes the claim. It keeps a fresh claim and prints
+  `Left claim <domain>`. A process that still renews a claim keeps it. Stop
+  that process. Then run `firecube chunks runs abandon` for the run, or
+  `firecube chunks claims clear --force` for the claim (#86).
+- Without `--yes-i-really-mean-it`, the `--all-stale` sweep is a dry run. It
+  deletes nothing and abandons no run. It now also lists the claims. It prints
+  `Would release claim <domain>` for each claim that a committed sweep
+  releases. It prints `Would leave claim <domain>` for each claim that the
+  sweep keeps. It lists only kept claims whose owner includes a terminal run
+  or a run in the sweep (#86).
+- `firecube zarr slots` no longer holds the whole plan in memory. It writes
+  each range as it computes it, so the number of ranges does not change its
+  memory use. A plan of 44 million ranges needed more than 100 GB.
+  The remaining-coverage intervals and the resolved index stay in memory.
+- `DirectZarrIngestor` no longer loses slots silently when writers share a
+  chunk or shard along time. The writers are slot-window workers,
+  `pipeline_workers` threads in one process, and staged promotion. Firecube
+  now refuses windows that would split a stored unit (see Changed).
+- A write to a slot outside a 1-D array now raises `IndexError`. Before,
+  Firecube ignored the write.
+- A window that splits a shard of a group that declares shards and no chunks
+  is now refused at the start of the run. The refusal comes before any array
+  data or metadata is written to the target, in direct and staged mode.
+  `.firecube/` run records can already exist.
+- Writers in one process now serialize per stored unit when they address a
+  local store in one of these ways:
+  - by a file path or a `file://` URI
+  - by a symbolic link
+  - by a supplied `LocalStore`
+
+  Firecube keys other supplied stores by their URI label. Two spellings of
+  one remote store, such as `s3://bucket` and `s3://bucket/`, still take
+  separate locks.
+- With `pipeline_workers` of 2 or more, two batches of one run could carry
+  different payloads for one static array (`WriteIntent.static`). This
+  happened in direct and staged mode. Both batches could succeed, and the later one silently
+  replaced the earlier. The check, the write and the marker stamp of a static
+  array now run under one lock per array in the process. The batch that finds
+  the array already written compares its payload. It fails with
+  `SchemaDriftError` if the payload differs, as a resume does. Which payload
+  stays depends on which batch takes the lock first.
+- A `GenericZarrIngestor` refill or overwrite (`force_reingest`) could lose
+  values written within one stored chunk. This happened when Dask computed the
+  pieces of that chunk as separate tasks, which left some slots with their
+  old values. Firecube now aligns the Dask tasks of a region write to the
+  stored chunks. The required xarray release aligns them to shards as well, so
+  a write whose inner chunks share a shard keeps every value.
+- A payload or static write intent aimed at a preallocated or coord-managed
+  time coordinate is now verified against the stored values. Identical values
+  cause no write. Different values raise `SchemaDriftError`. Before, the
+  intent overwrote the stored values.
+- Staged runs now refuse to promote a chunk or shard that they do not write
+  completely. This covers sparse windows, serial runs, and partially written
+  rows or channels. Before, promotion reset the unwritten cells to the fill
+  value.
+- A staged `DirectZarrIngestor` run can rewrite a whole chunk or shard with
+  only the fill value. Promotion now replaces the old data of that unit in the
+  target, so it reads back as the fill value. Before, promotion kept the old
+  values. This holds only when `zarr_write_empty_chunks` is off, the default.
+- `DirectZarrIngestor`'s `zarr_write_empty_chunks` option no longer changes
+  the process-wide configuration of Zarr. Concurrent writers with different
+  settings no longer receive each other's.
+- Concurrent staged runs into one local target no longer fail with Zstd or
+  JSON decode errors from reading a half-written file. Each uploaded object
+  now replaces the old one whole, so a reader sees the old or the new object.
+  S3 and GCS uploads are unchanged. See the "Run Parallel Zarr Writes"
+  operations guide.
 - `firecube chunks delete` no longer tries to delete span, run, and schema
   records from storage: their keys are not storage objects. On local products
   the attempt failed with "Missing local target base", and on S3 it deleted
@@ -36,23 +506,73 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
   objects and points to `firecube chunks delete-span` for span data.
 - `firecube chunks delete-span` works on cubes with static data variables
   such as `lat_bnds` and `lon_bnds` (#83). Arrays without the span's time
-  dimension are skipped and listed in one warning per span instead of
-  failing the delete. A span in which no array carries the time dimension,
-  or an array with unknown dimensions, is refused.
-- `GenericZarrIngestor` span records no longer list static data variables;
-  they list time-indexed variables only.
-- A `delete-span` fill that fails its pre-flight checks (a listed array is
-  missing, a range lies outside an array, the state array does not fit)
-  now changes nothing. Previously the data variables could be NaN-filled
-  while the state array still read `present`. A storage failure during the
-  write itself is not rolled back.
+  dimension are skipped and listed in one warning per span. Before, they
+  failed the delete. A span in which no array carries the time dimension is
+  refused. An array with unknown dimensions is also refused.
+- `GenericZarrIngestor` span records no longer list static data variables.
+  They list time-indexed variables only.
+- A `delete-span` fill that fails its pre-flight checks now changes nothing.
+  The checks find a missing listed array, a range outside an array, and a
+  state array that does not fit. Before, the data variables could be
+  NaN-filled while the state array still read `present`. A storage failure
+  during the write itself is not rolled back.
 - `delete-span` fills CF-encoded int64 and float time arrays (`units`
-  containing `since`) with NaT. Previously it wrote the array's Zarr fill
-  value, normally `0`, which decodes as the reference epoch, a valid date.
+  containing `since`) with NaT. Before, it wrote the Zarr fill value of the
+  array, normally `0`. That value decodes as the reference epoch, a valid date.
 - Resuming or force-reingesting into a DirectZarr store no longer fails with
-  `IndexError` when the plugin writes a 0-d static array, such as a CF
-  `spatial_ref` grid mapping (#84). The replay check now reads static
-  arrays of any rank.
+  `IndexError` when the plugin writes a 0-d static array. An example is a CF
+  `spatial_ref` grid mapping (#84). The replay check now reads static arrays
+  of any rank.
+- A rank-1 time-indexed array that declares `shards=` but not `chunks=` now
+  gets inner chunks that divide its shards, at most 256 slots each. This
+  applies to arrays that ingest workers write, to engine-owned arrays
+  and to the time coordinate. Existing arrays keep their layout, and
+  preallocate still accepts them.
+- Before that fix, `firecube zarr preallocate` gave an array of this kind
+  `min(256, slots)` slots per chunk. The array was a worker-written array or a
+  time coordinate on an exact or irregular axis. This failed with "not
+  divisible by the shard's inner chunk size" if that number did not divide the
+  shards. An example is 512 slots in shards of 100. Ingest without
+  preallocate let Zarr choose, which failed the same way for many shapes.
+- An observed time coordinate (`RegularTimeAxis(mode="floor")`) that
+  preallocate creates is the exception to that fix. It is unsharded with
+  `min(256, slots)` slots per chunk, and its declared shards are not used, as
+  before.
+- A serial or staged `DirectZarrIngestor` run with `pipeline_workers` above 1
+  could overwrite slots that another batch had just written. This happened
+  when the time chunk of an array holds more than one slot and the array grew
+  during the run. Each region write and each 1-D slot write took its array
+  handle before it took its locks. Each now reads the shape of the array while
+  it holds its locks. A write to a slot beyond the extent of the array is
+  refused with `IndexError` after the locks are taken, and nothing is written.
+- In a serial staged run, a write with a negative `ts_index` could overwrite
+  target cells the run never wrote, if the array grew afterwards. The
+  run recorded the write against the wrong array shape. Firecube now resolves
+  a negative `ts_index` once, against the workspace array, before the batch
+  records its footprint. A negative `ts_index` into an array that the
+  workspace does not hold yet is now refused with `ConfigurationError`. Emit an
+  absolute slot instead.
+- On S3 with the fsspec storage driver, the dimension check no longer fails
+  with `FileNotFoundError`. It failed when another process created an array
+  after this process had listed the store. The check now lists each group
+  again and reads the `zarr.json` file of each array directly. No action is
+  required.
+- Firecube now refuses a Gregorian time value outside the `datetime64[ns]`
+  range, about 1677-09-21 to 2262-04-11. Before, a value handed to a Gregorian
+  axis or written to a Gregorian coordinate wrapped to a wrong date without an
+  error. For example, 2500-01-01 became 1915-06-14. The error names the range.
+- `firecube archive create --archive-format tensogram` now refuses a store
+  with a non-Gregorian time coordinate. The error names the coordinate.
+  For a plain Zarr store, the command records nothing. For a Firecube
+  product, it attempts to record the run as failed. Before, the command
+  dropped the coordinate and wrote an archive without a time axis.
+- A second ingest run into a store that holds calendar-valued time objects no
+  longer crashes. Before, the run failed and recorded null coverage bounds.
+- `firecube zarr consolidate-time-coord` now leaves a preallocated
+  calendar time coordinate unchanged.
+- `firecube zarr validate` no longer reports the unwritten slots of an encoded
+  calendar coordinate as duplicates. It still reports a repeated value on every
+  other coordinate.
 
 ## [0.1.7] - 2026-09-19
 
@@ -887,7 +1407,9 @@ the migration procedure including `firecube zarr index rebuild`.
 - `uv build`: built `firecube-0.1.1.tar.gz` and `firecube-0.1.1-py3-none-any.whl`.
 - `uv run --with twine twine check dist/*`: passed.
 
-[Unreleased]: https://github.com/eumetsat/firecube/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/eumetsat/firecube/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/eumetsat/firecube/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/eumetsat/firecube/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/eumetsat/firecube/compare/v0.1.4.post1...v0.1.5
 [0.1.4.post1]: https://github.com/eumetsat/firecube/compare/v0.1.4.post0...v0.1.4.post1
 [0.1.4.post0]: https://github.com/eumetsat/firecube/compare/v0.1.4...v0.1.4.post0

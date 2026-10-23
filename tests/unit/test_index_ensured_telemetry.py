@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
@@ -37,6 +38,7 @@ from firecube.ingestor.templates.direct_zarr import (
     ZarrArraySpec,
     ZarrGroupSpec,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -53,7 +55,9 @@ class _FakeChunkManager:
         self.ensure_calls: list[dict[str, Any]] = []
         self.wal_events: list[IndexEnsuredEvent] = []
 
-    def acquire_claim(self, *, product: str, domain: Any, owner_id: str):
+    def acquire_claim(
+        self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+    ):
         _ = (product, domain, owner_id)
         return nullcontext()
 
@@ -183,28 +187,49 @@ def _sample_event() -> IndexEnsuredEvent:
     )
 
 
-def test_telemetry_service_emit_index_ensured_emits_counter() -> None:
-    telemetry = _FakeTelemetry()
-    service = TelemetryService(cast(Any, telemetry), "test-plugin")
-
-    service.emit_index_ensured(
-        product="prod-1",
-        identity_hash="a" * 64,
-        axis_kinds=("regular_time",),
-        groups=("data",),
-        outcome=INDEX_ENSURED_OUTCOME_CREATED,
+def test_telemetry_service_emit_index_ensured(subtests: Any, tmp_path: Path) -> None:
+    # (row id, identity hash, axis kinds, groups, joined axis kinds, joined groups)
+    rows = (
+        (
+            "test_telemetry_service_emit_index_ensured_emits_counter",
+            "a" * 64,
+            ("regular_time",),
+            ("data",),
+            "regular_time",
+            "data",
+        ),
+        (
+            "test_telemetry_service_emit_index_ensured_joins_multi_axis_and_groups",
+            "b" * 64,
+            ("integer", "regular_time"),
+            ("g_a", "g_b"),
+            "integer,regular_time",
+            "g_a,g_b",
+        ),
     )
+    for row_id, identity_hash, axis_kinds, groups, joined_axes, joined_groups in rows:
+        with table_row(subtests, row_id, tmp_path):
+            telemetry = _FakeTelemetry()
+            service = TelemetryService(cast(Any, telemetry), "test-plugin")
 
-    assert len(telemetry.emitted) == 1
-    name, value, kind, meta = telemetry.emitted[0]
-    assert "index_ensured" in name
-    assert value == 1.0
-    assert kind == "counter"
-    assert meta is not None
-    assert meta["outcome"] == INDEX_ENSURED_OUTCOME_CREATED
-    assert meta["identity_hash"] == "a" * 64
-    assert meta["axis_kinds"] == "regular_time"
-    assert meta["groups"] == "data"
+            service.emit_index_ensured(
+                product="prod-1",
+                identity_hash=identity_hash,
+                axis_kinds=axis_kinds,
+                groups=groups,
+                outcome=INDEX_ENSURED_OUTCOME_CREATED,
+            )
+
+            assert len(telemetry.emitted) == 1
+            name, value, kind, meta = telemetry.emitted[0]
+            assert "index_ensured" in name
+            assert value == 1.0
+            assert kind == "counter"
+            assert meta is not None
+            assert meta["outcome"] == INDEX_ENSURED_OUTCOME_CREATED
+            assert meta["identity_hash"] == identity_hash
+            assert meta["axis_kinds"] == joined_axes
+            assert meta["groups"] == joined_groups
 
 
 def test_telemetry_service_emit_index_ensured_no_sink_is_noop() -> None:
@@ -217,24 +242,6 @@ def test_telemetry_service_emit_index_ensured_no_sink_is_noop() -> None:
         groups=("data",),
         outcome=INDEX_ENSURED_OUTCOME_MATCHED_EXISTING,
     )
-
-
-def test_telemetry_service_emit_index_ensured_joins_multi_axis_and_groups() -> None:
-    telemetry = _FakeTelemetry()
-    service = TelemetryService(cast(Any, telemetry), "test-plugin")
-
-    service.emit_index_ensured(
-        product="prod-1",
-        identity_hash="b" * 64,
-        axis_kinds=("integer", "regular_time"),
-        groups=("g_a", "g_b"),
-        outcome=INDEX_ENSURED_OUTCOME_CREATED,
-    )
-
-    _, _, _, meta = telemetry.emitted[0]
-    assert meta is not None
-    assert meta["axis_kinds"] == "integer,regular_time"
-    assert meta["groups"] == "g_a,g_b"
 
 
 def test_wal_writer_record_index_ensured_event_appends(chunk_manager: Any) -> None:
@@ -295,50 +302,41 @@ def _bypass_legacy_check(ingestor: DirectZarrIngestor) -> None:
     ingestor._check_legacy_index_record_at_startup = lambda **_kwargs: None  # type: ignore[method-assign]
 
 
-def test_startup_emits_telemetry_and_wal_on_fresh_create() -> None:
-    manager = _FakeChunkManager(outcome=INDEX_ENSURED_OUTCOME_CREATED)
-    ingestor = _CapableIngestor(chunk_manager=manager)
-    _bypass_legacy_check(ingestor)
-    telemetry = _FakeTelemetry()
-    ctx = cast(Any, _ctx(telemetry=telemetry))
+def test_startup_emits_telemetry_and_wal(subtests: Any, tmp_path: Path) -> None:
+    rows = (
+        ("test_startup_emits_telemetry_and_wal_on_fresh_create", INDEX_ENSURED_OUTCOME_CREATED),
+        (
+            "test_startup_emits_matched_existing_when_record_matches",
+            INDEX_ENSURED_OUTCOME_MATCHED_EXISTING,
+        ),
+    )
+    for row_id, outcome in rows:
+        with table_row(subtests, row_id, tmp_path):
+            manager = _FakeChunkManager(outcome=outcome)
+            ingestor = _CapableIngestor(chunk_manager=manager)
+            _bypass_legacy_check(ingestor)
+            telemetry = _FakeTelemetry()
+            ctx = cast(Any, _ctx(telemetry=telemetry))
 
-    ingestor._ensure_index_identity_at_startup(ctx)
+            ingestor._ensure_index_identity_at_startup(ctx)
 
-    assert len(manager.wal_events) == 1
-    event = manager.wal_events[0]
-    assert event.outcome == INDEX_ENSURED_OUTCOME_CREATED
-    assert event.product == "index_ensured_test"
-    assert event.run_id == "startup-run"
-    assert event.axis_kinds == ("regular_time",)
-    assert event.groups == ("data",)
-    assert len(event.identity_hash) == 64
+            assert len(manager.wal_events) == 1
+            event = manager.wal_events[0]
+            assert event.outcome == outcome
+            assert event.product == "index_ensured_test"
+            assert event.run_id == "startup-run"
+            assert event.axis_kinds == ("regular_time",)
+            assert event.groups == ("data",)
+            assert len(event.identity_hash) == 64
 
-    assert len(telemetry.emitted) == 1
-    name, value, kind, meta = telemetry.emitted[0]
-    assert "index_ensured" in name
-    assert kind == "counter"
-    assert value == 1.0
-    assert meta is not None
-    assert meta["outcome"] == INDEX_ENSURED_OUTCOME_CREATED
-    assert meta["identity_hash"] == event.identity_hash
-
-
-def test_startup_emits_matched_existing_when_record_matches() -> None:
-    manager = _FakeChunkManager(outcome=INDEX_ENSURED_OUTCOME_MATCHED_EXISTING)
-    ingestor = _CapableIngestor(chunk_manager=manager)
-    _bypass_legacy_check(ingestor)
-    telemetry = _FakeTelemetry()
-    ctx = cast(Any, _ctx(telemetry=telemetry))
-
-    ingestor._ensure_index_identity_at_startup(ctx)
-
-    assert len(manager.wal_events) == 1
-    assert manager.wal_events[0].outcome == INDEX_ENSURED_OUTCOME_MATCHED_EXISTING
-
-    assert len(telemetry.emitted) == 1
-    _, _, _, meta = telemetry.emitted[0]
-    assert meta is not None
-    assert meta["outcome"] == INDEX_ENSURED_OUTCOME_MATCHED_EXISTING
+            assert len(telemetry.emitted) == 1
+            name, value, kind, meta = telemetry.emitted[0]
+            assert "index_ensured" in name
+            assert kind == "counter"
+            assert value == 1.0
+            assert meta is not None
+            assert meta["outcome"] == outcome
+            assert meta["identity_hash"] == event.identity_hash
 
 
 def test_startup_no_double_emission_when_already_stamped() -> None:

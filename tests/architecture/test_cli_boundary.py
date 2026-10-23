@@ -1,0 +1,374 @@
+# Copyright 2025-2026 EUMETSAT
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Architectural gate for the CLI boundary, with a tagged allowlist of today's debt.
+
+Five checks walk ``src/firecube`` with :mod:`ast`:
+
+1. Click is imported only below ``src/firecube/cli/``.
+2. ``firecube.cli`` is imported only below ``src/firecube/cli/``.
+3. Runtime strings in ``core/`` and ``ingestor/`` (raised, logged, warned or
+   inside an f-string) do not name CLI commands or flags.
+4. ``cli/`` modules import no private ``firecube.core`` / ``firecube.ingestor``
+   module (a path component with one leading underscore). Private *names* are
+   covered by ``test_cli_no_private_cross_subsystem_imports.py``.
+5. Every ``cli/`` module stays at or under ``CLI_MODULE_LINE_CEILING`` lines.
+
+Existing debt is listed in the row tables below. Each row carries a tag,
+``PERMANENT: <reason>`` or ``UNTIL <owner>: <reason>``. Rows only shrink by
+edit: a row that matches nothing, or whose count, tokens or cap differ from
+what the tree holds, fails its check and names the row to delete or correct.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.architecture
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = _REPO_ROOT / "src" / "firecube"
+_CLI_ROOT = _SRC_ROOT / "cli"
+CLI_MODULE_LINE_CEILING = 500
+
+_TAG = re.compile(r"^(PERMANENT: \S.*|UNTIL [a-z0-9-]+: \S.*)$")
+_CLI_FLAG = re.compile(r"--[a-z-]+")
+_CLI_COMMAND = re.compile(r"firecube [a-z][a-z-]*")
+_LOG_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
+)
+
+# Row tables. Key -> tag.
+_CLICK_ROWS: dict[str, str] = {}
+_CLI_IMPORT_ROWS: dict[str, str] = {
+    "src/firecube/__main__.py": "PERMANENT: python -m firecube is the CLI's own entry point",
+}
+# Text rows, one per line: "path below src/firecube | enclosing scope | sorted tokens".
+_CLI_TEXT_PERMANENT = {
+    "core/controlplane/manager.py | ChunkManager._apply_slot_model_precedence | firecube will": (
+        "PERMANENT: prose, the phrase firecube will not adopt it names no command"
+    ),
+    "core/filesystem/_obstore_compat.py | require_obstore | --storage-driver": (
+        "PERMANENT: dependency-install hint that names --storage-driver"
+    ),
+    "core/zarr/_reserved_root_attrs.py | assert_root_attrs_safe | firecube root": (
+        "PERMANENT: prose, the phrase firecube root attribute(s) names no command"
+    ),
+}
+_CLI_TEXT_ROWS: dict[tuple[str, str, tuple[str, ...]], str] = {
+    ("src/firecube/" + p.strip(), sc.strip(), tuple(t.strip().split(", "))): tag
+    for row, tag in _CLI_TEXT_PERMANENT.items()
+    for p, sc, t in [row.split(" | ")]
+}
+# path -> tag; every CLI-text hit in the file is covered.
+_CLI_TEXT_FILE_ROWS: dict[str, str] = {}
+# (path, private module, import count) -> tag
+_PRIVATE_IMPORT_ROWS: dict[tuple[str, str, int], str] = {}
+# path -> (cap, tag)
+_LINE_CEILING_ROWS: dict[str, tuple[int, str]] = {
+    "src/firecube/cli/main.py": (963, "UNTIL unscheduled: module is over the ceiling"),
+}
+
+
+def _rel(path: Path) -> str:
+    return path.relative_to(_REPO_ROOT).as_posix()
+
+
+def _parse(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _py_files(root: Path) -> list[Path]:
+    return sorted(root.rglob("*.py"))
+
+
+def _below_cli(path: Path) -> bool:
+    return _CLI_ROOT in path.parents
+
+
+def _imported_modules(
+    path: Path, tree: ast.Module, *, submodules: bool = True
+) -> Iterator[tuple[int, str]]:
+    """Yield ``(lineno, dotted module)`` for every import, relative ones resolved.
+
+    With ``submodules``, ``from pkg import name`` also yields ``pkg.name`` when
+    that is a module file or package under ``src/firecube``; other names are
+    symbols, not modules.
+    """
+    package = list(path.relative_to(_SRC_ROOT.parent).with_suffix("").parts)[:-1]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield node.lineno, alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package[: len(package) - (node.level - 1)]
+                parts = base + (node.module.split(".") if node.module else [])
+            else:
+                parts = (node.module or "").split(".")
+            module = ".".join(parts)
+            yield node.lineno, module
+            if submodules:
+                for alias in node.names:
+                    target = f"{module}.{alias.name}"
+                    base = _SRC_ROOT.joinpath(*target.split(".")[1:])
+                    if target.startswith("firecube.") and (
+                        base.with_suffix(".py").is_file() or (base / "__init__.py").is_file()
+                    ):
+                        yield node.lineno, target
+
+
+def _dynamic_import_targets(tree: ast.Module) -> Iterator[tuple[int, str]]:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        first = node.args[0]
+        if (
+            name in {"import_module", "__import__"}
+            and isinstance(first, ast.Constant)
+            and isinstance(first.value, str)
+        ):
+            yield node.lineno, first.value
+
+
+def _fail(title: str, offenders: list[str], stale: list[str]) -> None:
+    lines = [*sorted(offenders), *sorted(stale)]
+    if lines:
+        pytest.fail(f"{title}:\n" + "\n".join(lines), pytrace=False)
+
+
+def _stale_keys(rows: dict, found: set, label: str) -> list[str]:
+    return [
+        f"stale row, delete it: {label} {key!r} matches nothing" for key in rows if key not in found
+    ]
+
+
+def test_no_click_below_cli() -> None:
+    offenders: list[str] = []
+    found: set[str] = set()
+    for path in _py_files(_SRC_ROOT):
+        if _below_cli(path):
+            continue
+        rel = _rel(path)
+        tree = _parse(path)
+        hits = [
+            (node.lineno, f"import {alias.name}")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "click" or alias.name.startswith("click.")
+        ]
+        hits += [
+            (node.lineno, f"from {node.module} import ...")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module
+            and (node.module == "click" or node.module.startswith("click."))
+        ]
+        hits += [
+            (lineno, f"dynamic import of {target!r}")
+            for lineno, target in _dynamic_import_targets(tree)
+            if target.startswith("click")
+        ]
+        if hits:
+            found.add(rel)
+        if hits and rel not in _CLICK_ROWS:
+            offenders += [f"{rel}:{lineno}: Click outside cli/: {code}" for lineno, code in hits]
+    _fail(
+        "Click is imported outside src/firecube/cli/",
+        offenders,
+        _stale_keys(_CLICK_ROWS, found, "Click path"),
+    )
+
+
+def test_no_firecube_cli_import_below_cli() -> None:
+    offenders: list[str] = []
+    found: set[str] = set()
+
+    def is_cli(module: str) -> bool:
+        return module == "firecube.cli" or module.startswith("firecube.cli.")
+
+    for path in _py_files(_SRC_ROOT):
+        if _below_cli(path):
+            continue
+        rel = _rel(path)
+        tree = _parse(path)
+        hits = {(n, m) for n, m in _imported_modules(path, tree) if is_cli(m)}
+        hits |= {(n, t) for n, t in _dynamic_import_targets(tree) if is_cli(t)}
+        if hits:
+            found.add(rel)
+        if hits and rel not in _CLI_IMPORT_ROWS:
+            offenders += [f"{rel}:{n}: imports {m} outside cli/" for n, m in sorted(hits)]
+    _fail(
+        "firecube.cli is imported outside src/firecube/cli/",
+        offenders,
+        _stale_keys(_CLI_IMPORT_ROWS, found, "firecube.cli path"),
+    )
+
+
+def _cli_text_sites(path: Path) -> Iterator[tuple[int, str, str, list[str]]]:
+    """Yield ``(lineno, qualified scope, literal part, tokens)`` for CLI text in runtime strings."""
+    tree = _parse(path)
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def is_docstring(const: ast.Constant) -> bool:
+        stmt = parents.get(const)
+        owner = parents.get(stmt) if stmt is not None else None
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(
+                owner, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+            )
+            and owner.body[0] is stmt
+        )
+
+    def is_logging_call(node: ast.AST) -> bool:
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return False
+        if node.func.attr not in _LOG_METHODS:
+            return False
+        target = node.func.value
+        name = target.id if isinstance(target, ast.Name) else getattr(target, "attr", "")
+        name = name.lstrip("_").lower()
+        return name in {"logging", "warnings"} or name.endswith(("log", "logger"))
+
+    def scope_of(node: ast.AST) -> str:
+        names: list[str] = []
+        cur = parents.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                names.append(cur.name)
+            cur = parents.get(cur)
+        return ".".join(reversed(names)) or "<module>"
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        tokens = _CLI_FLAG.findall(node.value) + _CLI_COMMAND.findall(node.value)
+        if not tokens or is_docstring(node):
+            continue
+        cur = parents.get(node)
+        while cur is not None and not isinstance(
+            cur, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda
+        ):
+            if isinstance(cur, ast.Raise | ast.JoinedStr) or is_logging_call(cur):
+                yield node.lineno, scope_of(node), node.value, tokens
+                break
+            cur = parents.get(cur)
+
+
+def test_no_cli_text_in_runtime_strings() -> None:
+    found: dict[tuple[str, str], list[str]] = {}
+    first_site: dict[tuple[str, str], str] = {}
+    file_hits: set[str] = set()
+    for root in (_SRC_ROOT / "core", _SRC_ROOT / "ingestor"):
+        for path in _py_files(root):
+            rel = _rel(path)
+            for lineno, scope, text, tokens in _cli_text_sites(path):
+                file_hits.add(rel)
+                found.setdefault((rel, scope), []).extend(tokens)
+                first_site.setdefault(
+                    (rel, scope), f"{rel}:{lineno}: CLI text in {scope}: {text[:80]!r}"
+                )
+    pinned = {(rel, scope, tokens) for rel, scope, tokens in _CLI_TEXT_ROWS}
+    offenders = [
+        site
+        for key, site in first_site.items()
+        if key[0] not in _CLI_TEXT_FILE_ROWS and (*key, tuple(sorted(found[key]))) not in pinned
+    ]
+    stale: list[str] = []
+    for rel, scope, tokens in _CLI_TEXT_ROWS:
+        actual = tuple(sorted(found.get((rel, scope), [])))
+        if not actual:
+            stale.append(f"stale row, delete it: CLI text {(rel, scope)!r} matches nothing")
+        elif actual != tokens:
+            stale.append(
+                f"stale row, correct its tokens: {(rel, scope)!r} has {actual!r}, row says {tokens!r}"
+            )
+    stale += _stale_keys(_CLI_TEXT_FILE_ROWS, file_hits, "CLI text file")
+    _fail("CLI command or flag names in core/ or ingestor/ runtime strings", offenders, stale)
+
+
+def test_cli_imports_no_private_module() -> None:
+    offenders: list[str] = []
+    found: dict[tuple[str, str], int] = {}
+    for path in _py_files(_CLI_ROOT):
+        rel = _rel(path)
+        tree = _parse(path)
+        counts: dict[str, int] = {}
+        # Modules only (aliases that name a module count): private names are another test's concern.
+        for _lineno, module in _imported_modules(path, tree):
+            parts = module.split(".")
+            if parts[:2] in (["firecube", "core"], ["firecube", "ingestor"]) and any(
+                p.startswith("_") and not p.startswith("__") for p in parts[2:]
+            ):
+                counts[module] = counts.get(module, 0) + 1
+        for module, count in counts.items():
+            found[(rel, module)] = count
+            if (rel, module, count) not in _PRIVATE_IMPORT_ROWS:
+                offenders.append(f"{rel}: imports private module {module} x{count}")
+    stale: list[str] = []
+    for rel, module, count in _PRIVATE_IMPORT_ROWS:
+        actual = found.get((rel, module))
+        if actual is None:
+            stale.append(f"stale row, delete it: private import {(rel, module)!r} matches nothing")
+        elif actual != count:
+            stale.append(
+                f"stale row, correct its count: {(rel, module)!r} has {actual}, row says {count}"
+            )
+    _fail("cli/ imports private firecube modules", offenders, stale)
+
+
+def test_cli_modules_stay_under_line_ceiling() -> None:
+    offenders: list[str] = []
+    stale: list[str] = []
+    seen: set[str] = set()
+    for path in _py_files(_CLI_ROOT):
+        rel = _rel(path)
+        seen.add(rel)
+        lines = len(path.read_text(encoding="utf-8").splitlines())
+        row = _LINE_CEILING_ROWS.get(rel)
+        if row is None:
+            if lines > CLI_MODULE_LINE_CEILING:
+                offenders.append(f"{rel}: {lines} lines, ceiling {CLI_MODULE_LINE_CEILING}")
+        elif lines <= CLI_MODULE_LINE_CEILING:
+            stale.append(f"stale row, delete it: {rel} has {lines} lines, at or under the ceiling")
+        elif lines > row[0]:
+            offenders.append(f"{rel}: {lines} lines, over its cap {row[0]}")
+    stale += _stale_keys(_LINE_CEILING_ROWS, seen, "line ceiling path")
+    _fail("cli/ modules over the line ceiling", offenders, stale)
+
+
+def test_allowlist_tags_are_well_formed() -> None:
+    tags = [
+        *_CLICK_ROWS.values(),
+        *_CLI_IMPORT_ROWS.values(),
+        *_CLI_TEXT_ROWS.values(),
+        *_CLI_TEXT_FILE_ROWS.values(),
+        *_PRIVATE_IMPORT_ROWS.values(),
+        *(tag for _cap, tag in _LINE_CEILING_ROWS.values()),
+    ]
+    bad = [f"malformed tag: {tag!r}" for tag in tags if not _TAG.match(tag)]
+    _fail("allowlist tags must be 'PERMANENT: <reason>' or 'UNTIL <owner>: <reason>'", bad, [])

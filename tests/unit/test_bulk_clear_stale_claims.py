@@ -57,9 +57,9 @@ class _PathCountingFilesystem(CountingFilesystem):
         super().__init__(fs)
         self.ls_paths: list[str] = []
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list[Any]:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list[Any]:
         self.ls_paths.append(uri.path)
-        return super().ls(uri, detail=detail)
+        return super().ls(uri, detail=detail, refresh=refresh)
 
 
 def _counting_manager(

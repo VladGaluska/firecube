@@ -19,6 +19,9 @@ from pathlib import Path
 
 import click
 
+from firecube.cli._errors import render
+from firecube.core.controlplane.repo import UnparseableSpanBoundsError
+
 from ._common import parse_datetime, parse_meta_filters, parse_time_range
 from ._manager import resolve_cli_product, resolve_manager
 
@@ -121,11 +124,32 @@ def list_cmd(
     time_range_dt = parse_time_range(time_range)
     meta = parse_meta_filters(meta_filters) if meta_filters else None
 
-    if pattern:
-        chunks = []
-        for p in pattern:
-            entries = manager.list_chunks(
-                pattern=p,
+    try:
+        if pattern:
+            chunks = []
+            for p in pattern:
+                entries = manager.list_chunks(
+                    pattern=p,
+                    product=product_name,
+                    before=before_dt,
+                    after=after_dt,
+                    chunk_type=chunk_type,
+                    meta=meta,
+                    time_overlaps=time_range_dt,
+                    include_replaced=include_replaced,
+                    refuse_unparseable=True,
+                )
+                chunks.extend(entries)
+            deduped = []
+            seen = set()
+            for chunk in chunks:
+                key = (chunk.product, chunk.key)
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(chunk)
+            all_chunks = deduped
+        else:
+            all_chunks = manager.list_chunks(
                 product=product_name,
                 before=before_dt,
                 after=after_dt,
@@ -133,26 +157,10 @@ def list_cmd(
                 meta=meta,
                 time_overlaps=time_range_dt,
                 include_replaced=include_replaced,
+                refuse_unparseable=True,
             )
-            chunks.extend(entries)
-        deduped = []
-        seen = set()
-        for chunk in chunks:
-            key = (chunk.product, chunk.key)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(chunk)
-        all_chunks = deduped
-    else:
-        all_chunks = manager.list_chunks(
-            product=product_name,
-            before=before_dt,
-            after=after_dt,
-            chunk_type=chunk_type,
-            meta=meta,
-            time_overlaps=time_range_dt,
-            include_replaced=include_replaced,
-        )
+    except UnparseableSpanBoundsError as exc:
+        raise click.ClickException(render(exc)) from exc
 
     if limit:
         all_chunks = all_chunks[:limit]

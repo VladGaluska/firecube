@@ -260,37 +260,16 @@ def test_interior_failure_stops_the_run_and_records_the_truth(tmp_path: Path) ->
 
 
 def test_plain_rerun_after_failed_run_raises_resume_conflict_error(tmp_path: Path) -> None:
-    source, target, _first = _failed_store(tmp_path)
-
-    result = _ingest(source, target)
-
-    _assert_plain_rerun_refused(result)
-
-
-def test_message_names_both_resume_existing_and_force_reingest(tmp_path: Path) -> None:
-    source, target, _first = _failed_store(tmp_path)
+    """A plain rerun is refused, names both recoveries, claims nothing, mutates nothing."""
+    source, target, first = _failed_store(tmp_path)
+    before = _store_digest(target)
 
     combined = _assert_plain_rerun_refused(_ingest(source, target))
 
     assert "Re-run with --option resume_existing=true" in combined
     assert "--option force_reingest=true" in combined
-
-
-def test_message_does_not_claim_control_plane_will_process(tmp_path: Path) -> None:
-    source, target, first = _failed_store(tmp_path)
-    initial_message = first.stdout + first.stderr
-    refused_message = _assert_plain_rerun_refused(_ingest(source, target))
-
-    assert "control plane will attempt to process" not in initial_message
-    assert "control plane will attempt to process" not in refused_message
-
-
-def test_store_not_mutated_by_refused_rerun(tmp_path: Path) -> None:
-    source, target, _first = _failed_store(tmp_path)
-    before = _store_digest(target)
-
-    _assert_plain_rerun_refused(_ingest(source, target))
-
+    assert "control plane will attempt to process" not in first.stdout + first.stderr
+    assert "control plane will attempt to process" not in combined
     assert _store_digest(target) == before
 
 

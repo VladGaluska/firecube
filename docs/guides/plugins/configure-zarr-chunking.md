@@ -5,8 +5,9 @@
 Set the chunk shape of the arrays your plugin writes. Chunking decides how
 much data one read has to fetch. Decide it before the first real run: a
 written cube keeps its chunk shape, and appends must match it, so changing
-it later means writing a new cube. Without a setting Zarr picks a shape
-itself (for a `(2, 720, 1440)` array it chose `(1, 180, 720)`).
+it later means writing a new cube. Without a setting, `GenericZarrIngestor`
+lets Zarr pick a shape itself. For a `(2, 720, 1440)` array it chose
+`(1, 180, 720)`. `DirectZarrIngestor` has its own default, described below.
 
 | Template | Where the chunk shape comes from |
 |---|---|
@@ -100,6 +101,20 @@ ZarrArraySpec(
 )
 ```
 
+For a new worker-written time-indexed array, omit `chunks=` and `shards=` to
+use one slot per chunk. Firecube creates the array without sharding. Zarr
+selects the other chunk dimensions. Set `chunks=` to choose a chunk shape. Set
+`shards=` to choose a shard shape. If you omit `chunks=`, Firecube keeps the
+declared shards.
+
+Slot ranges must cover whole stored chunks or shards. This includes the chunks
+that a time coordinate declares. See
+[Chunk Ownership Refusals](../../operations/parallel-zarr-writes.md#chunk-ownership-refusals).
+
+Time coordinates and engine-owned arrays use dense chunks by default. Existing
+arrays keep their layout. Firecube logs a warning only when it changes the
+chunks that Zarr selects by default.
+
 ## Verify
 
 ```python
@@ -120,6 +135,7 @@ print(array.chunks)
 | `--option zarr_chunk_shape={"time":5}` without quotes | The shell eats the braces. Quote the whole option. |
 | A dimension name the dataset does not have | Use the dataset's own names, for example `latitude` rather than `lat`. |
 | `zarr_chunk_shape` on a `DirectZarrIngestor` plugin | It has no effect there. Set `chunks=` in the `ZarrArraySpec`. |
+| Slot ranges that split a stored chunk or shard | Plan ranges with `firecube zarr slots`. To allow one-slot ranges, create a new array without sharding and with time chunk 1. |
 | `get_zarr_config` returns the preset over the operator's options | Fill only the keys absent from `ctx.options`, as above. |
 
 ## Next Steps

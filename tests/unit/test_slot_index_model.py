@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -54,100 +55,101 @@ def _golden_model() -> SlotIndexModel:
     )
 
 
-def test_slot_axis_rejects_zero_cadence() -> None:
-    with pytest.raises(ValueError, match="cadence_s"):
-        SlotAxis(cadence_s=0, mode="exact")
+_G = {"g": SlotAxis(300, "exact")}
+_REJECTION_ROWS: tuple[tuple[str, Callable[[], object], type[Exception], str | None], ...] = (
+    (
+        "slot_axis_rejects_zero_cadence",
+        lambda: SlotAxis(cadence_s=0, mode="exact"),
+        ValueError,
+        "cadence_s",
+    ),
+    ("slot_axis_rejects_negative_cadence", lambda: SlotAxis(-1, "exact"), ValueError, "cadence_s"),
+    (
+        "slot_axis_rejects_invalid_mode",
+        lambda: SlotAxis(300, cast(Any, "invalid")),
+        ValueError,
+        "mode",
+    ),
+    ("slot_axis_rejects_bool_cadence", lambda: SlotAxis(True, "exact"), TypeError, None),
+    ("slot_axis_rejects_bool_cadence_false", lambda: SlotAxis(False, "exact"), TypeError, None),
+    ("slot_axis_rejects_float_cadence", lambda: SlotAxis(cast(int, 1.5), "exact"), TypeError, None),
+    (
+        "slot_axis_rejects_string_cadence",
+        lambda: SlotAxis(cast(Any, "1"), "exact"),
+        TypeError,
+        None,
+    ),
+    (
+        "slot_index_model_rejects_empty_name",
+        lambda: SlotIndexModel("", GOLDEN_EPOCH_ISO, dict(_G)),
+        ValueError,
+        "name",
+    ),
+    (
+        "slot_index_model_rejects_empty_epoch",
+        lambda: SlotIndexModel("x", "", dict(_G)),
+        ValueError,
+        "epoch",
+    ),
+    (
+        "slot_index_model_rejects_empty_groups",
+        lambda: SlotIndexModel("x", GOLDEN_EPOCH_ISO, {}),
+        ValueError,
+        "groups",
+    ),
+    (
+        "slot_index_model_rejects_empty_group_key",
+        lambda: SlotIndexModel("x", GOLDEN_EPOCH_ISO, {"": SlotAxis(300, "exact")}),
+        ValueError,
+        "group keys",
+    ),
+    (
+        "normalize_epoch_iso_rejects_non_utc_offset",
+        lambda: normalize_epoch_iso("2026-01-01T00:00:00+05:00"),
+        ValueError,
+        "UTC",
+    ),
+    (
+        "iso_to_epoch_s_rejects_non_utc_offset",
+        lambda: iso_to_epoch_s("2026-01-01T00:00:00-07:00"),
+        ValueError,
+        "UTC",
+    ),
+)
 
 
-def test_slot_axis_rejects_negative_cadence() -> None:
-    with pytest.raises(ValueError, match="cadence_s"):
-        SlotAxis(cadence_s=-1, mode="exact")
+def test_invalid_inputs_are_rejected(subtests) -> None:
+    for row_id, build, exc, match in _REJECTION_ROWS:
+        with subtests.test(msg=f"test_{row_id}"), pytest.raises(exc, match=match):
+            build()
 
 
-def test_slot_axis_rejects_invalid_mode() -> None:
-    with pytest.raises(ValueError, match="mode"):
-        SlotAxis(cadence_s=300, mode="invalid")  # type: ignore[arg-type]
+_CONVERSION_ROWS = (
+    ("iso_to_epoch_s_golden", lambda: iso_to_epoch_s(GOLDEN_EPOCH_ISO), GOLDEN_EPOCH_SECONDS),
+    ("epoch_s_to_iso_golden", lambda: epoch_s_to_iso(GOLDEN_EPOCH_SECONDS), GOLDEN_EPOCH_ISO),
+    (
+        "normalize_epoch_iso_accepts_explicit_utc_offset",
+        lambda: normalize_epoch_iso("2026-01-01T00:00:00+00:00"),
+        GOLDEN_EPOCH_ISO,
+    ),
+    (
+        "normalize_epoch_iso_round_trip_z",
+        lambda: normalize_epoch_iso(GOLDEN_EPOCH_ISO),
+        GOLDEN_EPOCH_ISO,
+    ),
+)
 
 
-def test_slot_axis_rejects_bool_cadence() -> None:
-    with pytest.raises(TypeError):
-        SlotAxis(cadence_s=True, mode="exact")
-    with pytest.raises(TypeError):
-        SlotAxis(cadence_s=False, mode="exact")
-
-
-def test_slot_axis_rejects_float_cadence() -> None:
-    with pytest.raises(TypeError):
-        SlotAxis(cadence_s=cast(int, 1.5), mode="exact")
-
-
-def test_slot_axis_rejects_string_cadence() -> None:
-    with pytest.raises(TypeError):
-        SlotAxis(cadence_s="1", mode="exact")  # type: ignore[arg-type]
+def test_epoch_conversions(subtests) -> None:
+    for row_id, convert, expected in _CONVERSION_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            assert convert() == expected
 
 
 def test_slot_axis_accepts_numpy_int64_cadence() -> None:
     axis = SlotAxis(cadence_s=cast(int, np.int64(300)), mode="exact")
     assert axis.cadence_s == 300
     assert axis.mode == "exact"
-
-
-def test_slot_index_model_rejects_empty_name() -> None:
-    with pytest.raises(ValueError, match="name"):
-        SlotIndexModel(
-            name="",
-            epoch=GOLDEN_EPOCH_ISO,
-            groups={"g": SlotAxis(300, "exact")},
-        )
-
-
-def test_slot_index_model_rejects_empty_epoch() -> None:
-    with pytest.raises(ValueError, match="epoch"):
-        SlotIndexModel(
-            name="x",
-            epoch="",
-            groups={"g": SlotAxis(300, "exact")},
-        )
-
-
-def test_slot_index_model_rejects_empty_groups() -> None:
-    with pytest.raises(ValueError, match="groups"):
-        SlotIndexModel(name="x", epoch=GOLDEN_EPOCH_ISO, groups={})
-
-
-def test_slot_index_model_rejects_empty_group_key() -> None:
-    with pytest.raises(ValueError, match="group keys"):
-        SlotIndexModel(
-            name="x",
-            epoch=GOLDEN_EPOCH_ISO,
-            groups={"": SlotAxis(300, "exact")},
-        )
-
-
-def test_iso_to_epoch_s_golden() -> None:
-    assert iso_to_epoch_s(GOLDEN_EPOCH_ISO) == GOLDEN_EPOCH_SECONDS
-
-
-def test_epoch_s_to_iso_golden() -> None:
-    assert epoch_s_to_iso(GOLDEN_EPOCH_SECONDS) == GOLDEN_EPOCH_ISO
-
-
-def test_normalize_epoch_iso_accepts_explicit_utc_offset() -> None:
-    assert normalize_epoch_iso("2026-01-01T00:00:00+00:00") == GOLDEN_EPOCH_ISO
-
-
-def test_normalize_epoch_iso_round_trip_z() -> None:
-    assert normalize_epoch_iso(GOLDEN_EPOCH_ISO) == GOLDEN_EPOCH_ISO
-
-
-def test_normalize_epoch_iso_rejects_non_utc_offset() -> None:
-    with pytest.raises(ValueError, match="UTC"):
-        normalize_epoch_iso("2026-01-01T00:00:00+05:00")
-
-
-def test_iso_to_epoch_s_rejects_non_utc_offset() -> None:
-    with pytest.raises(ValueError, match="UTC"):
-        iso_to_epoch_s("2026-01-01T00:00:00-07:00")
 
 
 def test_canonical_bytes_golden() -> None:

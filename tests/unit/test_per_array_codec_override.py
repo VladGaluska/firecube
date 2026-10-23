@@ -16,7 +16,7 @@
 
 Locks the per-array override matrix that governs how ``ZarrArraySpec`` codec
 fields (``filters`` / ``serializer`` / ``compressors``) interact with the
-``ZarrTemplateConfig.zarr_compression`` setting. The seven cases split into:
+``ZarrTemplateConfig.zarr_compression`` setting. The cases are:
 
 Positive (template ``True``, override lands on the array):
   * per-array ``compressors=None``    → inherit template default (zarr default)
@@ -24,15 +24,10 @@ Positive (template ``True``, override lands on the array):
                                         (``compress-except-X`` pattern)
   * per-array ``compressors=(blosc,)`` → declared blosc lands on the array
 
-Negative (template ``False``, ANY per-array codec is rejected by the shared
-validator ``validate_zarr_specs_against_template``):
-  * per-array ``compressors=(blosc,)`` → ``ConfigurationError``
-  * per-array ``compressors=()``       → ``ConfigurationError`` (empty tuple is still a declaration)
-  * per-array ``filters=(bitround,)``  → ``ConfigurationError``
-  * per-array ``serializer={bytes}``   → ``ConfigurationError``
+The negative matrix (template ``False`` rejects any per-array codec) lives in
+``test_validate_zarr_specs_against_template.py``.
 
-Positive cases exercise the full derivation → writer path with real zarr stores;
-negative cases only need the validator call.
+These cases exercise the full derivation → writer path with real zarr stores.
 """
 
 from __future__ import annotations
@@ -44,13 +39,9 @@ import pytest
 import zarr
 from zarr.abc.codec import BytesBytesCodec
 
-from firecube.core.errors import ConfigurationError
 from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.runtime.zarr.write import derive_effective_codecs_for_spec
-from firecube.ingestor.templates.config import (
-    ZarrTemplateConfig,
-    validate_zarr_specs_against_template,
-)
+from firecube.ingestor.templates.config import ZarrTemplateConfig
 from firecube.ingestor.templates.direct_zarr import ZarrArraySpec
 
 pytestmark = pytest.mark.unit
@@ -137,71 +128,3 @@ def test_per_array_specific_compressor(tmp_path) -> None:
     store = _apply(spec, template, str(tmp_path / "per-array-blosc.zarr"))
     names = _codec_names(_codecs_of(store, "G/var"))
     assert "blosc" in names, f"per-array declared blosc must land on the array, got {names!r}"
-
-
-# ---------------------------------------------------------------------------
-# Negative matrix — template False rejects any per-array codec declaration
-# ---------------------------------------------------------------------------
-
-
-def test_per_array_false_template_with_compressors_raises() -> None:
-    """Template False + per-array declared blosc compressor → validator rejects."""
-    template = ZarrTemplateConfig(zarr_compression=False)
-    spec = ZarrArraySpec(
-        name="var",
-        shape=(8,),
-        dtype="f4",
-        compressors=(BLOSC_ENTRY,),
-    )
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    msg = str(excinfo.value)
-    assert "'var'" in msg
-    assert "compressors" in msg
-    assert "zarr_compression=False" in msg
-
-
-def test_per_array_false_template_with_empty_compressors_raises() -> None:
-    """Template False + per-array ``compressors=()`` → validator rejects (empty is still a declaration)."""
-    template = ZarrTemplateConfig(zarr_compression=False)
-    spec = ZarrArraySpec(name="var", shape=(8,), dtype="f4", compressors=())
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    msg = str(excinfo.value)
-    assert "'var'" in msg
-    assert "compressors" in msg
-    assert "zarr_compression=False" in msg
-
-
-def test_per_array_false_template_with_filters_raises() -> None:
-    """Template False + per-array declared filter → validator rejects."""
-    template = ZarrTemplateConfig(zarr_compression=False)
-    spec = ZarrArraySpec(
-        name="var",
-        shape=(8,),
-        dtype="f4",
-        filters=({"name": "bitround", "configuration": {"keepbits": 8}},),
-    )
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    msg = str(excinfo.value)
-    assert "'var'" in msg
-    assert "filters" in msg
-    assert "zarr_compression=False" in msg
-
-
-def test_per_array_false_template_with_serializer_raises() -> None:
-    """Template False + per-array declared serializer → validator rejects."""
-    template = ZarrTemplateConfig(zarr_compression=False)
-    spec = ZarrArraySpec(
-        name="var",
-        shape=(8,),
-        dtype="f4",
-        serializer={"name": "bytes"},
-    )
-    with pytest.raises(ConfigurationError) as excinfo:
-        validate_zarr_specs_against_template([spec], template)
-    msg = str(excinfo.value)
-    assert "'var'" in msg
-    assert "serializer" in msg
-    assert "zarr_compression=False" in msg

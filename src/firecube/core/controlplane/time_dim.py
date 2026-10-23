@@ -26,6 +26,8 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from firecube.core.errors import Message, Param
+
 if TYPE_CHECKING:
     from firecube.core.controlplane.types import ChunkInfo
 
@@ -42,9 +44,14 @@ def resolve_time_dim_index(dim_names: Sequence[str], expected: str) -> int:
         return dim_names.index(expected)
     except ValueError:
         raise ValueError(
-            f"Cube dim_names={dim_names!r} does not contain expected time dimension "
-            f"'{expected}'. The cube was probably written with a different time_dim_name. "
-            "Pass the cube's time dimension explicitly (CLI: --time-dim) to proceed."
+            Message(
+                "Cube dim_names={dim_names!r} does not contain expected time dimension "
+                "'{expected}'. The cube was probably written with a different time_dim_name. "
+                "Pass the cube's time dimension explicitly (CLI: {time_dim}) to proceed.",
+                dim_names=dim_names,
+                expected=expected,
+                time_dim=Param("time_dim"),
+            )
         ) from None
 
 
@@ -103,9 +110,16 @@ def resolve_span_time_dims(
                 else f"discovered from the timestamp-state array {state_path!r}"
             )
             raise ValueError(
-                f"Span {span.key}: explicit time dimension {explicit!r} contradicts "
-                f"{authoritative!r} ({source}). Refusing to delete along a contradicted "
-                "axis; drop the explicit --time-dim or fix the span records."
+                Message(
+                    "Span {span}: explicit time dimension {explicit!r} contradicts "
+                    "{authoritative!r} ({source}). Refusing to delete along a contradicted "
+                    "axis; drop the explicit {time_dim} or fix the span records.",
+                    span=span.key,
+                    explicit=explicit,
+                    authoritative=authoritative,
+                    source=source,
+                    time_dim=Param("time_dim"),
+                )
             )
         resolved[span.key] = authoritative or explicit or default
     return resolved

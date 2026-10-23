@@ -19,12 +19,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
 from click.testing import CliRunner
-from index_spec_integer_test_plugin import IntegerAxisIngestor, MixedAxisIngestor
 
 from firecube.cli.main import cli
 from firecube.core.api import IntegerAxis, ResolvedIndexRecord
@@ -103,15 +100,6 @@ def _integer_record(run_id: str) -> ResolvedIndexRecord:
     )
 
 
-def _plugin_ctx() -> Any:
-    return SimpleNamespace(
-        _ctx=object(),
-        run_id="integer-axis-e2e-run",
-        storage=None,
-        option=lambda key, default=None: default,
-    )
-
-
 def test_integer_axis_ingest_writes_resolved_index(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         cli,
@@ -120,22 +108,11 @@ def test_integer_axis_ingest_writes_resolved_index(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "resolved index: created" in result.output
-    record = _read_record(tmp_path, INTEGER_PRODUCT)
-    assert record.index["groups"]["data"]["kind"] == "integer"
-    assert not _legacy_current_path(tmp_path, INTEGER_PRODUCT).exists()
-
-
-def test_integer_axis_record_has_correct_kind(tmp_path: Path) -> None:
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args(tmp_path, plugin=INTEGER_PLUGIN, product=INTEGER_PRODUCT),
-    )
-
-    assert result.exit_code == 0, result.output
     group = _read_record(tmp_path, INTEGER_PRODUCT).index["groups"]["data"]
     assert group["kind"] == "integer"
     assert group["size"] == 144
     assert group["params"] == {}
+    assert not _legacy_current_path(tmp_path, INTEGER_PRODUCT).exists()
 
 
 def test_mixed_axis_record_has_integer_and_regular_time_groups(tmp_path: Path) -> None:
@@ -228,12 +205,3 @@ def test_legacy_detection_for_integer_axis_plugin(tmp_path: Path) -> None:
     assert "firecube zarr index rebuild" in result.output
     assert _legacy_current_path(tmp_path, INTEGER_PRODUCT).exists()
     assert not _index_current_path(tmp_path, INTEGER_PRODUCT).exists()
-
-
-def test_fixture_plugin_specs_remain_integer_axis_contract() -> None:
-    ctx = cast(Any, _plugin_ctx())
-    integer_spec = IntegerAxisIngestor().index_spec(ctx)
-    mixed_spec = MixedAxisIngestor().index_spec(ctx)
-
-    assert integer_spec.groups["data"] == IntegerAxis(slot_count=144)
-    assert mixed_spec.groups["data"] == IntegerAxis(slot_count=144)

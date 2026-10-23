@@ -62,9 +62,9 @@ class CountingFilesystem:
     def _bump(self, name: str) -> None:
         self.counts[name] = self.counts.get(name, 0) + 1
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list[Any]:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list[Any]:
         self._bump("ls")
-        return self._fs.ls(uri, detail=detail)
+        return self._fs.ls(uri, detail=detail, refresh=refresh)
 
     def exists(self, uri: StorageUri) -> bool:
         self._bump("exists")

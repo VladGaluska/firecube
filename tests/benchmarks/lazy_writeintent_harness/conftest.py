@@ -46,10 +46,8 @@ import json
 import os
 import platform
 import re
-import shutil
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from importlib.util import find_spec
@@ -395,35 +393,3 @@ def make_measurement_record(measurement: IngestMeasurement, *, source: str) -> B
         host_id=socket.gethostname(),
         source=source,
     )
-
-
-@pytest.fixture(scope="session")
-def evidence_dir() -> Path:
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    return EVIDENCE_DIR
-
-
-@pytest.fixture(scope="session")
-def baseline_json_path(evidence_dir: Path) -> Path:
-    return evidence_dir / BASELINE_JSON.name
-
-
-@pytest.fixture(scope="session")
-def firecube_binary() -> str:
-    override = os.environ.get("FIRECUBE_BINARY")
-    if override:
-        return override
-    which = shutil.which("firecube")
-    if which:
-        return which
-    return f"{sys.executable} -m firecube"
-
-
-@pytest.fixture(scope="session")
-def fci_smoke_path() -> Path | None:
-    return resolve_fci_smoke_path()
-
-
-@pytest.fixture(scope="session")
-def environment_skip_reasons() -> list[str]:
-    return _explain_environment_skips()

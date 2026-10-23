@@ -157,6 +157,18 @@ def expand_time_index_ranges_to_chunk_boundaries(
     return expanded
 
 
+def _require_parent_groups(root: Any, parts: list[str]) -> Any:
+    """Create the missing parent groups of ``parts`` and return the innermost one.
+
+    Require each group by its full path from ``root``: a parent group object trusts its own
+    consolidated snapshot.
+    """
+    grp = root
+    for depth in range(1, len(parts)):
+        grp = root.require_group("/".join(parts[:depth]))
+    return grp
+
+
 def ensure_timestamp_state_array(
     *,
     store_uri: str,
@@ -187,16 +199,18 @@ def ensure_timestamp_state_array(
 
     if storage_config is not None:
         handle = _session_zarr_store(store_uri=store_uri, storage_config=storage_config, mode="a")
-        root = zarr.open_group(**handle.zarr_kwargs(), mode="a", zarr_format=3)
+        root = zarr.open_group(
+            **handle.zarr_kwargs(), mode="a", zarr_format=3, use_consolidated=False
+        )
     else:
-        root = zarr.open_group(store=store_uri, mode="a", storage_options=storage_options)
+        root = zarr.open_group(
+            store=store_uri, mode="a", storage_options=storage_options, use_consolidated=False
+        )
     parts = str(array_path).strip("/").split("/")
-    grp = root
-    for part in parts[:-1]:
-        grp = grp.require_group(part)
+    grp = _require_parent_groups(root, parts)
 
     name = parts[-1]
-    if name in grp:
+    if "/".join(parts) in root:
         return
 
     try:
@@ -262,18 +276,20 @@ def update_timestamp_state(
         raise ValueError("update_timestamp_state requires store_uri or zarr_store")
     elif storage_config is not None:
         handle = _session_zarr_store(store_uri=store_uri, storage_config=storage_config, mode="a")
-        root = zarr.open_group(**handle.zarr_kwargs(), mode="a", zarr_format=3)
+        root = zarr.open_group(
+            **handle.zarr_kwargs(), mode="a", zarr_format=3, use_consolidated=False
+        )
     else:
-        root = zarr.open_group(store=store_uri, mode="a", storage_options=storage_options)
+        root = zarr.open_group(
+            store=store_uri, mode="a", storage_options=storage_options, use_consolidated=False
+        )
     parts = str(array_path).strip("/").split("/")
-    grp = root
-    for part in parts[:-1]:
-        grp = grp.require_group(part)
-    name = parts[-1]
-    if name not in grp:
+    _require_parent_groups(root, parts)
+    full_path = "/".join(parts)
+    if full_path not in root:
         return
 
-    arr = grp[name]
+    arr = root[full_path]
     state_val = np.uint8(int(value))
     for start, end in normalized:
         cast(Any, arr)[start : end + 1] = state_val

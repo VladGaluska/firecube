@@ -31,6 +31,7 @@ from typing import Any, ClassVar, cast, get_type_hints
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.metrics import collect_wal_metrics
 from firecube.core.controlplane.types import IndexEnsuredOutcome
+from firecube.core.errors import Message, Param, PluginOption
 from firecube.core.filesystem import collect_filesystem_metrics
 from firecube.core.formats import discover_input_files
 from firecube.core.index_resolve import ExtentUnknownError
@@ -406,9 +407,15 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
         """
         if not ctx.source:
             raise ConfigurationError(
-                "--input-data is required when using default source discovery. "
-                "Override discover_source_files() in your plugin if your "
-                "ingestor does not consume an input path."
+                Message(
+                    "{input_data} is required when using default source discovery. "
+                    "Override discover_source_files() in your plugin if your "
+                    "ingestor does not consume an input path.",
+                    input_data=Param("input_data"),
+                    plugin=self.name,
+                    product_uri=ctx.target,
+                    run_id=ctx.run_id,
+                )
             )
         includes = None
         if getattr(self, "engine_config", None) is not None:
@@ -427,10 +434,17 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
             in_slot_range = engine_cfg is not None and engine_cfg.slot_start is not None
             if not allow_empty and not in_slot_range:
                 raise ConfigurationError(
-                    "No source files found after applying input filters. The default discovery looks for files ending in: "
-                    ".zip, .h5, .nc, .nc4, .hdf, .he5. To match different files, pass "
-                    "--input-filters '[\"*.csv\"]' or set "
-                    "--option allow_empty_source=true to proceed with an empty source."
+                    Message(
+                        "No source files found after applying input filters. The default discovery looks for files ending in: "
+                        ".zip, .h5, .nc, .nc4, .hdf, .he5. To match different files, pass "
+                        "{input_filters} or set "
+                        "{allow_empty_source} to proceed with an empty source.",
+                        input_filters=Param("input_filters", '["*.csv"]'),
+                        allow_empty_source=PluginOption("allow_empty_source", "true"),
+                        plugin=self.name,
+                        product_uri=ctx.target,
+                        run_id=ctx.run_id,
+                    )
                 )
             self._log.warning("No input files found in %s", ctx.source)
             return iter(())
@@ -620,6 +634,14 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
         _ = ctx
         return
 
+    def _close_run_state(self) -> None:
+        """Optional lifecycle hook: end of every run, whatever its outcome (main thread).
+
+        Raise when the run's writes are still in flight: ``run`` then logs it
+        and leaves the workspace in place instead of deleting it.
+        """
+        return
+
     def _resolve_index_binding_at_startup(self, ctx: PluginContext) -> Any:
         """Internal helper: resolve index binding at pod startup.
 
@@ -633,6 +655,14 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
         from firecube.ingestor.runtime.index_binding import resolve_index_spec_for_ingestor
 
         return resolve_index_spec_for_ingestor(self, ctx)
+
+    def bind_index_at_startup(self, ctx: PluginContext) -> None:
+        """Bind the plugin's index spec to a resolved index for `ctx`.
+
+        Args:
+            ctx: The plugin context of the run.
+        """
+        self._bind_index_at_startup(ctx)
 
     def _bind_index_at_startup(self, ctx: PluginContext) -> None:
         """Hook: bind IndexSpec to a resolved IndexBinding at pod startup.
@@ -1035,10 +1065,26 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
 
         finally:
             self._discovered_source_files = None
+            close_failed = False
+            try:
+                self._close_run_state()
+            except Exception as exc:
+                # Never masks the run's own outcome.
+                close_failed = True
+                self._log.warning("Closing the run state failed: %s", exc)
             # Teardown
             should_cleanup = (
                 self.engine_config.cleanup_workspace if hasattr(self, "engine_config") else False
             )
+            if should_cleanup and close_failed:
+                # The run's writes may still be landing in the staged store
+                # inside the workspace; deleting it would race them.
+                should_cleanup = False
+                self._log.error(
+                    "Workspace %s left in place: the run's writes were still in flight "
+                    "when its run state was closed",
+                    self._workspace.temp_root,
+                )
             with contextlib.suppress(Exception):
                 # Engine finalization populates metrics["pipeline"] via
                 # compute_run_summary(); emit that canonical run snapshot once.

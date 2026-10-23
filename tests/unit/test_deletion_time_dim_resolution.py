@@ -188,7 +188,7 @@ class TestSpanTimeDimResolution:
 
     def test_no_authority_fails_loudly_with_remediation(self, tmp_path: Path) -> None:
         _make_store(tmp_path, dim="time")
-        with pytest.raises(ValueError, match="--time-dim"):
+        with pytest.raises(ValueError, match=r"pass it explicitly \(CLI: time_dim\)"):
             _delete(_engine(tmp_path), _span())
         assert _chunk_path(tmp_path).exists()
 

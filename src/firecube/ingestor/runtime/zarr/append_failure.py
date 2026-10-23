@@ -36,6 +36,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
+from firecube.core.errors import FirecubeError, Message
+
 FAILED_BATCH_STATE = 3
 """State value written over the region slots of a failed batch."""
 
@@ -141,11 +143,12 @@ class AppendBatchOutcome:
     counters: dict[str, Any]
 
 
-class AppendBatchFailed(RuntimeError):
+class AppendBatchFailed(FirecubeError, RuntimeError):
     """One group's append raised; the batch outcome describes the store state.
 
     The original exception is chained as ``__cause__``; the message names
-    the failed group and repeats the cause so operators see both.
+    the failed group and repeats the cause so operators see both. A cause
+    raised with a `Message` stays nested, so its parts survive.
 
     Args:
         outcome: Committed, failed and not-attempted groups of the batch.
@@ -154,8 +157,15 @@ class AppendBatchFailed(RuntimeError):
 
     def __init__(self, outcome: AppendBatchOutcome, cause: BaseException) -> None:
         self.outcome = outcome
-        detail = str(cause) or type(cause).__name__
-        super().__init__(f"append failed in group {outcome.failed_group!r}: {detail}")
+        first = cause.args[0] if cause.args else None
+        detail = first if isinstance(first, Message) else str(cause) or type(cause).__name__
+        super().__init__(
+            Message(
+                "append failed in group {group!r}: {detail}",
+                group=outcome.failed_group,
+                detail=detail,
+            )
+        )
 
 
 def _append_axis(array: Any, append_dim: str) -> int | None:

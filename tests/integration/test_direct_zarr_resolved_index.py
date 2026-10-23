@@ -50,6 +50,7 @@ from firecube.ingestor.api import (
     register_ingestor,
 )
 from firecube.ingestor.registry import loader
+from tests.helpers.cli_hints import parse_hint
 
 pytestmark = pytest.mark.integration
 
@@ -273,4 +274,41 @@ def test_zarr_slots_resolved_index_staleness_tri_state(
     assert stale.exit_code == 0, stale.output
     assert "plugin resolved index differs from persisted record" not in stale.output.lower()
     assert "plugin resolved index differs from persisted record" in stale_fd.err.lower()
-    assert "firecube zarr index rebuild" in stale_fd.err.lower()
+    t3 = "Plugin resolved index differs from persisted record. Use the plugin that wrote the product, or a new target."
+    assert t3 in stale_fd.err
+
+
+def test_zarr_slots_differs_advice_recovers_with_the_writing_plugin(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    class _Writer(_ResolvedIndexPlugin):
+        def index_spec(self, ctx: PluginContext) -> IndexSpec:
+            return _index_spec(name="writer_v1", size=11)
+
+    register_ingestor("direct_zarr_resolved_index_writer")(_Writer)
+    target = tmp_path / "writer.zarr"
+    writer = "direct_zarr_resolved_index_writer"
+    rebuild = ["zarr", "index", "rebuild", "--target", target.as_uri(), "--plugin", writer]
+    rebuild += ["--product-name", PRODUCT_NAME]
+    CliRunner().invoke(cli, rebuild)
+    CliRunner().invoke(cli, _slots_args(target))
+    t3 = "Plugin resolved index differs from persisted record. Use the plugin that wrote the product, or a new target."
+    assert t3 in capfd.readouterr().err
+    assert "Index record unchanged" in CliRunner().invoke(cli, rebuild).output
+    args = [writer if a == PLUGIN_NAME else a for a in _slots_args(target)]
+    assert CliRunner().invoke(cli, args).exit_code == 0
+    assert "differs from persisted record" not in capfd.readouterr().err
+
+
+def test_repro_slots_legacy_warning_prints_runnable_rebuild_command(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "legacy.zarr"
+    model = SlotIndexModel(
+        name="legacy_only_v1",
+        epoch="2026-01-01T00:00:00Z",
+        groups={"data": SlotAxis(cadence_s=1, mode="exact")},
+    )
+    _manager(target).ensure_slot_index_model(product=PRODUCT_NAME, model=model, run_id="seed")
+    CliRunner().invoke(cli, _slots_args(target))
+    assert parse_hint(capfd.readouterr().err, "firecube zarr index rebuild")

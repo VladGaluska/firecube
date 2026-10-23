@@ -30,8 +30,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import pytest
 import zarr
 
+from firecube.core.zarr.guard.metadata_authority import AuthorityBasis, MetadataAuthority
+from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 from firecube.ingestor.templates.direct_zarr import _setup_global_zarr_schema
 
@@ -68,7 +71,9 @@ class _ClaimSpy:
     def __init__(self) -> None:
         self.acquired: list[str] = []
 
-    def acquire_claim(self, *, product: str, domain: Any, owner_id: str) -> Any:
+    def acquire_claim(
+        self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+    ) -> Any:
         self.acquired.append(domain.identifier)
         return contextlib.nullcontext()
 
@@ -116,3 +121,89 @@ def test_setup_takes_claim_when_array_must_be_created(tmp_path):
     assert spy.acquired == ["product:zarr_schema_global:data:setup"]
     arr = cast(Any, zarr.open_group(store=str(store_path), mode="r", zarr_format=3)["data/data"])
     assert arr.shape == (4, 3, 2)
+
+
+class _RecordingClaim:
+    """A claim that records when it is entered and left."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def __enter__(self) -> None:
+        self._events.append("claim-in")
+
+    def __exit__(self, *_exc: object) -> None:
+        self._events.append("claim-out")
+
+
+def _spy_metadata_writes(
+    monkeypatch: Any, events: list[str]
+) -> list[tuple[str, Any, bool, list[str]]]:
+    """Record the authority each writer metadata call receives, and its state then."""
+    seen: list[tuple[str, Any, bool, list[str]]] = []
+    for name in ("ensure_group", "set_group_attrs"):
+        original = getattr(RegionZarrWriter, name)
+
+        def spy(self: Any, *args: Any, _original: Any = original, _name: str = name, **kw: Any):
+            authority = kw.get("authority")
+            active = isinstance(authority, MetadataAuthority) and authority.active
+            seen.append((_name, authority, active, list(events)))
+            return _original(self, *args, **kw)
+
+        monkeypatch.setattr(RegionZarrWriter, name, spy)
+    return seen
+
+
+def _schema_with_group_attrs() -> list[ZarrGroupSpec]:
+    return [
+        ZarrGroupSpec(group="data", arrays=_schema()[0].arrays, attrs={"title": "setup"}),
+    ]
+
+
+@pytest.mark.parametrize("control_plane", ["fake", "none"])
+def test_setup_changes_metadata_under_the_authority_naming_its_basis(
+    tmp_path, monkeypatch, control_plane
+):
+    store_path = tmp_path / "fresh.zarr"
+    events: list[str] = []
+
+    class _Manager:
+        def acquire_claim(
+            self, *, product: str, domain: Any, owner_id: str, describe_conflict: bool = True
+        ) -> Any:
+            events.append(f"acquire {domain.identifier} {owner_id}")
+            return _RecordingClaim(events)
+
+    seen = _spy_metadata_writes(monkeypatch, events)
+    _setup_global_zarr_schema(
+        strategy=_strategy(str(store_path)),
+        schema=_schema_with_group_attrs(),
+        global_expected={"data": 4},
+        product="product",
+        run_id="run-1",
+        chunk_manager=_Manager() if control_plane == "fake" else None,
+    )
+
+    assert [name for name, *_ in seen] == ["ensure_group", "set_group_attrs"]
+    for name, authority, active, before in seen:
+        assert isinstance(authority, MetadataAuthority), f"{name} ran without an authority"
+        assert active
+        if control_plane == "fake":
+            assert authority.basis is AuthorityBasis.CLAIM
+            assert authority.claim_domain == "product:zarr_schema_global:data:setup"
+            assert authority.owner_id == "run-1:data:schema_global"
+            assert authority.scope.prefix == "data"
+            assert before[-1] == "claim-in", f"{name} ran outside the setup claim"
+            assert not authority.active  # released with the claim
+        else:
+            assert authority.basis is AuthorityBasis.PROCESS_LOCAL
+            assert authority.claim_domain is None
+    if control_plane == "fake":
+        assert events == [
+            "acquire product:zarr_schema_global:data:setup run-1:data:schema_global",
+            "claim-in",
+            "claim-out",
+        ]
+    root = zarr.open_group(store=str(store_path), mode="r", zarr_format=3)
+    assert cast(Any, root["data/data"]).shape == (4, 3, 2)
+    assert dict(cast(Any, root["data"]).attrs) == {"title": "setup"}

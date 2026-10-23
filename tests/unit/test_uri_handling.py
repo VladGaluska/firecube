@@ -23,75 +23,70 @@ import pytest
 from firecube.core.product import ensure_product_uri
 from firecube.core.storage.uri import StorageUri
 from firecube.core.uris import is_remote_target, parse_uri
+from tests.helpers.rows import table_row
 
 
 class TestParseUriStrictness:
     """T1: parse_uri raises ValueError on malformed URIs, accepts valid ones."""
 
-    def test_raises_on_malformed_single_slash(self):
-        with pytest.raises(ValueError, match="Malformed URI"):
-            parse_uri("s3:/bucket")
-
-    def test_raises_on_no_protocol(self):
-        with pytest.raises(ValueError, match="Malformed URI"):
-            parse_uri("://noprotocol")
-
-    def test_raises_on_double_slash_no_colon(self):
-        with pytest.raises(ValueError, match="Malformed URI"):
-            parse_uri("s3//bucket")
+    def test_raises_on_malformed(self, subtests, tmp_path):
+        for row_id, uri in [
+            ("test_raises_on_malformed_single_slash", "s3:/bucket"),
+            ("test_raises_on_no_protocol", "://noprotocol"),
+            ("test_raises_on_double_slash_no_colon", "s3//bucket"),
+        ]:
+            with (
+                table_row(subtests, row_id, tmp_path),
+                pytest.raises(ValueError, match="Malformed URI"),
+            ):
+                parse_uri(uri)
 
     def test_accepts_valid_s3(self):
         r = parse_uri("s3://bucket/prefix")
         assert r["protocol"] == "s3"
         assert "bucket" in r["path"]
 
-    def test_accepts_local_path(self):
-        r = parse_uri("/tmp/store.zarr")
-        assert r["protocol"] == "file"
-
-    def test_accepts_relative_path(self):
-        r = parse_uri("data/output")
-        assert r["protocol"] == "file"
-
-    def test_accepts_empty_string(self):
-        r = parse_uri("")
-        assert r["protocol"] == "file"
-
-    def test_accepts_gcs(self):
-        r = parse_uri("gcs://bucket/key")
-        assert r["protocol"] == "gcs"
+    def test_accepts(self, subtests, tmp_path):
+        for row_id, uri, protocol in [
+            ("test_accepts_local_path", "/tmp/store.zarr", "file"),
+            ("test_accepts_relative_path", "data/output", "file"),
+            ("test_accepts_empty_string", "", "file"),
+            ("test_accepts_gcs", "gcs://bucket/key", "gcs"),
+        ]:
+            with table_row(subtests, row_id, tmp_path):
+                assert parse_uri(uri)["protocol"] == protocol
 
 
 class TestEnsureProductUri:
     """T2: ensure_product_uri uses parsed path segments, not substring matching."""
 
-    def test_no_substring_match(self):
-        result = ensure_product_uri("s3://bucket/TEST_PRODUCT_data", "FRM")
-        assert result == "s3://bucket/TEST_PRODUCT_data/FRM"
-
-    def test_exact_match_preserved(self):
-        result = ensure_product_uri("s3://b/FRM", "FRM")
-        assert result == "s3://b/FRM"
-
-    def test_appends_to_bucket(self):
-        result = ensure_product_uri("s3://bucket", "product.zarr")
-        assert result == "s3://bucket/product.zarr"
+    def test_ensure_product_uri(self, subtests, tmp_path):
+        for row_id, base, product, expected in [
+            (
+                "test_no_substring_match",
+                "s3://bucket/TEST_PRODUCT_data",
+                "FRM",
+                "s3://bucket/TEST_PRODUCT_data/FRM",
+            ),
+            ("test_exact_match_preserved", "s3://b/FRM", "FRM", "s3://b/FRM"),
+            ("test_appends_to_bucket", "s3://bucket", "product.zarr", "s3://bucket/product.zarr"),
+        ]:
+            with table_row(subtests, row_id, tmp_path):
+                assert ensure_product_uri(base, product) == expected
 
 
 class TestIsRemoteTarget:
     """T1: is_remote_target returns True for cloud protocols, False for local."""
 
-    def test_s3(self):
-        assert is_remote_target("s3://bucket/data") is True
-
-    def test_local(self):
-        assert is_remote_target("/tmp/data") is False
-
-    def test_file_uri(self):
-        assert is_remote_target("file:///tmp/data") is False
-
-    def test_gcs(self):
-        assert is_remote_target("gcs://bucket/data") is True
+    def test_is_remote_target(self, subtests, tmp_path):
+        for row_id, uri, remote in [
+            ("test_s3", "s3://bucket/data", True),
+            ("test_local", "/tmp/data", False),
+            ("test_file_uri", "file:///tmp/data", False),
+            ("test_gcs", "gcs://bucket/data", True),
+        ]:
+            with table_row(subtests, row_id, tmp_path):
+                assert is_remote_target(uri) is remote
 
 
 class TestStorageUriAuthorityRequirement:

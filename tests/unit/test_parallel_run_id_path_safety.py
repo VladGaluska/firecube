@@ -21,30 +21,23 @@ from firecube.ingestor.runtime.parallel_run_id import derive_pod_run_id
 pytestmark = pytest.mark.unit
 
 
-def test_slot_group_with_slash_encoded() -> None:
-    assert (
-        derive_pod_run_id("base", 0, 100, "multires/0.5deg")
-        == "base__group=multires%2F0.5deg__slot=0-100"
-    )
+_ROWS = (
+    (
+        "test_slot_group_with_slash_encoded",
+        "multires/0.5deg",
+        "base__group=multires%2F0.5deg__slot=0-100",
+    ),
+    ("test_slot_group_with_equals_encoded", "key=value", "base__group=key%3Dvalue__slot=0-100"),
+    ("test_slot_group_with_unicode_encoded", "ñoño", "base__group=%C3%B1o%C3%B1o__slot=0-100"),
+    ("test_slot_group_simple_unchanged", "group_a", "base__group=group_a__slot=0-100"),
+    ("test_slot_group_none_format_unchanged", None, "base__slot=0-100"),
+)
 
 
-def test_slot_group_with_equals_encoded() -> None:
-    run_id = derive_pod_run_id("base", 0, 100, "key=value")
-
-    assert run_id == "base__group=key%3Dvalue__slot=0-100"
-    assert "%3D" in run_id
-
-
-def test_slot_group_with_unicode_encoded() -> None:
-    assert derive_pod_run_id("base", 0, 100, "ñoño") == "base__group=%C3%B1o%C3%B1o__slot=0-100"
-
-
-def test_slot_group_simple_unchanged() -> None:
-    assert derive_pod_run_id("base", 0, 100, "group_a") == "base__group=group_a__slot=0-100"
-
-
-def test_slot_group_none_format_unchanged() -> None:
-    assert derive_pod_run_id("base", 0, 100, None) == "base__slot=0-100"
+def test_slot_group_encoding(subtests: pytest.Subtests) -> None:
+    for row_id, group, expected in _ROWS:
+        with subtests.test(msg=row_id):
+            assert derive_pod_run_id("base", 0, 100, group) == expected
 
 
 def test_encoded_run_id_is_path_segment_safe() -> None:

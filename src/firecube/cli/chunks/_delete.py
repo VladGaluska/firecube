@@ -19,6 +19,8 @@ from pathlib import Path
 
 import click
 
+from firecube.cli._errors import render
+from firecube.core.controlplane.repo import UnparseableSpanBoundsError
 from firecube.core.errors import ManifestError
 
 from ._common import confirm_deletion, parse_datetime, parse_meta_filters, parse_time_range
@@ -211,21 +213,38 @@ def delete_cmd(
         after_dt = parse_datetime(start_str.strip())
         before_dt = parse_datetime(end_str.strip())
 
-    plans = []
-    patterns = pattern or [None]
-    for p in patterns:
-        plan = manager.create_deletion_plan(
-            pattern=p,
-            product=product_name,
-            before=before_dt,
-            after=after_dt,
-            chunk_type=chunk_type,
-            include_metadata=include_metadata,
-            meta=meta,
-            time_overlaps=time_range_dt,
-        )
-        if plan.chunks:
-            plans.append(plan)
+    try:
+        plans = []
+        patterns = pattern or [None]
+        for p in patterns:
+            if time_range_dt is not None:
+                # The deletion plan leaves unparseable spans out silently; this
+                # query makes the same selection, date window included, but
+                # refuses them.
+                manager.list_chunks(
+                    pattern=p,
+                    product=product_name,
+                    before=before_dt,
+                    after=after_dt,
+                    chunk_type=chunk_type,
+                    meta=meta,
+                    time_overlaps=time_range_dt,
+                    refuse_unparseable=True,
+                )
+            plan = manager.create_deletion_plan(
+                pattern=p,
+                product=product_name,
+                before=before_dt,
+                after=after_dt,
+                chunk_type=chunk_type,
+                include_metadata=include_metadata,
+                meta=meta,
+                time_overlaps=time_range_dt,
+            )
+            if plan.chunks:
+                plans.append(plan)
+    except UnparseableSpanBoundsError as exc:
+        raise click.ClickException(render(exc)) from exc
 
     if not plans:
         click.echo(
@@ -436,7 +455,7 @@ def delete_span_cmd(
             time_dim_name=time_dim,
         )
     except (ManifestError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     if dry_run:
         if result.get("region_filled_spans", 0):
@@ -465,7 +484,7 @@ def delete_span_cmd(
     if warnings_out:
         click.echo(f"\nWarnings: {len(warnings_out)}")
         for w in warnings_out[:10]:
-            click.echo(f"  - {w}")
+            click.echo(f"  - {render(w)}")
 
     collateral = result.get("collateral_spans") or []
     if collateral and not dry_run:
@@ -477,5 +496,5 @@ def delete_span_cmd(
     if errors:
         click.echo(f"\nErrors: {len(errors)}")
         for err in errors[:10]:
-            click.echo(f"  - {err}")
+            click.echo(f"  - {render(err)}")
         raise click.exceptions.Exit(1)

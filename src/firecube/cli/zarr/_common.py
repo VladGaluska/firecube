@@ -20,13 +20,13 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+import click
+
+from firecube.cli._errors import render
 from firecube.cli._typed_options import coerce_options_for_plugin
-from firecube.ingestor.api import (
-    IngestContext,
-    PluginContext,
-    RuntimeIngestContext,
-)
-from firecube.ingestor.runtime.configure import TierConfigurator
+from firecube.ingestor.api import PluginContext
+from firecube.ingestor.errors import RemovedConfigKeyError
+from firecube.ingestor.runtime.configure import configure_ingestor
 
 logger = logging.getLogger("firecube.cli.zarr")
 
@@ -44,35 +44,19 @@ def _configure_ingestor_for_cli(
     """Build and configure a PluginContext for CLI zarr commands.
 
     Mirrors the tier-configuration path used by `ingest`. Coerces plugin
-    options through `coerce_options_for_plugin`, builds an `IngestContext`,
-    wraps into a `RuntimeIngestContext`, runs `TierConfigurator.configure`,
-    and returns the `PluginContext`.
+    options through `coerce_options_for_plugin`, then delegates to
+    `configure_ingestor`.
     """
     coerced_options = coerce_options_for_plugin(ingestor.name, tuple(options))
-    resolved_options = dict(coerced_options)
-    if input_filters is not None:
-        resolved_options["input_filters"] = input_filters
-    ingest_ctx = IngestContext(
-        source=source,
-        target=target,
-        in_memory=True,
-        output_format="zarr",
-        options=resolved_options,
-        storage=storage,
-        run_id=run_id,
-    )
-    runtime_ctx = RuntimeIngestContext.from_ingest_context(
-        ingest_ctx,
-        run_id=run_id,
-        temp_root=None,
-        materializer=None,
-    )
-    configurator = TierConfigurator(
-        ingestor.template_config_class,
-        ingestor.plugin_config_class,
-        plugin_name=ingestor.name,
-    )
-    ingestor.engine_config, ingestor.template_config, ingestor.plugin_config = (
-        configurator.configure(runtime_ctx)
-    )
-    return PluginContext(runtime_ctx)
+    try:
+        return configure_ingestor(
+            ingestor,
+            target=target,
+            options=dict(coerced_options),
+            run_id=run_id,
+            source=source,
+            storage=storage,
+            input_filters=input_filters,
+        )
+    except RemovedConfigKeyError as exc:
+        raise click.UsageError(render(exc)) from exc

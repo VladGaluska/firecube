@@ -1,5 +1,372 @@
 # Done
 
+## 2026-10-20 — CF calendar time axes land on the guarded layers (fix/parallel-chunk-ownership)
+
+**Decision.** The CF-calendar work of branch `feat/77-cf-calendars` (9a309ca, 42 commits on c160535) lands on `fix/parallel-chunk-ownership` (9576ad3) in four signed commits. Nothing is pushed. The full lane runs on the exact tree of each commit before the commit. Calendar writes use the guarded layers of this branch: payload through `guarded_write`, `zarr.json` through `MetadataAuthority`, live metadata reads. The entries of 2026-09-23 and 2026-10-10 hold the design.
+
+- k1 `f1dc750` `feat(time): add encoded time axes for CF calendars`. The `core/time/` package, `core/zarr/_fill.py`, and the calendar changes to `index_resolve.py`, `index_spec.py`, `time_decode.py` and `index_binding.py`.
+- k2 `e159147` `feat(zarr): write CF-calendar time coordinates`. Coordinate materialization, re-materialization checks, region writer, DirectZarr startup check, preallocate, validation, consolidation and the tensogram refusal.
+- k3 `b8e422c feat(append,chunks): calendar append order and time-range refusals`.
+- k4 `docs(calendar): document CF calendar time axes`. Hash pending. This entry belongs to it.
+- Neo's choices. D1: four commits in this order, each green at its own position. D2: a pre-registered performance allowance. D3: one recorder allowance, the traceback of `test_indexed_write_error_fails_ingest_with_compilation_error#0`, for line numbers and the new reason suffix of `IndexedWriteCompilationError`. D4: at most 1,500 added test lines.
+- Planner choice P2. The branch keeps a curated test set. The 45 test paths of 77 add 7,689 lines. A scratch worktree runs every test that 77 added or changed against the landed source before each commit. So the assertions of 77 stay checked as evidence.
+- Planner choices on code. P3: the refusals carry fields (`Datetime64RangeError`, `DuplicateAxisInstantError`, `CoordinateRelabelError`, `UnparseableSpanBoundsError.spans`, `CalendarArchiveError`). Nothing is exported from a facade.
+- P4: read-only checks and pure helpers are in new modules. Every write stays in `coord_materialization.py`.
+- P6: a moved name leaves no alias. P7: only `CalendarArchiveError` joins the conversion errors of `create_archive`. P8: the preflight and the dry-run facts. P9: the legacy nanosecond check reads the stored coordinate before `ensure_group`.
+- Performance prediction (D2). The same job on the base of 77 measured these extra calls. S0 open +12, S0 `os.listdir` +1, W1 open +18, W1 `os.listdir` +2, W2 open +92, W2 open at root +2, W2 `os.listdir` +10, W3 open +18, W3 `os.listdir` +2. Every other row is 0.
+- The noise allowance is 5 for W2 open, 2 for W2 open at root and 1 for each other row. A row outside its allowance stops the run for Neo.
+
+**Coverage.**
+
+- Acceptance evidence is kept in a local folder that Git excludes.
+- Done now: `a1` (family 1) ran 200 ids, and 200 passed. `a2` (families 1 and 2) ran 392 ids. 389 passed, 2 are class B, and 1 is the strict xfail.
+- Scheduled: `a3` (all families) and the tip checks. The plan records them in the same folder when it finishes.
+- The `kept.md` file of each tester node maps every kept test to its behaviour. It maps every dropped test of 77 to a replacement or to "acceptance only".
+- Tests added: 1,494 lines against a budget of 1,500 (measured, `ultron tdd budget`).
+- The branch does not keep the byte-parity test of 77 or its 405-line manifest (D4). At 9576ad3 the three Gregorian scenarios of that manifest rebuild byte for byte (ran, 2026-10-20). The scratch acceptance run includes that test.
+- Not in this entry: the recorder replay and the performance judge at the tip, which node v2 runs after the commits.
+
+## 2026-10-20 — Cleanup after the CLI-creep sequence (fix/parallel-chunk-ownership)
+
+**Decision.** Two signed commits, nothing pushed, each revertable alone. Commit 1 is `9576ad3` `refactor(cleanup): delete dead code and duplicate tests`. Commit 2 is the commit that holds this entry. CLI output is unchanged.
+
+- Deleted: `fsspec_kwargs_from_binding`, `ManifestRepository.record_entry`, `_group_path`, `_upload_tree_shape0`, `_walk_chunk_entries`, `resolve_product_name`, `_first_present_float` and `_raise_unknown_time_dim`. Also the `multires` key of `OPERATION_FUNCTIONS` and `OPERATIONS`, which nothing raised.
+- Deleted tests, with the kept twin after the arrow: `test_no_markers_legacy_write` → `test_marker_absent_legacy_write_proceeds`. `test_schema_hash_changes_on_dtype_change` → `test_sensitive_to_dtype`. `test_generic_false_declared_codecs_raises` → `test_directzarr_false_declared_codecs_raises`. `test_known_slot_group_passes_capability_gate` → `test_slot_group_set_validates_only_that_group_chunks`. Each deletion was proved with an in-memory mutant that fails both tests.
+- Moved: the trailing-stop trim, from `engine.py` to `Message.without_trailing_stop()` in `core/errors.py`. A differential probe against the old helper matched on 60 cases.
+- Added: a check that the part kinds the CLI tests cover equal `_PART_TYPES`. Fixed `_unit_object_key` for an array at the store root. Fixed `ConfigFileError` and `RemovedConfigKeyError`, which came back from pickle or copy with a wrong sentence. Both now rebuild from their facts. Each fix has a test that failed first.
+
+**Coverage.**
+
+- Source lines under `src/firecube`: 67,731 at `9576ad3` and 67,572 at `9576ad3` (calculated from `git ls-tree` and `wc -l`).
+- Tests added: 54 lines against a budget of 60 (measured, `ultron tdd budget`).
+
+## 2026-10-20 — Structured errors rendered by the CLI (fix/parallel-chunk-ownership)
+
+**Decision.** Two signed commits, nothing pushed, each revertable alone. E `9576ad3` `refactor(errors): carry refusal facts and render commands in the CLI` (105 files, +2811 -766: code, tests, `CHANGELOG.md`, `AGENTS.md`, `plans/DESIGN.md`). D `docs(plans): record structured errors` (`plans/TODO.md`, `plans/DONE.md`): hash pending. Base `573748a`. A refusal below `cli/` now carries facts instead of shell text. `str(error)` is the library sentence; one renderer under `cli/` rebuilds it with flags and runnable commands taken from the live Click definitions. `core/hints.py` is gone, Click is out of `core/` and `ingestor/`, and the boundary gate has no `UNTIL structured-errors` row.
+
+- Neo's choices. D1: test budget 550 lines. D2: commands that ran with extra text print only the command (L1 to L5). D3: `cli/chunks/_delete.py` is edited. D4: preallocate's two cleanup failures keep the facts in the log line and print the command on stderr through `warn`. D5: the eight help and scaffold hints that do not run stay (`plans/TODO.md`). D6: one commit E, one records commit D. D7: proceed without `review-4c.md`, which did not exist yet. D8: `git commit -sS`; the two `UNTIL unscheduled` input-filter rows join (node g1); the `cli/main.py` ceiling row stays.
+- Planner choices inside them. P1: `Message` plus the parts `Param`, `PluginOption`, `Operation`, `CommandName`, `Placeholder`, with `FirecubeError.message`, `.recovery` and `.context` (`RefusalContext`) in `src/firecube/core/errors.py`. P2: `render` in `src/firecube/cli/_recovery.py`, imported lazily through `cli/_errors.py`, so start-up loads no new module. P3: the CLI sites that print structured refusals call it; `cli/_uri_policy.py:99` and `:109`, `advise.py:126`, `_command_schemas.py:85`, `plugins/mgmt.py:150` and `plugins/registry.py:118` still print `str(exc)` of sources that are not converted. P4: the command-naming strings of `core/` and `ingestor/` become `Message`s, each fact a part, except the `PERMANENT` rows of the gate and the generated scaffolding. P5: `PipelineResult.failure` and `PipelineFailedBatchesError(FirecubeError, RuntimeError)`. P6: `ConfigFileError` and `RemovedConfigKeyError` replace the Click errors; the CLI maps both to exit 2. P7: `zarr index rebuild` catches the attrs-without-record and attrs-drift refusals of the two uncontended precedence sites; the contended loser branch (`manager.py:1384`) still raises a plain `ManifestError`. P8: CLI-built advice uses `Operation`. P9: the foundation, claim recovery and batch path ran on the heavy tier. P10: red tests first, then fixes. P11: the commit subjects.
+- Changes to operator text. L1 to L3: the `(from Python: ...)` text is gone from the three preallocate refusals. L4 and L5: the legacy-index refusal and the slots warning print `firecube zarr index rebuild --target T --plugin P --product-name N`, values shell-quoted. L6: the schema-size refusal names the full preallocate command. L7: the unsorted-coordinate refusal prints `firecube zarr validate --product <uri> --group <group>`. L8: the `--option` token is shell-quoted. L9: `delete-span` prints `--force` and `--yes-i-really-mean-it`, not `force=True`. L10: under `zarr preallocate`, `--slot-group` reads `slot_group`. L11: `zarr index verify` advice carries the invocation's values. L12: the blocked-range advice prints `<target URI>` and Click's option order. L13: `zarr index rebuild` prints `Error: ...` and exits 1 for the two refusals, no traceback. L14: the stale-snapshot log line names `ChunkManager.rebuild_snapshot`. L15: preallocate's cleanup log lines name the library operations, and `warn` prints the command. L16: `StorageConfig.validate` names `access_key` and `secret_key`. L17, by class: refusals no Click boundary catches reach the operator as a traceback ending in the library sentence (sites in `plans/TODO.md`). L18, by class: `PipelineResult.error`, persisted run errors and log lines hold the library sentence. L19, library only: `str(exc)` names parameters, config errors are not `click.UsageError`, `PipelineFailedBatchesError` is a `FirecubeError`. L20 (Neo): the line numbers of the traceback frames of `test_indexed_write_error_fails_ingest_with_compilation_error#0`, shifted by 22 lines in `direct_zarr.py`.
+- Handoff corrections. The workers are a thread pool (`engine.py:598`), so nothing pickles a `PipelineResult`; 16 of 17 field-carrying exceptions fail a pickle round trip anyway (`plans/TODO.md`). The gate's scanner missed module constants, `warn` arguments and the failed-batches tail; P4 converted them. The 57 strings of generated scaffolding in `ingestor/devtools` stay. `core/hints.py` is gone and `cli/_rename_hints.py` is unrelated. "The hints sweep" is replaced by one test that parses every rendered command against the real CLI. `configure.py`'s `--show-options` `ValueError` is L17, not a CLI repro.
+- Widenings Neo approved. `src/firecube/ingestor/runtime/index_record.py` joined node a5 (`warn(str(exc))` and `detail=str(exc)` flattened the legacy-record `Message`). `src/firecube/ingestor/runtime/zarr/append_failure.py` joined node e1: `AppendBatchFailed` became a `FirecubeError` that keeps the cause's `Message`, because the batch-failure line lost `firecube zarr validate` (Vision reproduced it through `ingest`).
+- Cross-node edit inside the plan's scope. `ResolvedIndexAttrsConflictError`, a `ManifestError` subclass in `core/errors.py` raised at two sites of `manager.py`, is the discriminator `zarr index rebuild` catches; the first design probed current state and could convert an unrelated `ManifestError`.
+
+**Coverage.**
+
+- Red runs (ran, at `573748a`, `repro/`): r1 14 failing `test_repro_*` ids, one per broken hint, through the real CLI (`r1.txt`); tb 5 failing ids for the batch path (`tb.txt`); tc 6 failing ids for the config contract (`tc.txt`), with 3 unchanged-CLI cases green.
+- Tests added since `573748a`: 547 lines by `git diff --numstat 573748a 9576ad3 -- tests/`, of the 550 budget. Node caps moved between testers inside the 550 (ledger).
+- Replay (ran). Baseline pair, `base-1` against `base-2`: 861 records, no problems. Final pair `final-1` against `final-2`: 876 keys, 0 problems, 0 candidate-only keys. `base-1` against `final-1`: 15 candidate-only keys (the new tests) and 21 raw problems, which fall to 0 after 32 allowances, each naming one of L1, L2, L4, L5, L9, L10, L11, L12, L15, L18 and L20 (L20 on four frames of one stderr: Neo approved one frame, the other three shifted by the same 22 lines). The start-up module diff is the module rename of node g1 only.
+- Review rounds, Vision on every code, test and prose node: b0, r1, a1, ta, tb, tc, a2, a3, a4, a5, e1, tA, sE, final and x1 two rounds each (a2 ended APPROVE, the others APPROVE or APPROVE WITH NOTES); f1 and g1 one round; e2 three. Every REJECT closed before completion (e2 needed its third round).
+- Not in this entry: the full lane, ruff, pyright and the revert checks, which f9 runs after this commit.
+
+**Findings.**
+
+- Open items found on the way, all in `plans/TODO.md` (section "Open after structured errors (2026-10-20)"): five duplicated exception-text helpers, the loser-branch attrs-drift raise and the `index_record.py` unreadable-record detail, trailing parts the batch summary does not trim, the `product_uri` repr in two facts, the `multires` advice, and the refusals that still end in a traceback.
+
+## 2026-10-19 — The snapshot leftovers: staged-resume reads, dataset writes and archive order (fix/parallel-chunk-ownership)
+
+**Decision.** Five signed commits, nothing pushed, each revertable alone. C1 `573748a` `fix(append): read staged-resume arrays by full path from the root` (code, tests, `CHANGELOG.md`). C2 `573748a` `fix(zarr): dataset writes refresh snapshots, never create them` (code, tests, `CHANGELOG.md`, `AGENTS.md`, `plans/DESIGN.md`). C3 `573748a` `fix(tensogram): archive groups and variables in name order` (code, test, `CHANGELOG.md`). C4 `573748a` `test(arch): catch zarr.api opens and mutated kwargs dicts` (the scanner in `tests/unit/test_no_raw_fsspec_usage.py`). D `docs(plans): record the snapshot leftovers` (`plans/TODO.md`, `plans/DONE.md`): hash pending. Base `573748a`.
+
+- C1: `_compute_touched_data_chunks` and `verify_post_write_integrity` read each array by its full path from the live root, so a group's own snapshot no longer hides grown cells. The group lookups stay as existence checks.
+- C2: `ZarrIO.write_dataset` passes `consolidated=False` as a literal keyword and never creates a snapshot. `ZarrIO.refresh_consolidated_metadata(uri)` rewrites the snapshot of each group that already has one and creates none. `build_multires_layers` calls it once after its level loop when a level was written, and `tgm_to_zarr` once after its last data message. The zip restore is untouched.
+- C3: `zarr_to_tgm` sorts groups, data variables and coordinates by name (data variables before coordinates). An explicit `group` is unchanged. Existing archives restore as before.
+- C4: the live-metadata scanner resolves calls through `zarr.api.synchronous` and `zarr.api.asynchronous` (dotted, aliased, name-imported, bare `import zarr.api.<module>`). It counts a `**name` as passing the flag only when the name is bound once to a qualifying dict display and never mutated. No new hit in `src/firecube`; the three `PERMANENT` rows are unchanged.
+
+**Decision.** Neo's choices (D1 to D5) and the planner's choices inside them (P1 to P13), short.
+
+- D1: item 1 fixes both group-object reads. D2: item 2 never creates a snapshot and refreshes one that exists; a plain `xr.open_zarr` on a restored store then warns about a slower fallback read. D3: the scanner tightening is done here, as C4. D4: test budget 220 lines. D5: `git commit -sS`, one-line subjects, one commit per item, records in a final commit.
+- P1: the full path is built as `seed_touched_data_chunks` builds it. P2: item 1 went to the heavy coder tier because a missed lookup fails quietly. P3: the other group-object reads stay and are recorded in `plans/TODO.md`.
+- P4: one method, `ZarrIO.refresh_consolidated_metadata`, once per operation; one refresh helper costs 2N-1 group opens plus one consolidate per group that carries a snapshot. The operation as a whole costs 2N group opens, because the wrapper opens the root once first (measured in the independent review: N=4 gave eight opens), where N counts every group in the product, not only the written ones. Its default open is the existing `PERMANENT` scanner row. P5: a local `.tgm` restore has nothing to refresh; a remote grouped restore onto a full store does (simulated: the root snapshot listed 14 of 19 nodes without the refresh and 19 with it). P6: the multires tests are the first real multires write in the suite. P7: rule text in `AGENTS.md` and `plans/DESIGN.md`.
+- P8: sorting by `str` name where the archive is written, so the converter fallback and `restore.py` need no edit. P9: byte identity cannot hold (`archived_at`), so the test asserts name order through `tgm_info` and `open_tgm_listing`, with four groups, five data variables and three coordinates created in an order that is neither sorted nor reversed.
+- P10: three `CHANGELOG.md` nodes in sequence, each in its own commit. P11: this record. P12: the replay judge below. P13: the commit subjects.
+
+**Handoff corrections.**
+
+- Item 1: after the touched-map fix alone the integrity check still checked nothing for the grown cells, because it read through the group object too (probe: shape `(8,)` seen where `(12,)` was right). D1 fixes both.
+- Item 2: both callers wrote a non-null root snapshot, because xarray 2026.7.0 consolidates the store root after every write in a mode other than `r+`. A multires write onto a store with a root snapshot refreshed it, so `consolidated=False` alone would have left it stale.
+- Item 3: byte-identical `.tgm` files are impossible; coordinate order varied as well and is sorted too.
+- The recorder exits 1 at `573748a` because of the known failing test (`plans/TODO.md`), so recordings are judged by record count and `cli_diff`.
+
+**Coverage.**
+
+- Red runs (ran, on `573748a` source, `repro/`): r1 4 failing tests (`None == [(5,)]`, `[999, 0] == [999, 111]`, two `DID NOT RAISE`); r2 cases 1 and 2 failing, cases 3 and 4 passing; f2 showed cases 3 and 4 failing with `write_dataset` changed alone (`f2-no-refresh.txt`) and case 4 failing again with only the restore call left out (`f2-no-restore-refresh.txt`); r3 9 failing subtests in each of three runs; ra the scanner self-check failing.
+- Tests added since `573748a`: 206 added lines by `git diff --numstat 573748a -- tests/` (26, 29, 40, 27, 59 and 25 over six files), of the 220 budget; the scanner file also deletes 12 lines. `ultron tdd budget <plan> --base 573748a` printed `+0 lines` on the committed tree, so the numstat is the count.
+- Replay (ran). The judge `order_only.py` accepts only an `archive info` or `archive list` record of a `.tgm` that differs in order alone, compared per group block; checked on four synthetic pairs and four adversarial ones, and on 4b's known result (2 order-only, 3 other).
+- Baseline pair, `base-1` against `base-2` (855 records each): 1 difference, order-only (`test_full_archive_restore_cycle`, call 3). That is item 3's symptom at the baseline.
+- Final pair, `final-1` against `final-2` (861 records each), no allowance: 0 problems. The order is the same on every run.
+- `base-1` against `final-1`: 4 problems and 6 candidate-only keys (the new tests). Three problems are order-only in `archive info` and `archive list` of a `.tgm` (`test_archive_info_shows_groups` call 1; `test_full_archive_restore_cycle` calls 2 and 3). One is other: `test_archive_info_shows_groups` call 0, the `archive create` summary line `Groups:`, now `Alpha, Beta` where it was `Beta, Alpha`. Neo accepted it. No rule or allowance was written.
+- Not in this entry: the full lane and the revert checks, which run after this commit.
+
+**Findings.**
+
+- A remote `.tgm` restore ignores `--overwrite` and clears nothing (`_prepare_target`), and a remote restore of a root-group `.tgm` writes with mode `"w"`, which deletes the target prefix, `.firecube/` included (simulated on a local path, not run on S3). Both open in `plans/TODO.md`.
+- The group-object reads that still trust a group's own snapshot (P3) are listed by function under the audit entry in `plans/TODO.md`.
+- Also recorded in `plans/TODO.md`: `from zarr.api import synchronous as zs` is not flagged by the scanner; `build_multires_layers` over S3 with obstore fails in Dask tokenization before the refresh (a `PanicException`, inferred to predate the plan); case 4 of the restore snapshot test covers one group only, so a multi-group refresh is untested.
+- Rule deviations by testers (python heredoc rewrites of tracked test files in r1 and r3) were recorded in the decisions ledger; the results were linted and reviewed.
+
+## 2026-10-19 — Zarr and xarray opens that decide read live metadata (fix/parallel-chunk-ownership)
+
+**Decision.** Two signed commits, nothing pushed, each revertable alone. G1 `573748a` `fix(zarr): read live metadata wherever an open decides` holds the source, the red tests, the architecture test, `CHANGELOG.md`, `AGENTS.md`, `plans/DESIGN.md` and `plans/TEST.md`. G2 (`docs(plans): record the consolidated-metadata sweep`: `plans/TODO.md` and `plans/DONE.md`): hash pending. Every zarr or xarray open in `src/firecube` whose result drives a decision passes `use_consolidated=False` (zarr) or `consolidated=False` (xarray), at the site or through the two `ZarrIO` helpers in `src/firecube/core/zarr/io.py`. The intended invariant is that a decision that reads below the root does not trust a group's own snapshot either; the sites this sweep changed do that, and the exceptions are the three deliberate default opens, the converter fallback (P15), the opens that were already live and were not audited for descent (P16), and the known `_compute_touched_data_chunks` gap listed under Findings.
+
+**Ledger.** 34 opens, read at `cfcbe27`.
+
+- 16 stale decision opens fixed: 14 at the site and the two helpers.
+- 4 flag-only opens that cannot go stale (`group_exists`, the two root-attribute reads in `manager.py`, `_read_node_type`).
+- 4 display opens read live (`advise.py:123`, the restore summary, `zip_info`, `list_zip`).
+- 2 `open_array` calls exempt (`metadata_authority.py:499`, `zip_archive.py:242`): `open_array` reads the array's own `zarr.json` and has no `use_consolidated` parameter.
+- 3 deliberate defaults, `PERMANENT` rows in the architecture test: `_refresh_consolidated_metadata`, `_refuse_invalid_metadata`, and `validate_zip`'s whole-document parse (which gains a live walk).
+- 1 recorded gap: the converter fallback (P15).
+
+**Decision.** Choices inside the plan (P1 to P16).
+
+- P1: display sites read live (`zip_info`, `list_zip`, `zip_to_zarr`'s summary, advise's batch-size text); the allowlist has no "display only" row.
+- P2: `ZarrIO.open_group` passes `use_consolidated=False`; `ZarrIO.open_dataset` passes `consolidated=False` as a literal keyword, so a caller cannot pass `consolidated`; `layers.py` dropped its own `"consolidated": False`.
+- P3: one red test per helper, through one decision caller (`converter.py:103` for `open_group`, `converter.py:305` for `open_dataset`).
+- P4: opens that cannot go stale still pass the flag, so the rule has no exception for them.
+- P5: `open_array` never gets the keyword (on its create path it raises `TypeError`, zarr 3.2.1).
+- P6: three deliberate defaults, `PERMANENT` rows. `use_consolidated=False` drops a snapshot before it is parsed, so a live open no longer fails on a malformed snapshot; the two archive validators that judge whole documents keep a default open. `validate_zip` keeps its default open and walk and adds the live walk, so a child document that does not parse is reported at any depth wherever the snapshot sits (F30).
+- P7: the static-marker check is not edited; `_candidate_time_dim` picks `firecube_timestamp_state` by leaf name from the live listing, so only that array's dimension names and shape stop coming from the snapshot.
+- P8: `metadata_authority.py:499` is an `open_array` inside the node lock that already reads only its own document; no change.
+- P9: the architecture test extends `tests/unit/test_no_raw_fsspec_usage.py`, with a tagged row table modelled on `tests/architecture/test_cli_boundary.py`; a row that matches nothing or whose count differs fails.
+- P10: the rule covers `zarr.open_group`, `zarr.open`, `zarr.open_consolidated`, `xarray.open_zarr` and `engine="zarr"` opens, spelled through the module, an alias or a name imported from it, function-scope imports included. `**name` counts when the same function assigns that name a dict display holding the key as the literal `False`.
+- P11: the append resume cursor, the state array and staged seeding went to the heavy coder tier; the flags, the helpers and the zip walks to the ordinary tier.
+- P12: `append.py:184` (`_read_existing_append_values`) has no caller in `src`, and `group_exists` ignores `group` in its fallback; both left as they are and recorded in `plans/TODO.md`.
+- P13: `CHANGELOG.md` corrected and `AGENTS.md`, `plans/DESIGN.md` and `plans/TEST.md` updated in G1; the `plans/TODO.md` entry for the sweep is closed in G2.
+- P14: descent. A group reached as `root["G"]` or through `require_group` keeps its own snapshot when the root was opened live. So a decision that reads below the root reads each array by its full path from a live group, lists a group's children only after opening that group with `use_consolidated=False`, and walks descendants by reopening every group with `use_consolidated=False` and listing it at depth 0. The walk never relies on `members(max_depth=None, use_consolidated_for_children=False)`: zarr 3.2.1's sync `Group.members` accepts that flag and does not pass it on. Sites: `state.py`, `staged_metadata.py` and the zip walks.
+- P15: the converter fallback (`converter.py` `_open_group_dataset`, after a `KeyError` naming `dimension_names`) still trusts a group's own snapshot through `_group_from_root`; recorded, `converter.py` not edited (Neo, D1 revision).
+- P16: opens that already passed the flag before the sweep were not audited for descent; recorded.
+
+**Handoff corrections.**
+
+- Firecube writes consolidated metadata in two places, `_consolidate_metadata_best_effort` (`write.py`, only when `zarr_consolidate` is true, GenericZarr only) and the refresh in `coord_consolidation.py`; `append.py:995-996` never runs on zarr 3. The sweep changes neither.
+- W1 to W3 run the DirectZarr fixture and never consolidate, so no judge sees the live-read cost on a consolidated store.
+- `staged_metadata.py:96` was a data-loss path: seeding copies the target root `zarr.json` byte for byte, snapshot included, then reads workspace children through it; a target grown from 8 to 12 under a snapshot of 8 was seeded only to 8 (probe ran). The loss at promotion is inferred, not run.
+- A flag at the root does not reach a group's own snapshot (review round 1).
+
+**Coverage.**
+
+- Red runs (ran, on `cfcbe27` source, `repro/`): rA 5 failing ids, rB 7, rC 10, and the architecture test red with exactly 21 offenders and no stale row (`repro/ta.txt`); one bogus row failed as a stale row (`repro/ta-stale.txt`).
+- Tests added since `cfcbe27`: 368 added lines by `git diff --numstat cfcbe27 -- tests/` at G1, of the 370 budget. Two existing tests changed without weakening: `tests/unit/test_chunk_manager_slot_index.py` (call dictionary) and the transient-read leaf name in the seed test.
+- Replay (ran, x1): 852 base keys compared, 5 problems, 3 candidate-only keys. Three problems are the tree path in output text (`cc4b-base` against `cc4b-work`). Two are the variable order in `archive info` and `archive list` of a `.tgm` in `test_full_archive_restore_cycle` (`DSR,FWI` became `FWI,DSR`). Neo accepted all five.
+- Perf (ran, p1): the judge on S0, W1, W2 and W3 at zero allowance failed by 1 to 2 events (W2 open +1, W3 mkdir +2). Three more interleaved rounds each failed by 1 to 2 events, on different events. Neo accepted this. The cost on consolidated stores is calculated, not run: 4 reads against 11 for zarr and 1 against 4 for xarray on a 5-node store (measured in the survey probes).
+- Baseline failure, recorded not fixed: `tests/integration/test_cli_input_data_presence.py::test_override_discovery_no_input_data_succeeds` fails in the multi-file recording at `cfcbe27` and at `573748a`. The plugin-registry reload in `tests/integration/test_cli_zarr_preallocate_slot_index.py` leaves the registry with a stale class.
+
+**Findings.**
+
+- `_compute_touched_data_chunks` (`append.py`, about :412 and :421) read arrays through a group object. A group that carried its own snapshot taken before it grew made it return no touched chunks for the grown cells (review reproduced `{'G': {}}` where `{'G': {'val': [(5,)]}}` was right). A staged resume then skipped seeding for them, and whole-tree promotion replaced target cells next to the new data with fill values (review probe: cells 10 and 11 read `[999, 0]` where `[999, 111]` was right). `verify_post_write_integrity` read through the same stale shape and checked nothing for those cells. Fixed by `573748a` (snapshot-leftovers entry above), which reads both by full path from the live root.
+- `validate_zip` still passes a stale but well-formed snapshot; `zarr_consolidate` has only a sample line in `docs/reference/config.md:40`. Both open in `plans/TODO.md`. `ZarrIO.write_dataset` was fixed in `573748a`.
+
+## 2026-10-19 — The archive lifecycle runs below the CLI; recovery advice that works; a backfill is reported once recorded (fix/parallel-chunk-ownership)
+
+**Decision.** Two commits, each revertable alone, nothing pushed. The new modules are internal and importable (no facade export, no reference page), as `index_record` is. AB changes no behaviour; C changes text and one output point.
+
+- `cfcbe27` `refactor(archive): move lifecycle and inspection below the CLI` (AB). `src/firecube/cli/archive.py` became the package `src/firecube/cli/archive/` (`__init__.py`, `_common.py`, `_create.py`, `_restore.py`, `_inspect.py`; 59, 52, 260, 190 and 267 lines). `create_archive`, `restore_archive`, `ArchiveCreateResult`, `ArchiveRestoreResult`, `ArchiveClaimError`, `ArchiveConversionError` and `ArchiveRecordError` live in `src/firecube/ingestor/runtime/archive.py`. `tgm_info`, `open_tgm_listing`, `validate_tgm`, `TgmValidation` and `TensogramArchiveError` live in `src/firecube/core/tensogram/inspection.py`. The two `UNTIL archive-lifecycle` rows left `tests/architecture/test_cli_boundary.py`.
+- C, `fix(index): recovery advice that works; report a backfill once recorded`, hash pending (not landed when this entry was written). `firecube zarr index verify` and `firecube zarr slots` give a recovery that was run for the three states whose advice named `firecube zarr index rebuild`, which refuses them. `consolidate_time_coords` reports a backfilled consolidated WAL event after `record_time_coord_consolidation` succeeds for it, not before.
+
+**Decision.** Choices inside the plan (P8 to P11).
+
+- P8: the remote-artifact branches of the old `create` and `restore` (temporary paths and transfers) were unreachable and were dropped. They sat behind `StorageUri.from_local_path(...).is_remote()`, and `from_local_path` always yields protocol `file`.
+- P9: kept as they were and recorded in `plans/TODO.md`. Create's `manager.close()` is unguarded and can replace a pending error (restore guards it). A refused restore claim records the run started and failed. Admission is list-then-claim.
+- P10: `archive list` on a `.tgm` keeps its interleaving. `open_tgm_listing` is a context manager whose listing decodes each message's metadata as the command iterates and its objects when asked, so a late decode failure leaves the lines before it on stdout. `tests/unit/test_cli_archive_safety.py` pins it; the pin failed on a planted eager listing.
+- P11: `IndexRebuildResult` stays as `rebuild_index_record`'s return value for Python callers (`tests/integration/test_cli_index_rebuild.py` reads it). Rendering the CLI from it would print the two stdout lines after the terminal record, which the ordering test pins.
+- Start-up: exactly four new modules at `import firecube.cli.main` (`firecube.cli.archive._common`, `._create`, `._restore`, `._inspect`), accepted by Neo (D3).
+- The five command decorators changed from `@archive.command(` to `@click.command(` with the same arguments, because the group imports the commands; the other order is circular.
+
+**Coverage.**
+
+- The replay compares CLI output, streams, exit codes and log records of every CliRunner call; it does not capture persisted run records or WAL events, which the existing tests hold.
+- Replay (ran): 618 recorded CLI calls against the `cfcbe27` baseline. AB: 0 problems. C: 0 problems with the allowances, which are four stdout records where the backfill line moved (c1), two sentence swaps (the old and the new advice text, n1), and two rules Neo waived on 2026-10-19. The run-id rule covers only `tests/integration/test_archive_restore_audit.py::test_successful_restore_appears_in_chunks_runs_list_cli`, call 1, stdout. The group-order rule covers only `tests/integration/test_tensogram_archive.py::test_multigroup_archive_restore_cycle`, calls 0 and 1, stdout and stderr. The differ was checked by seven planted changes (create, restore stream, info, validate, list, restore warning, claim refusal text), each of which it reported; a wrong-field allowance still differed, a right-field one did not, and the control did not.
+- Start-up (ran): `bash EV/recorder/startup_check.sh EV/startup-new.txt` exits 0 on AB's tree, so the only added modules are the four above.
+- Tests added since `cfcbe27`: 350 lines of the 350 budget (AB 250, C 100). Reproductions failed before each fix: the two backfill cases (`tests/integration/test_consolidate_time_coord_command.py`) and the advice tests of `test_cli_index_verify.py` and `test_direct_zarr_resolved_index.py`. The recovery steps in the advice were run on scratch products and each ended in VERIFIED.
+
+**Findings.**
+
+- The library raises two `ValueError`s the commands cannot reach and no test pins: an unknown `archive_format`, and a zip archive in `create_archive` given `group`, `start_date`, `end_date` or `variables`.
+- The converters now resolve at call time inside the library functions, after the CLI has built the session. Tests that patch them on their modules keep working.
+- `zarr index rebuild` prints a raw `ManifestError` traceback in the attrs-without-record and attrs-drift states (`plans/DONE.md` 2026-10-18 already noted the raw propagation). Out of scope here; open in `plans/TODO.md`.
+- `docs/operations/firecube-index.md` (the `rebuild` section and the table row for a missing or corrupted record) still says `rebuild` recovers a corrupted or foreign-format record, which `ChunkManager._apply_resolved_index_precedence` (`manager.py:1341`) and `ResolvedIndexRecord.from_json_bytes` (`types.py:665-712`) refuse. Open in `plans/TODO.md` for the scribe.
+- The consolidated-metadata sweep (D1) is its own plan, next after this one; the full list of default opens is in `plans/TODO.md`.
+
+## 2026-10-18 — CLI boundary gate; index rebuild and verify, and time-coordinate consolidation run below the CLI (fix/parallel-chunk-ownership)
+
+**Decision.** A tagged architecture gate pins the CLI-boundary debt row by row, and three operations leave Click. Four groups of work on the branch (three committed, the fourth still uncommitted when this entry was written), nothing pushed, each new module internal and importable (no facade export, no reference page), as `coord_materialization` is. Behaviour-preserving except the one text change named below.
+
+- `cfcbe27` `tests/architecture/test_cli_boundary.py`. Six tests: no Click outside `cli/`, no `firecube.cli` import outside `cli/`, no CLI command or flag text in the strings that raise or log in `core/` and `ingestor/`, no private `core` or `ingestor` module imported by `cli/`, a 500-line ceiling per `cli/` module, and well-formed tags. Each allowlist row carries `PERMANENT: <reason>` or `UNTIL <owner>: <reason>`. A row that matches nothing, or whose count or tokens differ, fails, so the allowlist only shrinks by edit. `src/firecube/__main__.py` is a `PERMANENT` row (`python -m firecube` is the CLI's own entry point). The two prose matches and the one dependency-install hint of check 3 are `PERMANENT` rows. The other check-3 rows, the two Click imports and `src/firecube/core/hints.py` are `UNTIL structured-errors`.
+- `cfcbe27` `rebuild_index_record` and `verify_index_record` in `src/firecube/ingestor/runtime/index_record.py`, with frozen `IndexRebuildResult` and `IndexVerification` and `IndexRecordError(ConfigurationError)`. `src/firecube/cli/index.py` keeps `_manager`, `_load_plugin`, `_load_record`, `_exit_no_record`, `show` and the rendering. The legacy-index refusal (`check_legacy_index_record`) and the slots legacy warning also name `firecube.ingestor.runtime.index_record.rebuild_index_record`, right after the backticked command.
+- `cfcbe27` `consolidate_time_coords` in `src/firecube/core/zarr/coord_consolidation.py`, with frozen `ConsolidationSummary` and `ProductIdentityError(ConfigurationError)`. `src/firecube/cli/zarr/_consolidate.py` shrank to 176 lines and keeps the options, URI policy, the `--chunk-size` check, the s3 refusal, the storage config, the dry-run summary and exit 1.
+- The fourth group types `preallocate_product` and `plan_slots` against `PreallocateHost` and adds `BaseIngestor.bind_index_at_startup(ctx)`, which only calls the private `_bind_index_at_startup`. `slot_plan.py` reads `ingestor.time_dim_name` where it called `_resolve_time_dim_name()`. Docstrings stop naming `DirectZarrIngestor` as the host.
+
+**Decision.** Output and error mapping, as in the entry below.
+
+- `rebuild_index_record` takes `report` and `warn` callables, which the plan first left out (it had the CLI render from a result). Rendering after the call let an interrupted terminal record lose the stdout line and delayed the conflict stderr line, so the library calls them at the points where the command echoed, before the finalizing `finally`. The CLI passes `click.echo` and a stderr echo. `IndexRebuildResult` is returned but the CLI no longer renders from it.
+- The `ClickException` of the rebuild moved range became `IndexRecordError` with identical text; the CLI catches `IndexRecordError` and `ResolvedIndexConflictError` and nothing else, so what propagated raw before (a plugin `TypeError`, `ManifestError`, `ResolvedIndexClaimTimeoutError`) still does. A plugin's `click.ClickException` from `index_spec` is re-raised unchanged by `verify` and wrapped by `rebuild`, as before.
+- `consolidate_time_coords` calls `report(line)` where the command echoed. Its `ClickException`s became `ConfigurationError` (the two time-dim refusals) or `SchemaDriftError` (unexpected recovery state, coordinate-managed, non-datetime dtype, sealing failures) with identical text. `wrap_user_facing_errors` renders both as before. `ProductIdentityError` becomes `click.UsageError`, exit 2, as before.
+- Identity resolution keeps its place after the store open and the reference read. The library refuses an s3 storage config with today's text before any store opens; from the CLI that check stays unreachable because the CLI refuses first. The unreachable remote rewrite (`_rewrite_time_coord_remote` and every `remote=True` branch) was deleted, not moved.
+- The one intended text change: the legacy-index refusal and the slots legacy warning name the Python function. Four recorded calls carry the suffix.
+
+**Decision.** The consolidation move also fixes the stale-metadata open (`plans/TODO.md`, the consolidated-metadata entry). The root and every descendant group are opened with `use_consolidated=False`, because a subgroup that carries its own consolidated snapshot still hid a live `firecube_coord_managed` stamp when only the root was opened live (found in review). Before the fix, a store whose consolidated metadata predated the stamp exited 0, rewrote the coordinate and replaced the marker with `firecube_preallocated`. The premise that after this only validation reads consolidated metadata is false: `src/firecube/core/zarr/validation.py` (:475, :476, :613, :625, :795), `_read_array_meta_from_store` in `src/firecube/ingestor/runtime/zarr/append.py` (:84), `src/firecube/core/zarr/state.py` (:190, :192, :265, :267), `src/firecube/core/zarr/io.py` (:50) and `src/firecube/core/tensogram/metadata.py` (:212) still open with the default (read in code; not probed).
+
+**Coverage.**
+
+- The replay compares CLI output, streams, exit codes and log records of every CliRunner call on `cfcbe27` against the final tree; it does not capture persisted run records or WAL events, which the existing tests that read them hold.
+- Replay (`final.jsonl`, `final-raw.txt`; ran): 546 records, 542 base keys. Without allowances 4 problems, all the suffix. With `allow-b.args` 0 problems. 4 records carry the suffix and 4 keys exist only in the candidate (the new tests). The differ was checked by planted changes (`planted/`: consolidate text, consolidate exit, rebuild stream, verify text, index refusal each differ; the control does not).
+- Start-up: `import firecube.cli.main` loads 1545 modules against 1546 on `cfcbe27` (`startup-modules.txt`).
+- Tests added since `cfcbe27`: 768 lines by `git diff --numstat cfcbe27 -- tests/` (gate 440, index tests 137, consolidation reproduction 25, consolidation tests and patch repoint 103, host Protocol test and markers 63). Neo raised the budget from 650 to 800; `ultron tdd budget` reads the frozen 650 in the plan header and reports over budget.
+- The gate: red on the clean tree for every test but the tag test, green with rows, and stale rows, a malformed tag and a swapped token each fail (`gate/red.txt`, `gate/stale.txt`).
+- The reproduction of the consolidation symptom failed before the fix and passes after it (`repro/rc-red.txt`): `tests/integration/test_cross_regime_marker_refusals.py::test_consolidate_refuses_coord_managed_despite_stale_consolidated_metadata`.
+
+**Findings.**
+
+- The earlier layering review (section 2) is stale: of its 97 rows, 27 still sit at their line, and its hints rows cite `core/controlplane/hints.py`, which no longer exists. The gate's rows come from a scan of the `cfcbe27` tree.
+- The observability boundary test has no stale-row check and no `UNTIL` tag; the new gate adds both.
+- Check 2 was not empty: `src/firecube/__main__.py` imports `firecube.cli.main`. Check 3 misses literals that reach the user through a variable, a return value or a `warn(...)` call (23 sites, for example `core/zarr/guard/engine_owned.py` and `ingestor/runtime/slot_plan.py`), and a command split around an f-string placeholder. Recorded, not closed.
+- The consolidation writes still bypass `guarded_write` and `MetadataAuthority` and take no claim (`plans/TODO.md`, the `consolidate-time-coord` entry stays open). The move put that code inside `core/zarr/`. The post-delete recovery also renames a managed sibling before refusing (pre-existing).
+- An array named `<coord>.consolidating` is still deleted by consolidation (`plans/TODO.md`, identity in strings), recorded, not scheduled.
+- `rebuild` prints "Rebuilt index record" when `ensure_resolved_index` only re-mirrored the attribute (outcome `created`); a `ManifestError` from it propagates raw and is untested; `verify` passes `plugin or product_name` as the plugin name in the legacy message.
+- The index commands configure no tier config on the plugin; preserved.
+- Citations to `plans/DONE.md:97-103` and `:99` for the coordinate-materializer precedent were wrong; the precedent is the 2026-09-01 entry below.
+- The three advice texts that name `firecube zarr index rebuild` for states the command refuses stay untouched: `plan_slots` in `slot_plan.py` and the two attrs-drift messages in `src/firecube/cli/index.py` (`ensure_resolved_index` refuses a root attribute without a record, a matching record with a diverging attribute, and a hash mismatch).
+- Strings that name a CLI command or flag and moved below `cli/` verbatim: the `--time-dim` refusals in `core/zarr/coord_consolidation.py` (`consolidate_time_coords`, `_resolve_time_dim_for_group`). They are `UNTIL structured-errors` rows of the gate. The index move took none.
+- Two failures found while executing, not fixed. The first is present without this work; the second is a load-sensitive candidate with no clean-base reproduction: `tests/integration/test_slots_auto_input_data.py::test_slots_auto_uses_input_data` fails alone on the clean branch (it parses `CliRunner` `result.output`, which mixes stderr; `init_observability` binds the log handler to the first runner's stderr per process, `src/firecube/core/observability/logging.py:112`), and `tests/integration/test_concurrent_preallocate_race.py::test_two_concurrent_preallocates_with_slot_group_env_share_a_single_claim_and_never_overlap` failed once under load with `ControlPlaneCorruptionError` on a `.firecube-atomic-*.tmp` claim file and passed twice alone. Both are open in `plans/TODO.md`.
+
+## 2026-10-18 — `zarr preallocate` and `zarr slots` run below the CLI (fix/parallel-chunk-ownership)
+
+**Decision.** The preallocate operation and the slot plan no longer live in Click modules. Four commits, behaviour-preserving, nothing renamed publicly. The new modules are internal and importable, as `coord_materialization` is: no export from `firecube.ingestor.api`, no reference page.
+
+- `cfcbe27` `configure_ingestor` in `src/firecube/ingestor/runtime/configure.py`. It builds the contexts and runs `TierConfigurator` without Click. `_configure_ingestor_for_cli` still coerces the options and delegates.
+- `cfcbe27` The slot algebra (`merge_intervals`, `complement_intervals`, `iter_partitions`, `partition_count`, `chunk_aligned_remaining`, `resolve_per_group_slot_sizes`, `smallest_executable_slot_size`) moved to `src/firecube/core/zarr/planning.py`. `plan_slots`, `GroupSlotPlan`, `PLAN_RANGE_CEILING`, `SlotPlanError`, `SlotPlanBlockedError`, `SlotPlanCeilingError`, `_stored_time_units` and `_query_slots_coverage` moved to `src/firecube/ingestor/runtime/slot_plan.py`. The commit deletes `src/firecube/cli/_slot_planning.py` and `_partition_remaining`, which had no caller. `PLAN_SCHEMA_VERSION` and `PLAN_RANGE_HINT` live in `src/firecube/cli/zarr/_slots.py`.
+- `cfcbe27` `preallocate_product`, `PreallocateDryRunGroup` and `SlotWindowError` in `src/firecube/ingestor/runtime/preallocate.py`, with the helpers `_discover_engine_owned_values`, `_ensure_ancestors`, `_resolve_preallocate_windows`, `_refuse_ownership_change`, `_create_array` and `_materialize_engine_owned_arrays`. The command keeps options, input filters, URI policy, storage config, binding, session, `ChunkManager`, plugin lookup, ingestor construction and configuration. It closes the `ChunkManager` in `finally`.
+- `cfcbe27` The four refusals that ask for `firecube zarr preallocate` also name `firecube.ingestor.runtime.preallocate.preallocate_product`.
+
+Both operations are half-open `[start, end)` throughout. `firecube.core.controlplane.ranges` is inclusive. The one conversion happens where the code reads stored coverage.
+
+**Decision.** Output and error mapping. The library calls `report(line)` where the command echoed to stdout. It calls `warn(line)` where the command echoed to stderr. The text and the point stay the same, both JSON documents included. Printing the summary after the call returns would drop it when the terminal record fails. The dry-run preview is the exception: `on_dry_run_group` receives one `PreallocateDryRunGroup` per group, and the command prints today's lines from it. The command passes the `firecube.cli.zarr` logger, so log records keep their name. `slots` passes `_warn_stderr` as `warn`, so the drift warnings still go to descriptor 2.
+
+- Each `ClickException` in the moved preallocate range became `ConfigurationError` (caller input) or `SchemaDriftError` (store state) with identical text. `wrap_user_facing_errors` renders both as `ClickException(str(exc))`, exit 1.
+- The window `click.UsageError` texts became `SlotWindowError`. The command maps it back to `click.UsageError`, so exit 2 and the usage block stay.
+- `LegacyIndexRecordError` surfaces as `SchemaDriftError`.
+- The change deletes two `ClickException` re-wraps of an already-typed error, because `wrap_user_facing_errors` renders the same text.
+- `slots` has no `wrap_user_facing_errors`. The command catches `SlotPlanError` and nothing else, and raises today's `ClickException`. `resolve_per_group_slot_sizes` raises `ConfigurationError`. `plan_slots` converts it to `SlotPlanError` at both calls (`slot_plan.py`). The command converts the `SlotPlanError` family to `click.ClickException`.
+- The failure and terminal run records carry fixed texts, so the exception type change leaves them unchanged.
+
+**Findings.**
+
+- Eight test files changed.
+  - `tests/integration/test_cli_zarr_preallocate.py` and `tests/integration/test_preallocate_auto_rebuild.py` patch `firecube.core.observability.create_ingestion_telemetry` instead of `firecube.cli.zarr._preallocate.observability.create_ingestion_telemetry`. It is the same module attribute.
+  - `tests/unit/test_cli_slot_planning.py`, `tests/integration/test_direct_zarr_shard_sharing_reproduction.py`, `tests/integration/test_phase3_5_blocked_ranges.py` and `tests/unit/test_cli_zarr_slots.py` import from or patch the new homes. The invalid-explicit case in `test_cli_slot_planning.py` expects `ConfigurationError` instead of `click.ClickException`.
+  - `tests/integration/test_horizon_growth_rejects_shape_drift.py` expects the exact shape-refusal text with the new parenthetical.
+  - `tests/unit/test_cli_zarr_preallocate.py` and `tests/unit/test_cli_zarr_slots.py` also hold the new `preallocate_product` and `plan_slots` tests. The three `plan_slots` tests carry no definition-time markers.
+- `tests/integration/test_preallocate_auto_rebuild.py` never asserts that the code uses its telemetry fake. Its unbounded group bypasses the factory. The test therefore cannot prove that the patch intercepts the call. This limit existed before the change.
+- `tests/architecture/test_cli_no_private_cross_subsystem_imports.py` flags underscore names in `ImportFrom` only. It does not catch private module paths (`guard._layout`), private calls (`_bind_index_at_startup`) or private attributes (`_storage_config`, `_open_root`). The change did not widen it.
+- Those private accesses left `cli/` and still exist in `src/firecube/ingestor/runtime/`. `preallocate.py`, `slot_plan.py` and `parallel_gate.py` call `_bind_index_at_startup`. `preallocate.py` holds the `_storage_config` getattr and `_open_root`. `preallocate.py`, `parallel_gate.py` and `planning.py` import `guard._layout`. The change adds no public alias.
+- CLI-naming strings moved below `cli/` verbatim, for the structured-errors plan.
+  - `preallocate.py`: the `--input-data` text of the engine-owned discovery refusal, and the `--slot-group`, `--slot-start` and `--slot-end` window messages.
+  - `slot_plan.py`: the `--input-data` AUTO-discovery text, two `firecube zarr index rebuild` texts, the coverage-lookup text naming `--no-resume`, and the unreadable-layout text.
+  - `core/zarr/planning.py`: the two `--slot-size` texts.
+- The coverage query builds its storage config without the `anonymous` override that the command's own config has. The change keeps that gap and does not fix it.
+- The handoff's shared window-planning helpers do not exist. The two commands share only plugin configuration and two functions of `parallel_gate.py`.
+- A plugin-raised `click.ClickException` from `index_spec`, binding or `resolved_index` now shows `returned no index_spec`, because the library cannot import Click. No in-tree plugin or fixture raises it.
+- Three open slots items stay as they were. An explicit `--slot-size` can plan a last window that pods refuse. Obstore `exists()` reads a denied target as empty. The `click.Abort` handling of `_stored_time_units` has not changed.
+
+**Coverage.** Two test files lock the library contract.
+
+- `tests/unit/test_cli_zarr_preallocate.py`: a live run reports through `report` and `warn` and writes nothing to stdout or stderr. A dry run calls `on_dry_run_group` once per bounded group and creates no array. An out-of-group window raises `SlotWindowError` before any array exists.
+- `tests/unit/test_cli_zarr_slots.py`: one `GroupSlotPlan` per bounded group with a lazy `ranges()`. `SlotPlanBlockedError`. `SlotPlanCeilingError` and the override.
+
+The plan measured behaviour and did not assert it (measured). 484 recorded `CliRunner` calls of the CLI-driving tests ran on the final tree and on `b07aa49`. 484 normalised records compare equal under the recorded allowances: the parenthetical of `cfcbe27` (4 calls) and two differences that Neo accepted. The first difference is the log `lineno` of `configure.py`, which moved with the added code. The second is a thread race over which of two parallel batches logs a failure in `tests/integration/test_chunk_ownership_races.py`. The recording covers stdout, stderr, exit code, exception type, `firecube` log records and descriptor-level writes. The harness has limits. It masks path-dependent identity digests when they are well-formed 64-hex. It re-serialises parallel-run JSON after sorting object lists. It decodes stderr and descriptor bytes with replacement. Its clock and 32-hex normalisation is broader than the identified fields. The allowances apply to every string field.
+
+**Results.** Performance against a same-job `b07aa49` control, five runs per scenario (measured).
+
+- The performance judge reported FAIL on the final tree. The judge allows no increase in the median of any counted event.
+- W2 `open` is 10820 against 10819. W2 `os.scandir` is 45 against 44.
+- The +1 `open` is in the `zarr preallocate` step: 1958 on the control and 1959 on the final tree, in 20 of 20 runs. The count is repeatable. Other event counts vary by run. For example, `os.scandir` in W2 ranged from 40 to 48 per run across both trees.
+- Neo accepted the +1 `open`. The gate text stays.
+- The ingest-window step keeps its median `open` count in all four measured rounds (8860 or 8861 on both trees).
+- The cause is one more module file, `firecube.ingestor.runtime.preallocate`, opened once per preallocate process (inferred, not measured).
+- Start-up modules: 1546, equal to the baseline. S0 (`firecube --help`) is identical on every counted event.
+- W2 wall medians were 1.40–1.49 s on the final tree and 1.44–1.45 s on the control. The gate counts events. It reports wall time without gating it.
+
+## 2026-10-18 — The branch's data-loss paths are closed (fix/parallel-chunk-ownership)
+
+**Decision.** Before the branch merges, three reproduced data-loss paths close and one avoidable perf delta is cut. The staged `unclaimed` PUT, the ledger exclusion and the zip restore are new on this branch, so no release carries them. The `.tgm` delete-first, its late start record and its clear-by-domain are in v0.1.7. There is one commit per symptom. Step `rv` of the plan tests that each reverts alone, and it has not run yet. Nothing is pushed. Five commits sit on top of 300a3cc:
+
+- `b07aa49` `test: fix the pyright errors in two unit test modules`. `uv run pyright` exited 1 on 300a3cc with 11 errors in `tests/unit/test_chunk_manager_resolved_index.py` and `tests/unit/test_cli_archive_safety.py`.
+- `b07aa49` `perf(zarr): seed the workspace root metadata only when it changed`.
+- `b07aa49` `fix(archive): refuse a target that is not the session product`.
+- `b07aa49` `fix(zarr): publish no seeded chunk of a managed coordinate`.
+- `b07aa49` `fix(archive): validate before overwrite and keep the restore claim`.
+
+**Decision.** Symptom 1: a staged promotion reverted a concurrent `zarr preallocate` fill. A slot of the time coordinate went back to NaT, and every exit code was 0. Seeding copies the coordinate's chunks into the workspace as a snapshot. Promotion PUT that copy as `unclaimed`. `b07aa49` closed it. A data object of a managed time coordinate is planned UNCHANGED with reason `engine-managed`. Promotion never compares it and never PUTs it. The rule covers only the configured time coordinate (`time_dim_name`), and only when its final-target `zarr.json` marks it preallocated or coordinate-managed. No other array is classified, marked or not. An unmarked time coordinate's staged PUT is how a run's timestamps reach the target. A mutant that skipped every coordinate chunk failed four existing staged tests. The write session classifies two sets. One is the coordinates that seeding reported, through a new one-method Protocol, `_SeededCoordinates`. The other is the coordinate of each group the run wrote. It reads one target `zarr.json` per candidate. An invalid marker state raises `SchemaDriftError` before the target is touched.
+
+**Decision.** Symptom 2: `firecube archive restore --overwrite` deleted the target before it validated the archive. The delete took `.firecube/` and the restore's own claim with it. An invalid archive deleted the original. A second restore without `--overwrite` saw no claim and wrote beside the first. `b07aa49` closed it. The zip restore parses every `zarr.json` entry before any delete. The `.tgm` restore reads the message count, the version of message 0 and the structure. An overwrite on a local target keeps `.firecube/claims/`, `.firecube/schema.json` and `.firecube/runs/<keep_run_id>/`. It deletes the rest of the old control plane. A symlink at the target or on a kept path raises `ConfigurationError` before any delete. For library callers of `tgm_to_zarr`, `parse_target` refuses a relative target before any delete. A remote `.tgm` target is unchanged, and its root group still uses mode `"w"`. The CLI keeps one manager, one recorder and the claim handle for the whole restore. It records `started` after the claim and releases the claim by handle in `finally`. A failure to record the failure, to release the claim or to close the manager prints a `Warning:` line. It never replaces the restore error. A failure to record the start, or to record the success, surfaces as the error itself. The CLI still attempts to record the failure and releases the claim. Neo chose to replace in place and not to stage and swap (2026-10-18). The residual is in `plans/TODO.md`.
+
+**Decision.** Symptom 3: `zip_to_zarr` deleted `target` and wrote to `session.product.product_uri`. Nothing compared the two. `b07aa49` closed it. `require_target_is_product` in `src/firecube/core/uris.py` raises `ConfigurationError` when the two differ. `zip_to_zarr` calls it first. `tgm_to_zarr` calls it after `require_tensogram` when a session is passed. It is a refusal and not a single identity, because dropping `target` would change the CLI calls.
+
+**Decision.** Perf (`b07aa49`). `_seed_root_metadata` replaced the workspace root `zarr.json` before every batch, 20 batches in W3. The root document now goes through `update_document(..., lambda _current: data)`. It is written only when its bytes differ. The plain-file path compares the bytes itself. W3 `os.rename` fell from 253 to 234 (measured with `measure.py`).
+
+**Results.** Per node, from the orchestrator's reruns (ran):
+
+- t1: `uv run pyright` reported 0 errors, and 22 tests passed. Vision approved.
+- r1, r1b, c1, c1b: the r1b test failed on c1's tree with one slot reverted (1 failed). The union lane of c1b passed 145 tests. The merged tree passed 74. Vision approved r1 with notes and approved c1 with c1b. Its real-host probe showed the DirectZarr host forwarding `time_coord_name` `"t"` and classifying `g/t` and `h/nested/t`.
+- r3, c3: red on 300a3cc (two `DID NOT RAISE ConfigurationError` at `tests/architecture/test_storage_flows.py:532`). After the fix, 73 tests passed. Vision approved. It probed normalization variants and the CLI binding, and both were equal.
+- p1: `measure` printed 234 against a limit of 240. One test patched `publish_document` and now patches `update_document`. Vision approved with notes.
+- r2, c2: r2's tests showed 10 failed on b07aa49. After the fix, 102 tests passed on the node's lane and 68 on the merged tree. Vision rejected twice. The first blocker was a symlinked `.firecube` or `.firecube/runs` that the delete followed. The second was a remote `.tgm` root-group restore that kept stale arrays. Round 3 approved with notes and found a relative local target that deleted before `parse_target` refused it. The same commit fixed that. A narrow review in round 4 approved with notes.
+- Test budget: `ultron tdd budget --base 300a3cc` counts +275 physical test lines against 250. The plan neither trimmed nor loosened it. Neo rules.
+
+**Decision.** Perf delta against v0.1.7 (D-pf-1, Neo, 2026-10-18). `pf` ran `PERF_RUNS=5` on a `git archive` export of the tip and of 300a3cc in the same job. After the allowance, every counted event of the tip is at most the control's. The allowance is one more `open` and one more `open@root` in W3. It is the price of the one target `zarr.json` read per staged promotion. The wall term did not pass at this fixture size of 200 slots. The W3 median of the tip was 1.269 s against an original control at 1.070 s. An interleaved rerun gave control 1.269 s and 1.218 s, and tip 1.218 s and 1.469 s, with one 3.2 s outlier. Rerun control-1 is 1.186 times the original control. Tip-1 is below control-1. The two rerun control medians differ by 1.042 times. Neo accepted the counted events as the gate (D-pf-1). That acceptance rests on the event counts and does not claim a wall result. The medians below are measured over five runs on Python 3.13.15.
+
+| Event | v0.1.7 | 300a3cc control | Tip |
+|-------|--------|-----------------|-----|
+| W3 `os.rename` | 230 | 253 | 234 |
+| W3 `os.mkdir` | 524 | 542 | 523 |
+| W3 `open` | 3192 | 3232 | 3233 |
+| W3 `open@root` | 268 | 285 | 285 |
+| W3 `os.scandir` | 157 | 157 | 157 |
+| W2 `open@root` | 1092 | 1176 | 1176 |
+| W2 `os.scandir` | 154 | 45 | 45 |
+
+The plan records the causes of the remaining deltas against v0.1.7 and does not change them.
+
+- W3 `os.rename` +4: atomic chunk publication and promoted `zarr.json` through `update_document`, less offsets. The control's +23 over v0.1.7 was +20 from the root re-seed, +3 chunk publications, +3 promoted `zarr.json` and -3 offsets (ran, audit-hook trace). `b07aa49` replaced the 20 per-batch publications with one, which is 19 fewer renames (253 to 234).
+- W3 `open@root` +17: promotion's publish temporaries, `.partial` writes and comparison reads (per-site rows inferred).
+- W3 `open` +41: the same promotion costs plus the one allowed `zarr.json` read. Nobody traced this delta site by site (not checked).
+- W2 `open@root` +84 comes from three sources. They are per-batch `zarr.json` reads of the window ownership check, the read-only root open in the indexed region writer and the engine-owned checks. The per-site rows are inferred.
+- W2 `os.scandir` fell.
+- W1 on the tip equals the control: `open` 3154, `os.rename` 227, `open@root` 1043. Against v0.1.7 it differs by +24 `open`, -3 `os.rename` and -12 `open@root` (calculated from the three `raw.json` files).
+- Walls do not compare with the saved v0.1.7 baselines. The earlier survey (F25) exported trees without bytecode. The `pf` recipe compiled both of its trees, and no compile log was kept.
+
+**Coverage.** `tests/unit/test_storage_completion.py` (managed-coordinate promotion, including a group the run never wrote), `tests/architecture/test_storage_flows.py` (identity refusal), `tests/integration/test_maintenance_claims.py` and `tests/integration/test_maintenance_audit.py` (restore claim, ordering, recorded failure), `tests/unit/test_cli_archive_safety.py` and `tests/unit/test_zarr_staged_metadata.py` lock the behavior. `plans/TODO.md` lists the open and untested residuals under "Open after the branch data-loss fixes (2026-10-18)".
+
+## 2026-10-11 — Parallel writers never share a Zarr chunk or shard
+
+**Decision.** Slot-window pods, in-pod `pipeline_workers` threads and staged promotion silently lost slots when they shared a chunk or shard along time (measured on c160535: 12 single-slot pods on one 12-slot chunk lost slots in 10/10 barrier reps in direct and in staged mode, about 11 of 12 slots per rep). Fix shape: engine-owned routine plus safety net. `ZarrArraySpec(engine_owned=True)` with `ItemInfo(values=...)` makes preallocate write a rank-1 per-slot array once and pods verify it. One layout resolution (`core/zarr/guard/_layout.py`) applied at creation gives undeclared pod-written time-indexed arrays (no chunks, no shards) time chunk 1 with one warning, unless zarr's own whole-array chunks already have time chunk 1: those are kept and nothing is logged; shards-only declarations keep their shards. An ownership check on the stored layout (`core/zarr/guard/chunk_geometry.py`) refuses windows that split a stored unit, so existing unsafe stores are refused rather than repaired. Threads serialise per (store, array, unit); a run's batches share its schema claim.
+
+**Decision.** Staged runs must write every cell of each promoted unit; sparse staged writes are refused (seeding deferred). Serial staged runs are refused just before promotion, after workspace writes, with the target untouched, because a serial run has no slot plan before its batches. Staged engine-owned values are verified against the final target instead of seeding the workspace, since seeded chunks would be promoted back.
+
+**Decision.** Staged torn reads: promotion re-uploaded every staged file, including the seeded unchanged root `zarr.json` and time coordinate chunk, with an in-place truncating open, so a concurrent pod seeding or opening the target read zero bytes (measured: a torn read in 5 of 20 repetitions of 12 pods on c160535, 1 of 20 on the fixed tip). `StorageSession` now publishes every upload to a local target, both size branches, by writing a reserved `.firecube-publish-*.tmp` sibling and `os.replace`-ing it into place, after copying an existing regular destination's permission bits onto it; both drivers leave those names out of `find`/`ls`, and seeding also skips Zarr `*.partial` files. Remote uploads are unchanged (already whole-object). Skipping unchanged seeded files was not done. Coverage: none. No test under `tests/` exercises the publication temporary (a reader during a paused copy, copy-failure cleanup, the kept destination mode, the hidden `.firecube-publish-*.tmp` names or the skipped `*.partial` files); the torn-read numbers above came from the 12-pod measurement, not from a test.
+
+**Decision.** Publication detail dropped from the CHANGELOG (2026-10-11): a copy that fails removes its temporary and leaves the old object (`src/firecube/core/filesystem/publication.py`; no test covers it); the replace does not fsync, so it adds no crash durability; a killed promotion can leave `.firecube-publish-*.tmp` files that Firecube's listings and seeding skip but Zarr's own listings can see. A payload or static write aimed at a preallocated or coord-managed time coordinate is verified against the stored values (identical: no write; different: `SchemaDriftError`) rather than overwriting them. A run's concurrent batches share its schema claim instead of failing on it.
+
+**Decision.** Safe existing layouts keep their bytes: the stored chunks and shards of arrays whose layout was already safe on c160535 are unchanged by the new creation rules, checked against a manifest of those stores recorded before the change. `_compute_schema_hash` stays on declared values. `write_1d` raises `IndexError` for an out-of-range slot (was a silent no-op). Not in scope and unchanged: FCI plugin, repair of existing cubes, GenericZarr layouts.
+
+**Decision.** Accepted exception to the "no shared mutation in workers" invariant (`plans/DESIGN.md`, Architectural Invariants): the write path adds process-wide coordination state that the `pipeline_workers` threads of one process share. `_UNIT_LOCKS` in `src/firecube/core/zarr/guard/_unit_locks.py` holds locks and their reference counts, keyed by (store identity, array path, stored unit); an entry exists only while a thread holds or waits for it. `RunSchemaClaims` (`src/firecube/ingestor/runtime/zarr/write_session.py`) holds a plain lock around the lookup and release of the run's schema claims, and one setup lock per (run, group) that serialises schema setup; the run's staged ledger is shared by its batches the same way. None of it carries payload data between workers. It is shared on purpose: two threads that read-modify-write one stored unit lose a slot unless they exclude each other, and passing each worker an immutable copy cannot do that. The static-array transaction takes the `_UNIT_LOCKS` table with the whole-array key `(store, array, ())`. This is per-process protection. Between processes, pod-written time-indexed arrays stay safe through slot windows that cover whole stored units and the control-plane claims; a static array is not covered that way, and its transaction is not serialised between processes.
+
+**Coverage.** `tests/integration/test_engine_owned_arrays.py` (preallocate then ingest, refusals, partial stored units, staged promotion), `tests/integration/test_chunk_ownership_races.py` (forced interleavings, no timing) and `tests/unit/test_index_spec.py` lock the behavior. Finer cases are not tested.
+
+## 2026-10-10 — Calendar time code lives in `core/time/` (#77)
+
+**Decision.** The calendar vocabulary, the Gregorian fast path, the coordinate-encoding selection and the calendar value guard are in the package `firecube/core/time/`. The fill helpers are in `core/zarr/_fill.py`. The shared coordinate helpers and the re-materialization checks are in `core/zarr/_coord_common.py` and `core/zarr/coord_rematerialization.py`. `core/time/encoding.py` is the only place that derives the storage encoding. Nothing is added to `firecube.core.api` or `firecube.ingestor.api`. A moved name leaves no alias.
+
+- A module of `core/time/` imports only the modules before it in this list: `_codecs`, `calendar`, `guard`, `gregorian`, `encode`, `canonical`, `convert`, `encoding`.
+- `coord_to_datetime64` moved from `coord_materialization.py` to `core/time/convert.py`. `_fill_value_is_missing` and `_array_is_all_fill` moved from `region_writer.py` to `core/zarr/_fill.py`.
+- The refusals that carry fields are `Datetime64RangeError` (`value`), `DuplicateAxisInstantError` (`coordinate`, `slots`), `CoordinateRelabelError` (`coord_path`, `stored`, `incoming`, `differs_in`), `UnparseableSpanBoundsError` (`spans`) and `CalendarArchiveError` (`coordinate`, `calendar`).
+
+**Coverage.**
+
+- `tests/unit/test_time_encode.py`, `tests/unit/test_zarr_fill.py`, `tests/unit/test_epoch_parse_helper.py` and `tests/unit/test_coord_rematerialization.py` cover the moved code.
+- `tests/unit/test_group_identity_hash.py` and `tests/unit/test_time_axis_declaration.py` keep Gregorian hashes and declarations unchanged.
+- The landing of 2026-10-20 records the gates and the acceptance evidence.
+
 ## 2026-10-05 — `delete-span` on cubes with static data variables (#83)
 
 **Decision.** `GenericZarrIngestor` span records list time-indexed data variables only; static variables such as `lat_bnds` and `lon_bnds` are written once and have no time slots to cover. Records already written with static arrays in `span.arrays` stay valid: `delete-span` skips arrays whose known dimension names lack the span's time dimension and reports them as one warning per span. It does not rewrite old records.
@@ -9,6 +376,50 @@
 **Decision.** CF-encoded numeric time arrays (`units` containing `since`) are filled with NaT chosen by dtype, not through `encode_time_array`, which raises for all-NaT input with the `standard`/`gregorian` calendars. The sentinel is the declared `_FillValue` if present, else the `int64` minimum, else NaN for floats; an integer dtype other than `int64` without a declared `_FillValue` is refused. The Zarr fill value (`0`) decodes to the reference epoch and is a valid date. `chunks delete-span` exits 1 when it reports errors.
 
 **Coverage.** `tests/integration/test_generic_zarr_static_vars_span.py`, `tests/integration/test_delete_span_region_nan_fill.py`, `tests/unit/test_deletion_fill_value.py`, `tests/unit/test_cli_chunks_delete.py`, `tests/unit/test_deletion_missing_key_not_error.py`, and `tests/unit/test_append_stale_consolidated_metadata.py` lock the behavior.
+
+## 2026-09-23 — Calendar as a property of every time axis
+
+**Context.** A time axis on the direct write path always resolved and stored coordinates in the Gregorian calendar. A source on another day-counting calendar was read again as Gregorian. The store held plausible but wrong dates, and no error was raised. A staged time coordinate on such a calendar crashed the second ingest run. A first design added the calendar as an optional extra with no default. That left "declared Gregorian" and "undeclared" as two states for one behaviour. Also, `firecube archive` had no defined behaviour for a non-Gregorian time coordinate, and `firecube zarr validate` did not treat the fill value of an encoded coordinate as missing.
+
+**Decision.** Every time axis has a calendar. `calendar` defaults to `proleptic_gregorian`. `standard` and `gregorian` are aliases of it. A date before 1582-10-15 on a Gregorian axis follows the proleptic rule. An alias and an unset `calendar` resolve to the same declaration.
+
+- One function, `encode_coordinate`, places every value on its axis for every calendar. A Gregorian value takes a fast path that needs no time-coding library. The engine has no calendar arithmetic of its own. It delegates calendar-shaped values to the existing time-coding dependency.
+- One descriptor, `CoordinateEncoding`, selects the on-disk form. A Gregorian axis keeps the date type it always had. A non-Gregorian axis stores a CF-encoded count of a fixed unit since a reference point, with `units` and `calendar` attrs.
+- The coordinate of a non-Gregorian axis must be complete before any ingest run. `firecube zarr preallocate` writes it. Ingest verifies incoming values against it. Ingest never creates or fills it.
+- A non-Gregorian calendar with observed (`floor`) placement or an open-ended `end_date` raises at declaration time. The message names the supported alternative.
+- A value on a calendar that the axis does not declare is refused. A Gregorian value given to a non-Gregorian axis is refused.
+- The persisted index record and the group identity include the calendar only when it is not Gregorian-like. Every existing store, index record and identity hash stays byte-identical.
+- `firecube archive create --archive-format tensogram` refuses a store whose time coordinate is on a non-Gregorian calendar. The message names the coordinate. The run is recorded failed. `--archive-format zip` copies the store, so it keeps `units`, `calendar` and values. `archive restore` restores a `.zip` or a `.tgm`. A restore of a `.tgm` does not restore the CF encoding (see `plans/TODO.md`).
+- `firecube zarr validate` treats the fill value of an encoded calendar coordinate as missing. It keeps duplicate detection for every other coordinate.
+
+**Decision (2026-10-10, review fixes).**
+
+- A bare number on a Gregorian regular axis stays a `TypeError`, as in 0.1.7.
+- The `datetime64[ns]` range check is at the shared Gregorian conversion. `gregorian_to_datetime64_ns` refuses an instant outside 1677-09-21 to 2262-04-11 and raises `Datetime64RangeError`. The conversion of plugin coordinate values to `datetime64[ns]` goes through it. The legacy timestamp writer applies it only when the stored coordinate dtype is `datetime64[ns]`. Conversions to epoch seconds, `encode_coordinate` and slot position accept later dates.
+- Re-materialization of a stored coordinate is refused before any write when its epoch, `units` or calendar would change. The coordinate checks raise `CoordinateRelabelError`. The preflight runs for all groups before the first group is written.
+- `chunks list --time-range` and `chunks delete --time-range` refuse spans whose bounds cannot be compared, for example a `360_day` 30 February. They delete nothing. The refusal is opt-in on the control-plane filter, so force-reingest and resume keep working on a `360_day` store.
+- A consolidated snapshot of a child group does not hide a calendar coordinate from the relabel check. The check reads the array by its full path from a live root.
+- `firecube zarr validate` and `consolidate-time-coord` treat an integer coordinate as a calendar coordinate only when its `calendar` attr is not Gregorian-like. A Gregorian integer coordinate that carries `units` and `calendar` keeps ordinary handling.
+
+**Consequences.**
+
+- A plugin author declares the data calendar, or writes `calendar="standard"` for clarity. A Gregorian declaration gives the same store as before.
+- A staged time coordinate on a non-Gregorian calendar no longer crashes the second ingest run and no longer records empty coverage bounds.
+- A coordinate-resolution error names the calendar of the value and of the axis.
+- `firecube zarr index show --derived` and the preallocate dry run render calendar dates on the axis calendar.
+- `firecube zarr consolidate-time-coord` changes nothing on a calendar store, because preallocate left the coordinate complete.
+- The startup check that refuses a non-Gregorian group with an unpreallocated coordinate always resolves the final target. A staged ingest is not refused by mistake.
+
+**Coverage.** Landed test homes, by behaviour:
+
+- Axis declaration, calendar names, encoding, identity hash and resolution: `tests/unit/test_time_encode.py`, `tests/unit/test_time_axis_declaration.py`, `tests/unit/test_group_identity_hash.py`, `tests/unit/test_index_resolve_irregular.py`, `tests/unit/test_index_binding.py`, `tests/unit/test_as_resolved_index_record.py`.
+- Decode and range guard: `tests/unit/test_time_decode.py`, `tests/unit/test_epoch_parse_helper.py`, `tests/unit/test_zarr_fill.py`.
+- Coordinate materialization and relabel refusal: `tests/unit/test_materialize_regular_coord_array.py`, `tests/unit/test_materialize_irregular_coord_array.py`, `tests/unit/test_coord_rematerialization.py`.
+- Writer, startup and compile error: `tests/unit/test_region_zarr_writer.py`, `tests/unit/test_pod_startup_phantom_group.py`, `tests/unit/test_indexed_write_compile.py`, `tests/unit/test_indexed_write_exception.py`.
+- Preallocate and ingest through the CLI: `tests/unit/test_cli_zarr_preallocate.py`, `tests/integration/test_preallocate_regular_axis_dense.py`, `tests/integration/test_irregular_axis_pipeline.py`, `tests/integration/test_zarr_index_show_derived.py`.
+- Append, coverage and time-range refusal: `tests/integration/test_cf_time_dim_value_dedup.py`, `tests/unit/test_append_coverage_builder_time_decode.py`, `tests/unit/test_append_overwrite_errors.py`, `tests/unit/test_chunk_manager_queries.py`, `tests/unit/test_chunks_list_cli.py`, `tests/unit/test_cli_chunks_delete.py`.
+- Validate, consolidate and archive: `tests/unit/test_validate_time_coord_uniqueness.py`, `tests/integration/test_consolidate_time_coord_command.py`, `tests/unit/test_tensogram_core.py`, `tests/cli/test_archive_create_contract.py`.
+- The branch keeps no byte-parity manifest test. The Gregorian layout is unchanged. The landing of 2026-10-20 records that 9576ad3 rebuilds the three Gregorian scenarios of that manifest byte for byte.
 
 ## 2026-09-18 — Ingest hot-path scan fixes
 
@@ -685,7 +1096,7 @@ A production DirectZarr plugin's ingest failed under the pinned `numpy>=2.3.3` r
 - `write_1d` contract now documented explicitly: "write exactly one timestamp slot" — never multi-slot.
 - Callers that previously wrote 0-D scalars OR 1-elem ndarrays are unaffected.
 - Callers passing multi-element ndarrays to 1-D targets (previously silently mis-writing via numpy 1.x broadcast) now fail loudly with `ValueError`. No such caller was found in firecube-core; external plugins should validate their payload construction.
-- Blast radius bounded: only `region_writer.py:639` had the failing pattern; `write_timestamp:693` uses 0-D scalar (safe), `write_region` uses `y_slice` (safe), `write_static` uses `arr[...]` (safe), `state.py:212` uses scalar-to-slice fill (safe).
+- Blast radius bounded: only `RegionZarrWriter.write_1d` in `region_writer.py` had the failing pattern; `write_timestamp` uses 0-D scalar (safe), `write_region` uses `y_slice` (safe), `write_static` uses `arr[...]` (safe), `state.py:212` uses scalar-to-slice fill (safe).
 - Tech debt flagged (out of scope for this fix): `write_1d` is a poorly-named method (a slot payload, not necessarily a 1-D array). Future rename candidate: `write_slot_payload` or `write_time_indexed_intent`.
 
 ### Verified

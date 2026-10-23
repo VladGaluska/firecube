@@ -45,6 +45,7 @@ from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.runtime.zarr.write import derive_effective_codecs_for_spec
 from firecube.ingestor.templates.config import ZarrTemplateConfig
 from firecube.ingestor.templates.direct_zarr import ZarrArraySpec
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.integration
 
@@ -123,64 +124,57 @@ def test_e2e_2_per_array_empty_compressors_uncompressed(tmp_path) -> None:
     )
 
 
-def test_e2e_3_resume_same_config_no_drift(tmp_path) -> None:
-    """Resuming with identical codec config raises no SchemaDriftError."""
-    store_path = str(tmp_path / "cube.zarr")
-    spec = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5}},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    filters, serializer, compressors = derive_effective_codecs_for_spec(spec, template)
-
-    writer_v1 = RegionZarrWriter(f"file://{store_path}")
-    writer_v1.ensure_group(
-        "g/data",
-        shape=(10,),
-        dtype="f4",
-        filters=filters,
-        serializer=serializer,
-        compressors=compressors,
-    )
-
-    writer_v2 = RegionZarrWriter(f"file://{store_path}")
-    writer_v2.verify_array_spec("g/data", spec, 10)
+def _blosc(clevel: int) -> tuple[dict[str, Any], ...]:
+    return ({"name": "blosc", "configuration": {"cname": "zstd", "clevel": clevel}},)
 
 
-def test_e2e_4_resume_different_codec_raises_drift(tmp_path) -> None:
-    """Resuming with changed codec config raises SchemaDriftError naming the field."""
-    store_path = str(tmp_path / "cube.zarr")
-    spec_v1 = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5}},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    filters, serializer, compressors = derive_effective_codecs_for_spec(spec_v1, template)
+# Resume rows: (old test name, array, shape, dtype, time_indexed, resume clevel, extent).
+# The cube is created at clevel 5; a resume at another level must raise drift naming
+# ``compressors`` (static arrays are not exempt), the same level must not.
+_RESUME_ROWS = [
+    ("test_e2e_3_resume_same_config_no_drift", "data", (10,), "f4", True, 5, 10),
+    ("test_e2e_4_resume_different_codec_raises_drift", "data", (10,), "f4", True, 9, 10),
+    ("test_e2e_6_static_array_codec_drift", "lat", (100, 100), "f8", False, 9, 0),
+]
 
-    writer_v1 = RegionZarrWriter(f"file://{store_path}")
-    writer_v1.ensure_group(
-        "g/data",
-        shape=(10,),
-        dtype="f4",
-        filters=filters,
-        serializer=serializer,
-        compressors=compressors,
-    )
 
-    spec_v2 = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 9}},),
-    )
-    writer_v2 = RegionZarrWriter(f"file://{store_path}")
-    with pytest.raises(SchemaDriftError) as exc_info:
-        writer_v2.verify_array_spec("g/data", spec_v2, 10)
-    assert "compressors" in str(exc_info.value), str(exc_info.value)
+def test_e2e_resume_codec_drift(tmp_path, subtests: pytest.Subtests) -> None:
+    """Resume with the created codec config passes; a changed compressor level is drift."""
+    for row_id, name, shape, dtype, time_indexed, clevel, extent in _RESUME_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            store_path = str(workdir / "cube.zarr")
+            spec_v1 = ZarrArraySpec(
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                time_indexed=time_indexed,
+                compressors=_blosc(5),
+            )
+            template = ZarrTemplateConfig(zarr_compression=True)
+            filters, serializer, compressors = derive_effective_codecs_for_spec(spec_v1, template)
+            RegionZarrWriter(f"file://{store_path}").ensure_group(
+                f"g/{name}",
+                shape=shape,
+                dtype=dtype,
+                filters=filters,
+                serializer=serializer,
+                compressors=compressors,
+            )
+
+            spec_v2 = ZarrArraySpec(
+                name=name,
+                shape=shape,
+                dtype=dtype,
+                time_indexed=time_indexed,
+                compressors=_blosc(clevel),
+            )
+            writer_v2 = RegionZarrWriter(f"file://{store_path}")
+            if clevel == 5:
+                writer_v2.verify_array_spec(f"g/{name}", spec_v2, extent)
+            else:
+                with pytest.raises(SchemaDriftError) as exc_info:
+                    writer_v2.verify_array_spec(f"g/{name}", spec_v2, extent)
+                assert "compressors" in str(exc_info.value), str(exc_info.value)
 
 
 def test_e2e_5_sharded_with_codec(tmp_path) -> None:
@@ -223,42 +217,6 @@ def test_e2e_5_sharded_with_codec(tmp_path) -> None:
     assert existing_shards is not None and tuple(existing_shards) == (50, 50), (
         f"expected shards=(50, 50), got {existing_shards!r}"
     )
-
-
-def test_e2e_6_static_array_codec_drift(tmp_path) -> None:
-    """Static (``time_indexed=False``) array with changed codec raises SchemaDriftError."""
-    store_path = str(tmp_path / "cube.zarr")
-    spec_v1 = ZarrArraySpec(
-        name="lat",
-        shape=(100, 100),
-        dtype="f8",
-        time_indexed=False,
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5}},),
-    )
-    template = ZarrTemplateConfig(zarr_compression=True)
-    filters, serializer, compressors = derive_effective_codecs_for_spec(spec_v1, template)
-
-    writer_v1 = RegionZarrWriter(f"file://{store_path}")
-    writer_v1.ensure_group(
-        "g/lat",
-        shape=(100, 100),
-        dtype="f8",
-        filters=filters,
-        serializer=serializer,
-        compressors=compressors,
-    )
-
-    spec_v2 = ZarrArraySpec(
-        name="lat",
-        shape=(100, 100),
-        dtype="f8",
-        time_indexed=False,
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 9}},),
-    )
-    writer_v2 = RegionZarrWriter(f"file://{store_path}")
-    with pytest.raises(SchemaDriftError) as exc_info:
-        writer_v2.verify_array_spec("g/lat", spec_v2, 0)
-    assert "compressors" in str(exc_info.value), str(exc_info.value)
 
 
 def test_e2e_7_backward_compat_zarr_default(tmp_path) -> None:

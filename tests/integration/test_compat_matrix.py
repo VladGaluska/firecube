@@ -41,79 +41,27 @@ from tests.fixtures.cf_dataset_fixtures import (
     make_cf_compliant_dataset,
     make_legacy_timestamp_dataset,
 )
+from tests.helpers.rows import table_row
+
+# New-cube rows 1-3: (row id = former test name, declared dim).
+_NEW_CUBE_ROWS = (
+    ("test_row1_new_cube_timestamp_dim_allowed", "timestamp"),
+    ("test_row2_new_cube_time_dim_allowed", "time"),
+    ("test_row3_new_cube_arbitrary_dim_allowed", "foo"),
+)
 
 
-@pytest.mark.integration
-def test_row1_new_cube_timestamp_dim_allowed(tmp_path):
-    """Row 1: no existing cube + declared='timestamp' → no error (will be written fresh)."""
-    target = str(tmp_path / "row1.zarr")
-    verify_dim_compatibility(target, "timestamp", group_paths=["."], storage_config=None)
-
-
-@pytest.mark.integration
-def test_row2_new_cube_time_dim_allowed(tmp_path):
-    """Row 2: no existing cube + declared='time' → no error."""
-    target = str(tmp_path / "row2.zarr")
-    verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
-
-
-@pytest.mark.integration
-def test_row3_new_cube_arbitrary_dim_allowed(tmp_path):
-    """Row 3: no existing cube + declared='foo' (any other) → no error."""
-    target = str(tmp_path / "row3.zarr")
-    verify_dim_compatibility(target, "foo", group_paths=["."], storage_config=None)
-
-
-@pytest.mark.integration
-def test_row4_existing_timestamp_matches_timestamp(tmp_path):
-    """Row 4: existing 'timestamp' cube + declared='timestamp' → append OK (back-compat)."""
-    target = str(tmp_path / "row4.zarr")
+def _legacy_timestamp_cube(target: str) -> None:
     make_legacy_timestamp_dataset().to_zarr(target, mode="w", zarr_format=3, consolidated=False)
-    verify_dim_compatibility(target, "timestamp", group_paths=["."], storage_config=None)
 
 
-@pytest.mark.integration
-def test_row5_existing_timestamp_mismatch_time_fails_with_guidance(tmp_path):
-    """Row 5: existing 'timestamp' cube + declared='time' → FAIL with migration guidance."""
-    target = str(tmp_path / "row5.zarr")
-    make_legacy_timestamp_dataset().to_zarr(target, mode="w", zarr_format=3, consolidated=False)
-    with pytest.raises(ConfigurationError) as exc:
-        verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
-    msg = str(exc.value)
-    assert "Refusing to append" in msg
-    assert "declared time dimension" in msg
-    assert "migrate the existing cube" in msg
-
-
-@pytest.mark.integration
-def test_row6_existing_time_matches_time(tmp_path):
-    """Row 6: existing 'time' cube + declared='time' → append OK."""
-    target = str(tmp_path / "row6.zarr")
+def _cf_time_cube(target: str) -> None:
     make_cf_compliant_dataset(time_dim="time").to_zarr(
         target, mode="w", zarr_format=3, consolidated=False
     )
-    verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
 
 
-@pytest.mark.integration
-def test_row7_existing_time_mismatch_timestamp_fails_with_guidance(tmp_path):
-    """Row 7: existing 'time' cube + declared='timestamp' → FAIL with migration guidance."""
-    target = str(tmp_path / "row7.zarr")
-    make_cf_compliant_dataset(time_dim="time").to_zarr(
-        target, mode="w", zarr_format=3, consolidated=False
-    )
-    with pytest.raises(ConfigurationError) as exc:
-        verify_dim_compatibility(target, "timestamp", group_paths=["."], storage_config=None)
-    msg = str(exc.value)
-    assert "Refusing to append" in msg
-    assert "declared time dimension" in msg
-    assert "migrate the existing cube" in msg
-
-
-@pytest.mark.integration
-def test_row8_ambiguous_both_dims_fails(tmp_path):
-    """Row 8: existing cube with BOTH 'time' AND 'timestamp' dims → FAIL with ambiguous diagnostic."""
-    target = str(tmp_path / "row8.zarr")
+def _ambiguous_cube(target: str) -> None:
     ambiguous = xr.Dataset(
         {
             "temperature": (
@@ -124,7 +72,58 @@ def test_row8_ambiguous_both_dims_fails(tmp_path):
         coords={"time": [0, 1], "timestamp": [0, 1], "lat": [10, 20, 30]},
     )
     ambiguous.to_zarr(target, mode="w", zarr_format=3, consolidated=False)
-    with pytest.raises(ConfigurationError) as exc:
-        verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
-    msg = str(exc.value)
-    assert any(token in msg.lower() for token in ("ambiguous", "both", "conflicting"))
+
+
+# Existing-cube rows 4-7: (row id = former test name, cube writer, declared dim,
+# whether the append must be refused with migration guidance).
+_EXISTING_CUBE_ROWS = (
+    ("test_row4_existing_timestamp_matches_timestamp", _legacy_timestamp_cube, "timestamp", False),
+    (
+        "test_row5_existing_timestamp_mismatch_time_fails_with_guidance",
+        _legacy_timestamp_cube,
+        "time",
+        True,
+    ),
+    ("test_row6_existing_time_matches_time", _cf_time_cube, "time", False),
+    (
+        "test_row7_existing_time_mismatch_timestamp_fails_with_guidance",
+        _cf_time_cube,
+        "timestamp",
+        True,
+    ),
+)
+
+
+@pytest.mark.integration
+def test_new_cube_accepts_any_declared_dim(tmp_path, subtests: pytest.Subtests):
+    """Rows 1-3: no existing cube, any declared dim -> no error (written fresh)."""
+    for row_id, declared in _NEW_CUBE_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            target = str(workdir / "cube.zarr")
+            verify_dim_compatibility(target, declared, group_paths=["."], storage_config=None)
+
+
+@pytest.mark.integration
+def test_existing_cube_dim_compatibility(tmp_path, subtests: pytest.Subtests):
+    """Rows 4-8: matching dims append, mismatches and ambiguity are refused."""
+    for row_id, make_cube, declared, refused in _EXISTING_CUBE_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            target = str(workdir / "cube.zarr")
+            make_cube(target)
+            if not refused:
+                verify_dim_compatibility(target, declared, group_paths=["."], storage_config=None)
+                continue
+            with pytest.raises(ConfigurationError) as exc:
+                verify_dim_compatibility(target, declared, group_paths=["."], storage_config=None)
+            msg = str(exc.value)
+            assert "Refusing to append" in msg
+            assert "declared time dimension" in msg
+            assert "migrate the existing cube" in msg
+
+    with table_row(subtests, "test_row8_ambiguous_both_dims_fails", tmp_path) as (workdir, _mp):
+        target = str(workdir / "cube.zarr")
+        _ambiguous_cube(target)
+        with pytest.raises(ConfigurationError) as exc:
+            verify_dim_compatibility(target, "time", group_paths=["."], storage_config=None)
+        msg = str(exc.value)
+        assert any(token in msg.lower() for token in ("ambiguous", "both", "conflicting"))

@@ -100,22 +100,6 @@ def test_dry_run_help_shows_flag() -> None:
     assert "--dry-run" in result.output
 
 
-def test_dry_run_exits_zero(tmp_path: Path) -> None:
-    target_dir = tmp_path / "out.zarr"
-    result = CliRunner().invoke(cli, _dry_run_args(target_dir))
-    assert result.exit_code == 0, result.output
-
-
-def test_dry_run_output_is_valid_json_with_required_keys(tmp_path: Path) -> None:
-    target_dir = tmp_path / "out.zarr"
-    result = CliRunner().invoke(cli, _dry_run_args(target_dir))
-    assert result.exit_code == 0, result.output
-    parsed = json.loads(result.stdout)
-    assert "identity_hash" in parsed
-    assert "index" in parsed
-    assert len(parsed["identity_hash"]) == 64
-
-
 def test_dry_run_makes_no_filesystem_mutations(tmp_path: Path) -> None:
     target_dir = tmp_path / "out.zarr"
     before = set(tmp_path.rglob("*"))
@@ -138,6 +122,7 @@ def test_dry_run_output_is_deterministic(tmp_path: Path) -> None:
     payload = json.loads(r1.stdout)
     assert payload["recorded_at"] == "dry-run"
     assert len(payload["identity_hash"]) == 64
+    assert "index" in payload
 
 
 def test_dry_run_identity_hash_equals_real_preallocate(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,7 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
+from tests.helpers.rows import table_row
 
 
 class _DummyZarrIngestor(GenericZarrIngestor):
@@ -44,60 +46,63 @@ class _DummyZarrIngestor(GenericZarrIngestor):
 
 
 @pytest.mark.unit
-def test_on_pipeline_start_warns_when_parallel_writes_are_serialized(caplog, tmp_path):
-    ingestor = _DummyZarrIngestor(name="dummy_zarr")
-    ingestor.engine_config = EngineConfig(duckdb_persist_batches=False)
+def test_on_pipeline_start_checks(subtests: Any, tmp_path: Path, caplog) -> None:
+    with table_row(
+        subtests, "on_pipeline_start_warns_when_parallel_writes_are_serialized", tmp_path
+    ) as (workdir, _):
+        ingestor = _DummyZarrIngestor(name="dummy_zarr")
+        ingestor.engine_config = EngineConfig(duckdb_persist_batches=False)
 
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=4,
-        batch_size=8,
-        batches=(),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-    )
-    input_ctx = IngestContext(source=".", target="out.zarr", output_format="zarr")
-    runtime_ctx = RuntimeIngestContext.from_ingest_context(
-        input_ctx,
-        run_id="run-1",
-        temp_root=tmp_path,
-        materializer=lambda source: Path(source),
-    )
-    ctx = PluginContext(runtime_ctx)
+        state = PipelineRunState(
+            product="dummy",
+            pipeline_workers=4,
+            batch_size=8,
+            batches=(),
+            ingestion_start_time=0.0,
+            batch_creation_duration=0.0,
+            processing_start_time=0.0,
+        )
+        input_ctx = IngestContext(source=".", target="out.zarr", output_format="zarr")
+        runtime_ctx = RuntimeIngestContext.from_ingest_context(
+            input_ctx,
+            run_id="run-1",
+            temp_root=workdir,
+            materializer=lambda source: Path(source),
+        )
+        ctx = PluginContext(runtime_ctx)
 
-    with caplog.at_level(logging.WARNING, logger="firecube.ingestor.dummy_zarr"):
-        ingestor.on_pipeline_start(ctx, state)
+        with caplog.at_level(logging.WARNING, logger="firecube.ingestor.dummy_zarr"):
+            ingestor.on_pipeline_start(ctx, state)
 
-    assert any(
-        "appends commit in batch order" in rec.message and "prepare_batch_data" in rec.message
-        for rec in caplog.records
-    )
+        assert any(
+            "appends commit in batch order" in rec.message and "prepare_batch_data" in rec.message
+            for rec in caplog.records
+        )
 
+    with table_row(
+        subtests, "on_pipeline_start_requires_duckdb_hooks_when_persist_enabled", tmp_path
+    ) as (workdir, _):
+        ingestor = _DummyZarrIngestor(name="dummy_zarr_no_duck")
+        ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
 
-@pytest.mark.unit
-def test_on_pipeline_start_requires_duckdb_hooks_when_persist_enabled(tmp_path):
-    ingestor = _DummyZarrIngestor(name="dummy_zarr_no_duck")
-    ingestor.engine_config = EngineConfig(duckdb_persist_batches=True)
+        state = PipelineRunState(
+            product="dummy",
+            pipeline_workers=1,
+            batch_size=8,
+            batches=(),
+            ingestion_start_time=0.0,
+            batch_creation_duration=0.0,
+            processing_start_time=0.0,
+        )
+        input_ctx = IngestContext(source=".", target="out.zarr", output_format="zarr")
+        runtime_ctx = RuntimeIngestContext.from_ingest_context(
+            input_ctx,
+            run_id="run-1",
+            temp_root=workdir,
+            materializer=lambda source: Path(source),
+        )
+        runtime_ctx.in_memory = False
+        ctx = PluginContext(runtime_ctx)
 
-    state = PipelineRunState(
-        product="dummy",
-        pipeline_workers=1,
-        batch_size=8,
-        batches=(),
-        ingestion_start_time=0.0,
-        batch_creation_duration=0.0,
-        processing_start_time=0.0,
-    )
-    input_ctx = IngestContext(source=".", target="out.zarr", output_format="zarr")
-    runtime_ctx = RuntimeIngestContext.from_ingest_context(
-        input_ctx,
-        run_id="run-1",
-        temp_root=tmp_path,
-        materializer=lambda source: Path(source),
-    )
-    runtime_ctx.in_memory = False
-    ctx = PluginContext(runtime_ctx)
-
-    with pytest.raises(ConfigurationError, match="duckdb_persist_batches=true requires"):
-        ingestor.on_pipeline_start(ctx, state)
+        with pytest.raises(ConfigurationError, match="duckdb_persist_batches=true requires"):
+            ingestor.on_pipeline_start(ctx, state)

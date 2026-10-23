@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from firecube.core.zarr.region_writer import _array_is_all_fill
+from firecube.core.zarr._fill import _array_is_all_fill
 
 pytestmark = pytest.mark.unit
 

@@ -28,9 +28,9 @@ firecube chunks runs list \
 A stuck run usually appears as `started`:
 
 ```text
-Run ID            Status   State   Parts Events
-------------------------------------------------
-docs-started-run  started  active  1     1
+Run ID                               Status     State    Parts Events
+--------------------------------------------------------------------------------
+docs-started-run                     started    active   1     1
 ```
 
 Confirm the original process is no longer active before abandoning the run.
@@ -70,7 +70,27 @@ Expected output:
 
 ```text
 Abandoned run docs-started-run for MY_PRODUCT.zarr
+Released claim MY_PRODUCT:zarr_region:F001
+Released claim MY_PRODUCT:zarr_region:F002
 ```
+
+The abandon also releases the write claims that only this run owns. Each
+`Released claim` line names the domain of one released claim.
+
+The abandon keeps a claim and prints a `Left claim` line in two cases. More
+than one run can own the claim, or another writer replaced the claim during
+the release:
+
+```text
+Left claim MY_PRODUCT:zarr_region:F001
+```
+
+Do not clear a left claim blindly. List the claims to see the current owner.
+Confirm that its writer is stopped, then clear the claim. See
+[Clear A Blocking Claim](#clear-a-blocking-claim).
+
+If the run is already terminal, the command keeps its status. It still
+releases the claims that the run owns.
 
 Verify:
 
@@ -82,9 +102,28 @@ firecube chunks runs list \
 Expected output:
 
 ```text
-Run ID            Status     State   Parts Events
---------------------------------------------------
-docs-started-run  abandoned  active  2     2
+Run ID                               Status     State    Parts Events
+--------------------------------------------------------------------------------
+docs-started-run                     abandoned  active   2     2
+```
+
+### If The Claims Cannot Be Listed
+
+If Firecube cannot list the claims of the product, it still records the
+abandon. The command then exits 1 and releases no claim:
+
+```text
+Error: The write claims of MY_PRODUCT.zarr could not be listed: [Errno 13] Permission denied: '/data/products/MY_PRODUCT.zarr/.firecube/claims'.
+Run docs-started-run is recorded abandoned; run the abandon again to release its claims:
+  firecube chunks runs abandon --product-name file:///data/products/MY_PRODUCT.zarr --run-id docs-started-run --reason "<reason>"
+```
+
+Fix the cause of the listing error. Then run the same abandon command again:
+
+```text
+Run docs-started-run already terminal with status=abandoned
+Released claim MY_PRODUCT:zarr_region:F001
+Released claim MY_PRODUCT:zarr_region:F002
 ```
 
 ## Inspect Claims
@@ -98,21 +137,26 @@ firecube chunks claims list --product-name "$PRODUCT_URI"
 Expected output when a claim exists:
 
 ```text
-Product       State   Owner                 Domain
----------------------------------------------------------------------------
-MY_PRODUCT.zarr  active  docs-started-run:F024 MY_PRODUCT:zarr_region:F024
+Product                  State    Owner                    Domain
+--------------------------------------------------------------------------------------------
+MY_PRODUCT.zarr          active   docs-started-run:F001    MY_PRODUCT:zarr_region:F001
 ```
 
 The `Domain` value is the exact value to pass to `--domain`.
 
 ## Clear A Blocking Claim
 
+Use `chunks claims clear` for a claim that no single run owns. The abandon
+leaves such a claim in place and prints it as `Left claim`. A successor can
+also own a left claim now. Verify that the current owner is stopped before
+you clear it.
+
 Clear a stale claim in non-interactive context:
 
 ```bash
 firecube chunks claims clear \
   --product-name "$PRODUCT_URI" \
-  --domain MY_PRODUCT:zarr_region:F024 \
+  --domain MY_PRODUCT:zarr_region:F001 \
   --yes-i-really-mean-it
 ```
 
@@ -122,7 +166,7 @@ cleared even though it does not look stale:
 ```bash
 firecube chunks claims clear \
   --product-name "$PRODUCT_URI" \
-  --domain MY_PRODUCT:zarr_region:F024 \
+  --domain MY_PRODUCT:zarr_region:F001 \
   --force \
   --yes-i-really-mean-it
 ```
@@ -130,7 +174,7 @@ firecube chunks claims clear \
 Expected output:
 
 ```text
-Cleared claim for MY_PRODUCT:zarr_region:F024
+Cleared claim for MY_PRODUCT:zarr_region:F001
 ```
 
 Verify:
@@ -147,9 +191,9 @@ No claims found.
 
 ## Resume Ingestion
 
-After the stuck run is abandoned and stale claims are cleared, rerun ingestion
-with `--option resume_existing=true` so the batches that already succeeded are
-kept:
+After you abandon the stuck run and clear every claim that remains, rerun
+ingestion with `--option resume_existing=true`. This keeps the batches that
+already succeeded:
 
 ```bash
 firecube ingest <plugin> \
@@ -207,8 +251,10 @@ exits 1, resolve the reported validation issues before using the product.
 
 | Symptom | Meaning | Recovery |
 |---|---|---|
-| `started` run blocks resume | Firecube cannot prove the old process is dead. | Verify the process is gone, then use `chunks runs abandon`. |
-| Claim remains after crash | The writer did not release its claim. | Verify no writer is active, then use `chunks claims clear`. |
+| `started` run blocks resume | Firecube cannot prove the old process is dead. | Verify the process is gone, then use `chunks runs abandon`. It also releases the claims that only this run owns. |
+| `chunks runs abandon` exits 1 with "could not be listed" | Firecube recorded the abandon but could not list the claims. | Fix the listing error, then run the same abandon again. |
+| `Left claim` line after an abandon | More than one run can own the claim, or another writer replaced it. | Inspect the current owner with `chunks claims list`. Verify that writer is stopped, then use `chunks claims clear`. |
+| Claim remains after crash | No abandon covers the claim. | Verify no writer is active, then use `chunks claims clear`. |
 | Claim does not look stale | The heartbeat timestamp is still recent. | Use `--force` only if the writer is gone. |
 | Run ends with `status=failed` and "later batch(es) were not attempted" | Append ingestion stopped before processing all inputs. | Fix the reported error, then [recover the failed batch](#recover-from-a-failed-batch). |
 | Rerun refused: "spans from a failed run exist" | The retry needs an explicit choice about keeping earlier work. | Follow [Recover From A Failed Batch](#recover-from-a-failed-batch) for the original write mode. |

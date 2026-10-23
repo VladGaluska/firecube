@@ -178,3 +178,21 @@ class CFTimeDimValueDedupIngestor(DirectZarrIngestor):
                 kind="1d",
             ),
         ]
+
+
+@register_ingestor("cf_time_dim_calendar")
+class CFTimeDimCalendarIngestor(GenericZarrIngestor):
+    PRODUCT_NAME: ClassVar[str] = "cf_time_dim_calendar"
+    time_dim_name: ClassVar[str] = "time"
+
+    def build_dataset(
+        self, group: str, items: list[object], ctx: PluginContext
+    ) -> xr.Dataset | None:
+        calendar, start = (
+            str(ctx.option("x_calendar", "360_day")),
+            str(ctx.option("x_start", "2049-01-29")),
+        )
+        times = xr.date_range(start, periods=5, freq="1D", calendar=calendar, use_cftime=True)
+        return xr.Dataset(
+            {"value": ("time", np.arange(5, dtype=np.float32))}, coords={"time": times}
+        )

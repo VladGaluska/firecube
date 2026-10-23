@@ -62,6 +62,8 @@ def test_core_independence():
 
             if imp.startswith("firecube.plugins"):
                 pytest.fail(f"Layer violation in {path.relative_to(PROJECT_ROOT)}: imports {imp}")
+            if imp.split(".")[0] == "click":
+                pytest.fail(f"Click violation in {path.relative_to(PROJECT_ROOT)}: imports {imp}")
 
             # Strict API usage check
             if "register_ingestor" in imp and "firecube.ingestor.api" not in imp:

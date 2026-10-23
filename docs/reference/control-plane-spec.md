@@ -155,8 +155,31 @@ Semantics:
   the claim, even a stale one.
 - Release deletes the file.
 - A claim is stale when `now - last_heartbeat_at > stale_threshold_s`. A
-  crashed owner leaves a stale claim behind; operators clear stale claims with
-  the recovery tooling, which refuses to clear fresh claims unless forced.
+  crashed owner leaves a stale claim behind. Operators clear stale claims with
+  `firecube chunks claims clear`, which refuses to clear fresh claims unless
+  forced.
+- Abandoning a run releases every claim whose owner id resolves to that run
+  alone. The release applies to fresh and stale claims. The claim file stays in
+  place if its owner or `acquired_at` changed after the claims were listed.
+- An owner id resolves through its candidates: the id itself and each prefix
+  that ends just before a `:`. The claim is released only if exactly one
+  candidate is a recorded run, and that run is the abandoned one.
+- A sweep of stale runs also releases the claims of a run that an earlier
+  abandon already ended. A sweep that a crash interrupted therefore finishes
+  its release when it runs again.
+- The `firecube chunks runs abandon --all-stale` sweep releases a claim of a
+  terminal run only if the claim is stale when re-read before the delete.
+  Its dry run reports the claims it would release and the claims it would leave.
+- If the claims of the product cannot be listed, the abandon reports an error
+  and does not report success. Run the abandon again to release the claims.
+- Acquisition does not change. A claim that the release left in place still
+  blocks acquisition of its domain.
+
+Known limitation: a release reads the claim again, then deletes the file. These
+are two separate operations. If two releases run at the same time, one can
+delete a claim that a successor acquired between the read and the delete.
+`firecube chunks claims clear` has the same limitation. Do not run two releases
+for the same product at the same time.
 
 See [Write Safety](../concepts/orchestration/write-safety.md) for how claims
 coordinate concurrent writers.
@@ -231,7 +254,15 @@ evaluated in this order:
 
 Refusals surface as documented control-plane errors, never as silent
 overwrites. Row 5 is the guard against pointing a changed declaration at an
-existing store; `firecube zarr index rebuild` is the explicit way through.
+existing store. Use the plugin that wrote the product, or a new target.
+`firecube zarr index rebuild` does not change this row.
+
+For row 4, restore `index/current.json`. Or remove the root attrs
+`firecube_resolved_index_identity_hash` and `firecube_resolved_index`, then
+run `firecube zarr index rebuild` with the plugin that wrote the data. For
+row 7, remove the root attr `firecube_resolved_index_identity_hash`, then run
+`firecube zarr index rebuild`. The command writes the attr again from the
+record. `rebuild` refuses both states while the attrs remain.
 
 ## Slot Index: `slot_index/current.json`
 

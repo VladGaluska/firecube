@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import IndexedRegionStrategy
 from firecube.ingestor.templates.direct_zarr import WriteIntent, ZarrArraySpec, ZarrGroupSpec
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -80,13 +82,18 @@ def _run(monkeypatch, *, slot_range) -> list[str]:
     return group_claims
 
 
-def test_slot_range_mode_skips_per_batch_schema_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    # Parallel pod: schema already set up at startup -> no per-batch schema claim.
-    assert _run(monkeypatch, slot_range=(0, 100)) == []
+def test_indexed_region_schema_claim_modes(
+    subtests: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with table_row(
+        subtests, "slot_range_mode_skips_per_batch_schema_claim", tmp_path, monkeypatch
+    ) as (_, mp):
+        assert mp is not None
+        assert _run(mp, slot_range=(0, 100)) == []
 
-
-def test_single_pod_still_takes_schema_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # Single-pod: §24 claim-then-ensure preserved.
-    assert _run(monkeypatch, slot_range=None) == ["data"]
+    with table_row(subtests, "single_pod_still_takes_schema_claim", tmp_path, monkeypatch) as (
+        _,
+        mp,
+    ):
+        assert mp is not None
+        assert _run(mp, slot_range=None) == ["data"]

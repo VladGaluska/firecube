@@ -21,10 +21,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+from firecube.core.errors import Message, Operation, Param, Placeholder, PluginOption
 from firecube.core.observability.metrics import ResumeGuardMetrics, resume_guard_span
 from firecube.core.zarr.validation import validate_group_with_fs
 from firecube.ingestor.errors import RangeOverlapError, ResumeConflictError
 from firecube.ingestor.runtime.resume_types import ResumeDecision, ResumeVerdict
+
+# The plugin options a refusal tells the operator to set.
+_RESUME_EXISTING = PluginOption("resume_existing", "true")
+_FORCE_REINGEST = PluginOption("force_reingest", "true")
+_VALIDATE_ZARR = PluginOption("validate_zarr", "true")
 
 
 def _ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
@@ -272,11 +278,19 @@ class ResumeGuard:
             missing_ctx_keys = [k for k in self.slice_meta_keys if k not in slice_meta]
             if missing_ctx_keys and existing_records:
                 raise ResumeConflictError(
-                    f"Existing entries for product '{product}' (plugin={self.plugin_name}) detected but "
-                    f"this run is missing slice options needed for safe matching: {missing_ctx_keys}. "
-                    "Provide those options to enable safe slice matching, or rerun with "
-                    "--option resume_existing=true / --option force_reingest=true "
-                    "(optionally --option validate_zarr=true to inspect storage; may be slow)."
+                    Message(
+                        "Existing entries for product '{product}' (plugin={plugin}) detected but "
+                        "this run is missing slice options needed for safe matching: {missing}. "
+                        "Provide those options to enable safe slice matching, or rerun with "
+                        "{resume} / {force} "
+                        "(optionally {validate} to inspect storage; may be slow).",
+                        product=product,
+                        plugin=self.plugin_name,
+                        missing=missing_ctx_keys,
+                        resume=_RESUME_EXISTING,
+                        force=_FORCE_REINGEST,
+                        validate=_VALIDATE_ZARR,
+                    )
                 )
 
             comparable: list[Any] = []
@@ -359,11 +373,20 @@ class ResumeGuard:
                 )
             )
             raise ResumeConflictError(
-                f"Pipeline run {failed_run_id!r} left {len(failed_conflicts)} succeeded span(s) in the store "
-                f"(batches: {span_summary}). "
-                "A plain re-run is refused while spans from a failed run exist. "
-                "Re-run with --option resume_existing=true to keep the succeeded batches, "
-                "or --option force_reingest=true to redo them."
+                Message(
+                    "Pipeline run {run_id!r} left {count} succeeded span(s) in the store "
+                    "(batches: {batches}). "
+                    "A plain re-run is refused while spans from a failed run exist. "
+                    "Re-run with {resume} to keep the succeeded batches, "
+                    "or {force} to redo them.",
+                    run_id=failed_run_id,
+                    count=len(failed_conflicts),
+                    batches=span_summary,
+                    resume=_RESUME_EXISTING,
+                    force=_FORCE_REINGEST,
+                    product=product,
+                    plugin=self.plugin_name,
+                )
             )
 
         if validate_zarr:
@@ -381,9 +404,14 @@ class ResumeGuard:
                     )
                 )
                 raise ResumeConflictError(
-                    f"Existing entries for product '{product}' (plugin={self.plugin_name}) detected. "
-                    "Rerun with --option resume_existing=true to continue, "
-                    "--option force_reingest=true to overwrite."
+                    Message(
+                        "Existing entries for product '{product}' (plugin={plugin}) detected. "
+                        "Rerun with {resume} to continue, {force} to overwrite.",
+                        product=product,
+                        plugin=self.plugin_name,
+                        resume=_RESUME_EXISTING,
+                        force=_FORCE_REINGEST,
+                    )
                 )
             self._log_decision(
                 ResumeDecision(
@@ -392,8 +420,13 @@ class ResumeGuard:
                 )
             )
             raise ResumeConflictError(
-                f"Manifest entries for product '{product}' (plugin={self.plugin_name}) exist but no chunks were found. "
-                "Consider scrubbing or rerun with --option force_reingest=true to overwrite."
+                Message(
+                    "Manifest entries for product '{product}' (plugin={plugin}) exist but no "
+                    "chunks were found. Consider scrubbing or rerun with {force} to overwrite.",
+                    product=product,
+                    plugin=self.plugin_name,
+                    force=_FORCE_REINGEST,
+                )
             )
 
         self._log_decision(
@@ -403,10 +436,16 @@ class ResumeGuard:
             )
         )
         raise ResumeConflictError(
-            f"Existing entries for product '{product}' (plugin={self.plugin_name}) detected. "
-            "Rerun with --option resume_existing=true to continue, "
-            "or --option force_reingest=true to overwrite. "
-            "Use --option validate_zarr=true to inspect storage (may be slow)."
+            Message(
+                "Existing entries for product '{product}' (plugin={plugin}) detected. "
+                "Rerun with {resume} to continue, or {force} to overwrite. "
+                "Use {validate} to inspect storage (may be slow).",
+                product=product,
+                plugin=self.plugin_name,
+                resume=_RESUME_EXISTING,
+                force=_FORCE_REINGEST,
+                validate=_VALIDATE_ZARR,
+            )
         )
 
     def _check_time_coord_seal(self, *, product: str, slot_group: str | None) -> None:
@@ -491,12 +530,22 @@ class ResumeGuard:
             )
             return
 
+        product_uri = self.chunk_manager.get_product_root(product)
+
+        def abandon_cmd_for(run_id: str) -> Message:
+            return Message(
+                "{abandon}\nAbandoning the run also releases the write claims it alone owns.",
+                abandon=Operation(
+                    "abandon_run",
+                    product_name=product_uri,
+                    run_id=run_id,
+                    reason=Placeholder('"<reason>"'),
+                ),
+                product_uri=product_uri,
+            )
+
         for run in non_terminal:
             existing_slot_range = run.slot_range
-            abandon_cmd = (
-                f"firecube chunks runs abandon --product-name {product} --run-id {run.run_id} "
-                '--reason "<reason>"'
-            )
 
             if slot_range is not None and existing_slot_range is None:
                 if run.stale:
@@ -507,9 +556,17 @@ class ResumeGuard:
                     )
                     continue
                 raise ResumeConflictError(
-                    f"Non-range run {run.run_id!r} is active for product '{product}'. "
-                    "Abandon it first to start a slot-range parallel run:\n"
-                    f"  {abandon_cmd}"
+                    Message(
+                        "Non-range run {run_id!r} is active for product '{product}'. "
+                        "Abandon it first to start a slot-range parallel run:\n  {abandon}",
+                        run_id=run.run_id,
+                        product=product,
+                        abandon=abandon_cmd_for(run.run_id),
+                        product_uri=product_uri,
+                        plugin=self.plugin_name,
+                        group=new_slot_group,
+                        slot_window=slot_range,
+                    )
                 )
 
             if slot_range is not None and existing_slot_range is not None:
@@ -545,20 +602,49 @@ class ResumeGuard:
                         )
                         continue
                     raise ResumeConflictError(
-                        f"Run {run.run_id!r} with same slot_range={slot_range} is active "
-                        f"for product '{product}'. Resume with --option resume_existing=true or "
-                        f"abandon:\n  {abandon_cmd}"
+                        Message(
+                            "Run {run_id!r} with same slot_range={slot_window} is active "
+                            "for product '{product}'. Resume with {resume} or "
+                            "abandon:\n  {abandon}",
+                            run_id=run.run_id,
+                            slot_window=slot_range,
+                            product=product,
+                            resume=_RESUME_EXISTING,
+                            abandon=abandon_cmd_for(run.run_id),
+                            product_uri=product_uri,
+                            plugin=self.plugin_name,
+                            group=new_slot_group,
+                        )
                     )
                 raise RangeOverlapError(
-                    f"Run {run.run_id!r} with slot_range={existing_slot_range} overlaps "
-                    f"new slot_range={slot_range} for product '{product}'. "
-                    "Overlapping ranges risk Zarr chunk corruption. "
-                    f"Abandon the conflicting run first:\n  {abandon_cmd}"
+                    Message(
+                        "Run {run_id!r} with slot_range={existing} overlaps "
+                        "new slot_range={slot_window} for product '{product}'. "
+                        "Overlapping ranges risk Zarr chunk corruption. "
+                        "Abandon the conflicting run first:\n  {abandon}",
+                        run_id=run.run_id,
+                        existing=existing_slot_range,
+                        slot_window=slot_range,
+                        product=product,
+                        abandon=abandon_cmd_for(run.run_id),
+                        product_uri=product_uri,
+                        plugin=self.plugin_name,
+                        group=new_slot_group,
+                    )
                 )
 
             raise ResumeConflictError(
-                f"Non-terminal run(s) [{run.run_id}] exist for product '{product}'. "
-                f"Abandon them first:\n  {abandon_cmd}"
+                Message(
+                    "Non-terminal run(s) [{run_id}] exist for product '{product}'. "
+                    "Abandon them first:\n  {abandon}",
+                    run_id=run.run_id,
+                    product=product,
+                    abandon=abandon_cmd_for(run.run_id),
+                    product_uri=product_uri,
+                    plugin=self.plugin_name,
+                    group=new_slot_group,
+                    slot_window=slot_range,
+                )
             )
 
     def _check_completed_spans_for_slot_overlap(
@@ -604,11 +690,22 @@ class ResumeGuard:
                     break
         if overlapping:
             raise ResumeConflictError(
-                f"Completed spans overlap new slot_range={slot_range} "
-                f"(slot_group={slot_group!r}) for product '{product}'. "
-                f"Overlapping: {overlapping[:5]}{'...' if len(overlapping) > 5 else ''}. "
-                "Rerun with --option force_reingest=true to overwrite, "
-                "or pass a disjoint --slot-start/--slot-end range."
+                Message(
+                    "Completed spans overlap new slot_range={slot_window} "
+                    "(slot_group={group!r}) for product '{product}'. "
+                    "Overlapping: {overlapping}{more}. "
+                    "Rerun with {force} to overwrite, "
+                    "or pass a disjoint {slot_start}/{slot_end} range.",
+                    slot_window=slot_range,
+                    group=slot_group,
+                    product=product,
+                    overlapping=overlapping[:5],
+                    more="..." if len(overlapping) > 5 else "",
+                    force=_FORCE_REINGEST,
+                    slot_start=Param("slot_start"),
+                    slot_end=Param("slot_end"),
+                    plugin=self.plugin_name,
+                )
             )
         return len(completed_spans)
 

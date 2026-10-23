@@ -42,7 +42,7 @@ from firecube.ingestor.types.context import (
     PluginContext,
     RuntimeIngestContext,
 )
-from tests.helpers.storage import make_test_binding, make_test_context
+from tests.helpers.storage import begin_write_session, make_test_binding, make_test_context
 
 
 class _OutputResolutionIngestor(BaseIngestor):
@@ -201,6 +201,7 @@ def test_direct_zarr_storage_handled_metric_matches_write_mode(
     batch = PipelineBatch(batch_id="batch-1", data_path=tmp_path, items=["source.nc"])
     ctx = _plugin_ctx(tmp_path)
 
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(batch, ctx)
 
     assert result.success is True

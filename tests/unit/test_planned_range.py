@@ -31,19 +31,17 @@ def test_planned_range_valid() -> None:
     assert range_.slot_end == 100
 
 
-def test_planned_range_invalid_equal() -> None:
-    with pytest.raises(ValueError, match="slot_start must be < slot_end"):
-        PlannedRange(group="g", slot_start=10, slot_end=10)
+_INVALID_RANGE_ROWS = (
+    ("test_planned_range_invalid_equal", 10, 10, "slot_start must be < slot_end"),
+    ("test_planned_range_inverted", 11, 10, "slot_start must be < slot_end"),
+    ("test_planned_range_negative_start", -1, 10, "slot_start must be >= 0"),
+)
 
 
-def test_planned_range_inverted() -> None:
-    with pytest.raises(ValueError, match="slot_start must be < slot_end"):
-        PlannedRange(group="g", slot_start=11, slot_end=10)
-
-
-def test_planned_range_negative_start() -> None:
-    with pytest.raises(ValueError, match="slot_start must be >= 0"):
-        PlannedRange(group="g", slot_start=-1, slot_end=10)
+def test_planned_range_invalid(subtests):
+    for row_id, start, end, message in _INVALID_RANGE_ROWS:
+        with subtests.test(msg=row_id), pytest.raises(ValueError, match=message):
+            PlannedRange(group="g", slot_start=start, slot_end=end)
 
 
 def test_compute_covered_ranges_inclusive_to_half_open() -> None:

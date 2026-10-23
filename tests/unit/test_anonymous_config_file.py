@@ -42,19 +42,6 @@ def _load_storage_config(
     return build_storage_config(cfg, env or {}, overrides or {})
 
 
-def test_config_file_anonymous_true_sets_storage_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    storage = _load_storage_config(
-        tmp_path,
-        monkeypatch,
-        '[storage]\ntype = "s3"\nanonymous = true\n',
-    )
-
-    assert storage.anonymous is True
-
-
 @pytest.mark.parametrize(
     ("content", "env", "overrides", "expected"),
     [

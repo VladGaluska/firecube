@@ -37,6 +37,7 @@ pytestmark = pytest.mark.integration
 
 _GROUP = "grp"
 _STATE_ARRAY = "firecube_timestamp_state"
+_ARRAYS = (_STATE_ARRAY, "timestamp")
 
 
 def _open_state_array(store_path: Path, mode: Literal["r", "r+", "a", "w", "w-"]) -> zarr.Array:
@@ -127,6 +128,34 @@ def test_workspace_corruption_inside_seeded_chunk_blocks_promotion(
 
     target_final_state = np.asarray(_open_state_array(final_store, mode="r")[:])
     assert list(target_final_state) == [1, 1, 1, 1, 0, 0, 0, 0], "Target must be untouched"
+
+
+@pytest.mark.parametrize("loop", ["state", "coordinate"])
+def test_corruption_past_group_snapshot_extent_blocks_promotion(tmp_path: Path, loop: str) -> None:
+    final_store, temp_store = tmp_path / "final.zarr", tmp_path / "temp" / "final.zarr"
+    for store in (final_store, temp_store):
+        group = zarr.open_group(str(store), mode="w", zarr_format=3).require_group(_GROUP)
+        arrays = [group.create_array(n, shape=(8,), dtype="i8", chunks=(2,)) for n in _ARRAYS]
+        zarr.consolidate_metadata(str(store), path=_GROUP)  # snapshot at 8, stores grow to 12
+        for arr, values in zip(arrays, (np.ones(12), np.arange(12)), strict=True):
+            arr.resize((12,))
+            arr[:] = values
+    name, bad = (_STATE_ARRAY, 0) if loop == "state" else ("timestamp", 999)
+    ws: Any = zarr.open_group(str(temp_store), mode="r+", use_consolidated=False)
+    ws[f"{_GROUP}/{name}"][10] = bad
+
+    with pytest.raises(IntegrityGuardError):
+        verify_post_write_integrity(
+            temp_store_uri=str(temp_store),
+            final_target_uri=str(final_store),
+            touched_chunks={_GROUP: {name: [(5,)]}},
+            session=make_local_session(str(temp_store)),
+            append_dim="timestamp",
+        )
+
+    assert not temp_store.exists(), "Workspace must be deleted on integrity failure"
+    target: Any = zarr.open_group(str(final_store), mode="r", use_consolidated=False)
+    assert target[f"{_GROUP}/{name}"][10:12].tolist() == ([1, 1] if loop == "state" else [10, 11])
 
 
 def test_untouched_slots_do_not_trigger_guard(tmp_path: Path) -> None:

@@ -19,7 +19,11 @@ from __future__ import annotations
 from enum import Enum, auto
 
 from firecube.core.errors import SchemaDriftError
-from firecube.core.zarr._sealing_markers import ATTR_COORD_MANAGED, ATTR_PREALLOCATED
+from firecube.core.zarr._sealing_markers import (
+    ATTR_COORD_MANAGED,
+    ATTR_ENGINE_OWNED,
+    ATTR_PREALLOCATED,
+)
 
 __all__ = [
     "CoordLifecycleState",
@@ -49,6 +53,7 @@ class CoordLifecycleState(Enum):
     PREALLOCATED = auto()
     COORD_MANAGED = auto()
     INVALID_BOTH_MARKERS = auto()
+    INVALID_ENGINE_OWNED_MARKER = auto()
 
 
 def resolve_coord_lifecycle(attrs: dict) -> CoordLifecycleState:
@@ -56,6 +61,9 @@ def resolve_coord_lifecycle(attrs: dict) -> CoordLifecycleState:
     has_preallocated = bool(attrs.get(ATTR_PREALLOCATED, False))
     has_coord_managed = bool(attrs.get(ATTR_COORD_MANAGED, False))
 
+    if bool(attrs.get(ATTR_ENGINE_OWNED, False)):
+        # Engine-owned per-slot arrays are never a time coordinate.
+        return CoordLifecycleState.INVALID_ENGINE_OWNED_MARKER
     if has_preallocated and has_coord_managed:
         return CoordLifecycleState.INVALID_BOTH_MARKERS
     if has_preallocated:
@@ -67,6 +75,12 @@ def resolve_coord_lifecycle(attrs: dict) -> CoordLifecycleState:
 
 def raise_if_invalid(state: CoordLifecycleState, coord_path: str) -> None:
     """Raise when the resolved coordinate lifecycle is internally inconsistent."""
+    if state is CoordLifecycleState.INVALID_ENGINE_OWNED_MARKER:
+        raise SchemaDriftError(
+            f"coordinate array {coord_path} carries {ATTR_ENGINE_OWNED}, the marker of an "
+            "engine-owned per-slot array; a time coordinate is never one, so the store "
+            "was edited out of band"
+        )
     if state is not CoordLifecycleState.INVALID_BOTH_MARKERS:
         return
 

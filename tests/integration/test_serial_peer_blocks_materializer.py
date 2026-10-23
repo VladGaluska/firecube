@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import pytest
 
+from firecube.cli._errors import render
 from firecube.core.controlplane import ChunkManager
 from firecube.core.index_resolve import resolve_index_spec
 from firecube.core.index_spec import IndexSpec, RegularTimeAxis
 from firecube.core.zarr.planning import coord_chunk_sizes_by_group
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 from firecube.ingestor.errors import ConfigurationError
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding
 
 pytestmark = [pytest.mark.integration, pytest.mark.gate]
@@ -156,7 +158,10 @@ def test_serial_ingest_first_blocks_windowed_materializer(tmp_path) -> None:
         assert "conflicting serial ingest run" in message, message
         assert _SERIAL_RUN_ID in message, message
         assert "holds full extent" in message, message
-        assert "chunks runs abandon" in message, message
+        assert "ChunkManager.abandon_run" in message and "--run-id" not in message
+        printed = render(exc_info.value)
+        assert f"--run-id {_SERIAL_RUN_ID} " in printed
+        run_hint(printed, "firecube chunks runs abandon", "--dry-run")
         assert "coordinate chunk(s)" not in message, (
             "serial-peer message must not borrow the ranged-peer chunk-overlap phrasing; "
             f"got: {message!r}"

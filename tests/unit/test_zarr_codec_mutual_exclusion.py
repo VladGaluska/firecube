@@ -20,6 +20,7 @@ import pytest
 
 from firecube.core.errors import ConfigurationError
 from firecube.ingestor.templates.config import ZarrTemplateConfig
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -44,18 +45,13 @@ def test_error_names_both_fields() -> None:
     assert "zarr_codecs" in msg
 
 
-def test_true_and_codecs_accepted() -> None:
-    entry = {"name": "blosc", "configuration": {}}
-    cfg = ZarrTemplateConfig(zarr_compression=True, zarr_codecs=[entry])
-    assert cfg.zarr_codecs == [entry]
-    assert cfg.zarr_compression is True
-
-
-def test_true_and_none_accepted() -> None:
-    cfg = ZarrTemplateConfig(zarr_compression=True, zarr_codecs=None)
-    assert cfg.zarr_compression is True
-
-
-def test_false_and_none_accepted() -> None:
-    cfg = ZarrTemplateConfig(zarr_compression=False, zarr_codecs=None)
-    assert cfg.zarr_compression is False
+def test_compatible_combinations_accepted(subtests, tmp_path) -> None:
+    for row_id, compression, codecs in [
+        ("test_true_and_codecs_accepted", True, [{"name": "blosc", "configuration": {}}]),
+        ("test_true_and_none_accepted", True, None),
+        ("test_false_and_none_accepted", False, None),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            cfg = ZarrTemplateConfig(zarr_compression=compression, zarr_codecs=codecs)
+            assert cfg.zarr_compression is compression
+            assert cfg.zarr_codecs == codecs

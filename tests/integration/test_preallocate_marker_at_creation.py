@@ -173,7 +173,7 @@ def test_existing_observed_unmarked_refuses_without_retroactive_stamp(tmp_path: 
     )
     writer = _writer(target)
 
-    with pytest.raises(SchemaDriftError, match=r"legacy.*firecube chunks"):
+    with pytest.raises(SchemaDriftError, match=r"legacy.*`ChunkManager` tooling"):
         materialize_regular_coord_array(
             writer=writer,
             root=writer._open_root(),
@@ -217,7 +217,7 @@ def test_marker_write_failure_raises_cleanup_guidance() -> None:
         def ensure_group(self, *args: Any, **kwargs: Any) -> _Arr:
             return _Arr()
 
-    with pytest.raises(SchemaDriftError, match="firecube chunks"):
+    with pytest.raises(SchemaDriftError, match="cleaned up with existing `ChunkManager` tooling"):
         materialize_regular_coord_array(
             writer=_Writer(),
             root={},

@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 # pyright: reportCallIssue=false, reportAttributeAccessIssue=false
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
 import random
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -32,7 +34,7 @@ from firecube.core.controlplane._paths import run_dir_for
 from firecube.core.controlplane.claims import ClaimHandle
 from firecube.core.controlplane.deletion import DeletionEngine
 from firecube.core.controlplane.events import ConsolidatedTimeCoord
-from firecube.core.controlplane.repo import ManifestRepository
+from firecube.core.controlplane.repo import ClaimOwner, ManifestRepository, _owner_candidates
 from firecube.core.controlplane.types import (
     EVENT_SLOT_INDEX_MODEL_RECORDED,
     EVENT_SLOT_INDEX_MODEL_VERIFIED,
@@ -61,6 +63,10 @@ from firecube.core.errors import (
     ConfigurationError,
     LegacyIndexRecordError,
     ManifestError,
+    Message,
+    Operation,
+    Placeholder,
+    ResolvedIndexAttrsConflictError,
     ResolvedIndexClaimTimeoutError,
     ResolvedIndexConflictError,
     SlotIndexModelClaimTimeoutError,
@@ -74,8 +80,22 @@ from firecube.core.slot_index import (
     SlotIndexModel,
 )
 from firecube.core.storage.binding import StorageBinding
+from firecube.core.zarr.guard._unit_locks import _store_identity
+from firecube.core.zarr.guard.metadata_authority import (
+    HeldClaim,
+    MetadataScope,
+    adopt_held_claim,
+    ensure_group,
+    hold_authority,
+    set_attributes,
+)
 
 log = logging.getLogger(__name__)
+
+# The claim a winner holds while it mirrors; unset for the Row-1 losers.
+_HELD_CLAIM: contextvars.ContextVar[HeldClaim | None] = contextvars.ContextVar(
+    "firecube_held_mirror_claim", default=None
+)
 
 
 def _format_duration(seconds: float) -> str:
@@ -553,8 +573,13 @@ class ChunkManager:
         time_max_before: str | None = None,
         time_overlaps: tuple[str, str] | None = None,
         filter_fn: Callable[[ChunkInfo], bool] | None = None,
+        refuse_unparseable: bool = False,
     ) -> list[ChunkInfo]:
         """Return projected chunk records with optional filtering.
+
+        With ``refuse_unparseable`` a time filter raises
+        ``UnparseableSpanBoundsError`` when a span's compared bounds do not
+        parse; by default such spans are left out of the result.
 
         During a force-reingest run there is a brief window where both prior
         spans and new spans have ``status="active"`` (before
@@ -586,6 +611,7 @@ class ChunkManager:
             time_max_before=time_max_before,
             time_overlaps=time_overlaps,
             filter_fn=filter_fn,
+            refuse_unparseable=refuse_unparseable,
         )
         run_started_at_by_id = (
             self._build_run_started_at_lookup(chunks)
@@ -663,6 +689,7 @@ class ChunkManager:
         coord_chunk_sizes: dict[str, int],
         slot_group: str | None = None,
         meta: dict[str, Any] | None = None,
+        whole_extent_groups: Mapping[str, int] | None = None,
     ) -> ClaimHandle:
         """Atomically reject overlapping coord-chunk peers and return a live claim.
 
@@ -672,6 +699,11 @@ class ChunkManager:
         coordinate chunk, then records this run as started while the claim is
         still held.
 
+        ``whole_extent_groups`` maps a group to its slot count when this run
+        writes the group's engine-owned arrays whole: every live ranged peer
+        on that group conflicts, whatever its window, and the recorded run
+        range covers ``[0, slot count)``.
+
         If this method raises, no run is registered and no terminalization is
         needed. If it returns normally, the caller must release the returned
         handle after materialization and record a terminal run state on every
@@ -679,7 +711,7 @@ class ChunkManager:
         """
 
         # Function-scope import: avoid module-level cycle with core.zarr.
-        from firecube.core.zarr.chunk_geometry import chunk_axis_range
+        from firecube.core.zarr.guard.chunk_geometry import chunk_axis_range
 
         domain = WriteDomain(
             product=product,
@@ -704,12 +736,20 @@ class ChunkManager:
                 if serial_peer.started_at:
                     elapsed_s = datetime.now(tz=UTC).timestamp() - float(serial_peer.started_at)
                     elapsed = f"{elapsed_s:.0f}s"
+                product_uri = self.get_product_root(product)
                 raise ConfigurationError(
-                    f"conflicting serial ingest run {serial_peer.run_id} is live "
-                    f"(holds full extent; state: {serial_peer.status}, running for {elapsed}); "
-                    f"if this run is confirmed dead, abandon it explicitly: "
-                    f"firecube chunks runs abandon {serial_peer.run_id} "
-                    f"then re-run preallocate. Automatic timeout is not implemented."
+                    Message(
+                        "conflicting serial ingest run {run_id} is live "
+                        "(holds full extent; state: {status}, running for {elapsed}); "
+                        "if this run is confirmed dead, abandon it explicitly, then re-run "
+                        "preallocate. Automatic timeout is not implemented.\n  {abandon}",
+                        run_id=serial_peer.run_id,
+                        status=serial_peer.status,
+                        elapsed=elapsed,
+                        abandon=_abandon_operation(product_uri, serial_peer.run_id),
+                        product=product,
+                        product_uri=product_uri,
+                    )
                 )
             for group, window in windows_by_group.items():
                 chunk_size = coord_chunk_sizes.get(group)
@@ -728,17 +768,55 @@ class ChunkManager:
                         if peer.started_at:
                             elapsed_s = datetime.now(tz=UTC).timestamp() - float(peer.started_at)
                             elapsed = f"{elapsed_s:.0f}s"
+                        product_uri = self.get_product_root(product)
                         raise ConfigurationError(
-                            f"group {group!r} window [{window[0]}, {window[1]}) touches "
-                            f"coordinate chunk(s) {overlap} owned by run {peer.run_id} "
-                            f"(state: {peer.status}, materializing for {elapsed}); "
-                            f"if this run is confirmed dead, abandon it explicitly: "
-                            f"firecube chunks runs abandon {peer.run_id} "
-                            f"then re-run preallocate. Automatic timeout is not implemented."
+                            Message(
+                                "group {group!r} window [{slot_window[0]}, {slot_window[1]}) "
+                                "touches coordinate chunk(s) {overlap} owned by run {run_id} "
+                                "(state: {status}, materializing for {elapsed}); "
+                                "if this run is confirmed dead, abandon it explicitly, then "
+                                "re-run preallocate. Automatic timeout is not implemented.\n"
+                                "  {abandon}",
+                                group=group,
+                                slot_window=(window[0], window[1]),
+                                overlap=overlap,
+                                run_id=peer.run_id,
+                                status=peer.status,
+                                elapsed=elapsed,
+                                abandon=_abandon_operation(product_uri, peer.run_id),
+                                product=product,
+                                product_uri=product_uri,
+                            )
                         )
+            whole = dict(whole_extent_groups or {})
+            for group in whole:
+                for peer in ranged_peers:
+                    if peer.slot_group is not None and peer.slot_group != group:
+                        continue
+                    peer_range = peer.slot_range
+                    assert peer_range is not None
+                    product_uri = self.get_product_root(product)
+                    raise ConfigurationError(
+                        Message(
+                            "group {group!r} has engine-owned arrays, which preallocate writes "
+                            "whole, but run {run_id} is live on window "
+                            "[{slot_window[0]}, {slot_window[1]}) (state: {status}); wait for "
+                            "it to finish, or if it is confirmed dead abandon it explicitly, "
+                            "then re-run preallocate. Automatic timeout is not implemented.\n"
+                            "  {abandon}",
+                            group=group,
+                            run_id=peer.run_id,
+                            slot_window=(peer_range[0], peer_range[1]),
+                            status=peer.status,
+                            abandon=_abandon_operation(product_uri, peer.run_id),
+                            product=product,
+                            product_uri=product_uri,
+                        )
+                    )
 
-            hull_start = min(window[0] for window in windows_by_group.values())
-            hull_end = max(window[1] for window in windows_by_group.values())
+            claimed = [*windows_by_group.values(), *((0, extent) for extent in whole.values())]
+            hull_start = min(window[0] for window in claimed)
+            hull_end = max(window[1] for window in claimed)
             self.record_run_started(
                 product=product,
                 run_id=run_id,
@@ -809,13 +887,144 @@ class ChunkManager:
         reason: str,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Mark a non-terminal run as abandoned (control-plane only, no data cleanup)."""
-        return self.repo.abandon_run(
+        """Abandon a run and release the write claims it owns; data stays untouched.
+
+        It records a non-terminal run as abandoned first; a terminal run keeps its status.
+        Either way, it then deletes every claim of the product whose owner resolves to this
+        run alone.
+
+        A claim owner id resolves through its candidates: the id itself and each prefix
+        ending just before a `:`. The single candidate recorded as a run owns the claim.
+
+        Args:
+            product: Product name.
+            run_id: Run to abandon.
+            reason: Operator reason, recorded with the abandon.
+            meta: Extra metadata for the terminal record.
+
+        Returns:
+            `product`, `run_id`, `status` and `abandoned` (False when the run was already
+            terminal), plus `released_claims`, the deleted claim domains, and
+            `skipped_claims`, the domains left because their owner is ambiguous or changed.
+            Both lists are sorted and always present.
+
+        Raises:
+            ManifestError: The run is not recorded for the product, or the claims cannot be
+                listed after the abandon is recorded; the message then says to run it again.
+        """
+        outcome = self.repo.abandon_run(
             product=product,
             run_id=run_id,
             reason=reason,
             meta=meta,
         )
+        released, skipped = self._release_run_claims(
+            product=product, run_id=run_id, status=str(outcome.get("status"))
+        )
+        return {**outcome, "released_claims": released, "skipped_claims": skipped}
+
+    def _resolve_claim_owner(self, *, product: str, owner_id: str) -> ClaimOwner:
+        """Return the recorded runs among the candidates of a claim owner id, via the repository."""
+        return self.repo.resolve_claim_owner(product=product, owner_id=owner_id)
+
+    def _list_claims_to_release(
+        self, *, product: str, recovery: Callable[[], str]
+    ) -> list[ClaimInfo]:
+        """List the product's claims from a fresh listing, for a release.
+
+        A listing error raises ManifestError naming the product, the error and then the text
+        `recovery` returns. A ManifestError, including a malformed claim file, propagates.
+        """
+        try:
+            return self.repo.list_product_claims(product=product)
+        except ManifestError:
+            raise
+        except Exception as exc:
+            raise ManifestError(
+                Message(
+                    "The write claims of {product} could not be listed: {error}.\n{recovery}",
+                    product=product,
+                    error=str(exc),
+                    recovery=recovery(),
+                )
+            ) from exc
+
+    def _release_claims(
+        self,
+        *,
+        product: str,
+        claims: Iterable[ClaimInfo],
+        decide: Callable[[ClaimOwner], Literal["release", "skip"] | None],
+        stale_only: bool = False,
+        dry_run: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Release or skip each listed claim as `decide` says for its resolved owner.
+
+        Resolves each distinct owner id once. A claim to release that changed since the
+        listing is skipped instead; one already gone is in neither list. With `stale_only`,
+        a claim that is fresh when re-read, or whose heartbeat moved, is skipped too.
+
+        With `dry_run` it deletes nothing and judges `stale_only` on the listed claim.
+        Returns the released and the skipped domains, sorted.
+        """
+        service = self.repo.claims
+        assert service is not None
+        owners: dict[str, ClaimOwner] = {}
+        released: list[str] = []
+        skipped: list[str] = []
+        for claim in claims:
+            owner = owners.get(claim.owner_id)
+            if owner is None:
+                owner = self._resolve_claim_owner(product=product, owner_id=claim.owner_id)
+                owners[claim.owner_id] = owner
+            decision = decide(owner)
+            if decision == "skip":
+                skipped.append(claim.domain)
+            elif decision == "release" and dry_run:
+                kept = stale_only and not claim.stale
+                (skipped if kept else released).append(claim.domain)
+            elif decision == "release":
+                outcome = service.release_claim_if_unchanged(
+                    product=product, claim=claim, stale_only=stale_only
+                )
+                if outcome == "released":
+                    released.append(claim.domain)
+                elif outcome == "changed":
+                    skipped.append(claim.domain)
+        return sorted(released), sorted(skipped)
+
+    def _release_run_claims(
+        self, *, product: str, run_id: str, status: str
+    ) -> tuple[list[str], list[str]]:
+        """Delete the claims whose owner resolves to `run_id` alone, after its abandon.
+
+        Considers only owners equal to `run_id` or starting with `run_id:`; any other recorded
+        run among an owner's candidates leaves the claim skipped. Lists the claims strictly:
+        a listing error raises ManifestError saying the run is recorded `status` and that
+        running the abandon again releases its claims.
+        """
+
+        def recovery() -> Message:
+            product_uri = self.get_product_root(product)
+            return Message(
+                "Run {run_id} is recorded {status}; run the abandon again to release its "
+                "claims:\n  {abandon}",
+                run_id=run_id,
+                status=status,
+                abandon=_abandon_operation(product_uri, run_id),
+                product_uri=product_uri,
+            )
+
+        claims = [
+            claim
+            for claim in self._list_claims_to_release(product=product, recovery=recovery)
+            if claim.owner_id == run_id or claim.owner_id.startswith(f"{run_id}:")
+        ]
+
+        def decide(owner: ClaimOwner) -> Literal["release", "skip"]:
+            return "release" if owner.run is not None and owner.run.run_id == run_id else "skip"
+
+        return self._release_claims(product=product, claims=claims, decide=decide)
 
     def create_deletion_plan(
         self,
@@ -925,9 +1134,107 @@ class ChunkManager:
             "records": records,
         }
 
-    def acquire_claim(self, *, product: str, domain: WriteDomain, owner_id: str):
-        """Acquire an exclusive write claim for a domain."""
-        return self.repo.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+    def acquire_claim(
+        self, *, product: str, domain: WriteDomain, owner_id: str, describe_conflict: bool = True
+    ):
+        """Acquire an exclusive write claim for a domain.
+
+        Pass ``describe_conflict=False`` when the caller catches the conflict and retries.
+
+        Raises:
+            ClaimConflictError: Another owner holds the claim. With ``describe_conflict`` the
+                message names that owner's run and status, then the commands that release it.
+        """
+        try:
+            return self.repo.acquire_claim(product=product, domain=domain, owner_id=owner_id)
+        except ClaimConflictError as exc:
+            if not describe_conflict:
+                raise
+            raise ClaimConflictError(
+                Message(
+                    "{conflict}\n{detail}",
+                    conflict=str(exc) if exc.message is None else exc.message,
+                    detail=self._claim_conflict_detail(product=product, domain=domain),
+                )
+            ) from exc
+
+    def _claim_conflict_detail(self, *, product: str, domain: WriteDomain) -> str:
+        """Describe who holds a conflicting claim and how to release it; never raises.
+
+        Re-reads the claim, resolves its owner to a recorded run and names the clear
+        operation, plus the abandon operation when exactly one run owns the claim.
+        """
+        try:
+            product_uri = self.get_product_root(product)
+        except Exception as exc:
+            return Message(
+                "The product root could not be resolved: {error}.",
+                error=str(exc),
+                product=product,
+            )
+        try:
+            service = self.repo.claims
+            assert service is not None
+            claim = service.read_claim_by_domain(product=product, domain=domain.identifier)
+        except Exception as exc:
+            return Message(
+                "The claim could not be read: {error}.\n"
+                "If no process of its owner is running, clear the claim:\n  {clear}",
+                error=str(exc),
+                clear=_clear_operation(product_uri, domain.identifier, force=False),
+                product=product,
+                product_uri=product_uri,
+                claim_domain=domain.identifier,
+            )
+        if claim is None:
+            return "The claim was released after the conflict; retry."
+        clear = _clear_operation(product_uri, domain.identifier, force=not claim.stale)
+        abandon: str = ""
+        try:
+            owner = self._resolve_claim_owner(product=product, owner_id=claim.owner_id)
+            if owner.run is not None:
+                run = owner.run
+                who = Message(
+                    "Owner {claim_owner} is run {run_id} (status: {status}{stale}).",
+                    claim_owner=claim.owner_id,
+                    run_id=run.run_id,
+                    status=run.status,
+                    stale=", stale" if run.stale else "",
+                )
+                abandon = Message(
+                    "\nor abandon run {run_id}, which releases the claims it alone owns:"
+                    "\n  {abandon}",
+                    run_id=run.run_id,
+                    abandon=_abandon_operation(product_uri, run.run_id),
+                )
+            elif owner.ambiguous:
+                who = Message(
+                    "Owner {claim_owner} matches more than one recorded run: {candidates}.",
+                    claim_owner=claim.owner_id,
+                    candidates=", ".join(run.run_id for run in owner.runs),
+                )
+            else:
+                who = Message(
+                    "Owner {claim_owner} is not a recorded run of this product.",
+                    claim_owner=claim.owner_id,
+                )
+        except Exception as exc:
+            who = Message(
+                "The run status of owner {claim_owner} could not be read: {error}.",
+                claim_owner=claim.owner_id,
+                error=str(exc),
+            )
+            abandon = ""
+        return Message(
+            "{who}\nIf no process of that owner is running, clear the claim:\n  {clear}{abandon}",
+            who=who,
+            clear=clear,
+            abandon=abandon,
+            product=product,
+            product_uri=product_uri,
+            claim_domain=domain.identifier,
+            claim_owner=claim.owner_id,
+        )
 
     def list_claims(self, *, product: str | None = None):
         """List active write claims, optionally filtered by product."""
@@ -1026,8 +1333,14 @@ class ChunkManager:
         backoff = float(initial_backoff_s)
         for attempt in range(int(max_retries) + 1):
             try:
-                with self.acquire_claim(
-                    product=product, domain=domain, owner_id=record.recorded_by_run_id
+                with (
+                    self.acquire_claim(
+                        product=product,
+                        domain=domain,
+                        owner_id=record.recorded_by_run_id,
+                        describe_conflict=False,
+                    ),
+                    self._holding(domain, record.recorded_by_run_id),
                 ):
                     return self._apply_resolved_index_precedence(product, record)
             except ClaimConflictError:
@@ -1130,7 +1443,7 @@ class ChunkManager:
             return cp_record, "created"
 
         if cp_record is None and attrs_hash is not None:
-            raise ManifestError(
+            raise ResolvedIndexAttrsConflictError(
                 "zarr root attrs have resolved-index identity hash but no control-plane record"
             )
 
@@ -1145,7 +1458,7 @@ class ChunkManager:
             )
 
         if cp_record is not None and attrs_hash != record.identity_hash:
-            raise ManifestError(
+            raise ResolvedIndexAttrsConflictError(
                 "zarr root attrs have drifted from authoritative resolved-index record: "
                 f"cp_hash={cp_record.identity_hash[:16]} "
                 f"attrs_hash={str(attrs_hash)[:16]!r}"
@@ -1187,7 +1500,7 @@ class ChunkManager:
     ) -> AbandonSweepResult:
         """Bulk-abandon stale non-terminal runs for a product with mutation-time re-check.
 
-        Between preview (``list_stale_runs``) and mutation (``abandon_run``), a
+        Between preview (``list_runs``) and mutation (``abandon_run``), a
         live pod could refresh the run's heartbeat or the run could reach a
         terminal status. Each mutation re-reads the current run entry and only
         abandons runs that remain stale AND non-terminal.
@@ -1195,12 +1508,39 @@ class ChunkManager:
         runs whose heartbeat refreshed are recorded as ``skipped_fresh``. The
         sweep continues past any single-run race so one live pod cannot block
         cleanup of unrelated stale runs.
+
+        The sweep lists the product's runs once, then its claims once, from a fresh listing,
+        before it abandons anything. A claim listing error raises ManifestError and abandons
+        nothing.
+
+        After the abandons it resolves a claim's owner only when the owner id, or a `:`
+        prefix, names a run listed terminal or one it abandoned. Other claims stay unreported.
+        It releases a claim when its owner resolves to one terminal run alone and the claim is
+        stale when re-read before the delete. A fresh claim, a moved heartbeat or an ambiguous
+        owner leaves the claim in `skipped_claims`. Releasing a stale claim finishes a release
+        a crash interrupted.
+
+        A dry run treats the stale runs as abandoned and judges each claim as listed. It
+        reports in `released_claims` and `skipped_claims` what a committed sweep would do, and
+        deletes and abandons nothing.
         """
         result = AbandonSweepResult()
-        stale = self.list_stale_runs(product=product)
+        runs = self.repo.list_runs(product=product)
+        stale = [run for run in runs if not run.is_terminal and run.stale]
+        terminal = {run.run_id for run in runs if run.is_terminal}
         result.previewed = [run.run_id for run in stale]
+        claims = self._list_claims_to_release(
+            product=product,
+            recovery=lambda: "No run was abandoned; run the sweep again.",
+        )
         if dry_run:
-            return result
+            return self._release_sweep_claims(
+                product=product,
+                result=result,
+                claims=claims,
+                ended=terminal | set(result.previewed),
+                dry_run=True,
+            )
         self.repo._ensure_bound()
         assert self.repo._resolver is not None
         assert self.repo._wal_reader is not None
@@ -1223,14 +1563,56 @@ class ChunkManager:
                 result.skipped_fresh.append(run.run_id)
                 continue
             try:
-                outcome = self.abandon_run(product=product, run_id=run.run_id, reason=reason)
+                outcome = self.repo.abandon_run(product=product, run_id=run.run_id, reason=reason)
             except ManifestError:
                 result.skipped_already_terminal.append(run.run_id)
                 continue
-            if outcome.get("abandoned"):
-                result.abandoned.append(run.run_id)
-            else:
+            if not outcome.get("abandoned"):
                 result.skipped_already_terminal.append(run.run_id)
+                continue
+            result.abandoned.append(run.run_id)
+
+        # Outside the ManifestError guard above: a corrupt claim file fails loudly.
+        return self._release_sweep_claims(
+            product=product,
+            result=result,
+            claims=claims,
+            ended=terminal | set(result.abandoned),
+            dry_run=False,
+        )
+
+    def _release_sweep_claims(
+        self,
+        *,
+        product: str,
+        result: AbandonSweepResult,
+        claims: list[ClaimInfo],
+        ended: set[str],
+        dry_run: bool,
+    ) -> AbandonSweepResult:
+        """Release a sweep's stale claims whose owner resolves to one ended run alone.
+
+        Resolves only owners with a candidate in `ended`, so live runs' claims cost no reads.
+        A committed sweep trusts the resolved run status; a dry run also counts `ended` runs
+        as terminal. Fills the claim fields of `result` and returns it.
+        """
+        candidates = [
+            claim
+            for claim in claims
+            if any(candidate in ended for candidate in _owner_candidates(claim.owner_id))
+        ]
+
+        def has_ended(run: RunInfo) -> bool:
+            return run.is_terminal or (dry_run and run.run_id in ended)
+
+        def decide(owner: ClaimOwner) -> Literal["release", "skip"] | None:
+            if owner.run is not None:
+                return "release" if has_ended(owner.run) else None
+            return "skip" if any(has_ended(run) for run in owner.runs) else None
+
+        result.released_claims, result.skipped_claims = self._release_claims(
+            product=product, claims=candidates, decide=decide, stale_only=True, dry_run=dry_run
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -1283,7 +1665,15 @@ class ChunkManager:
         backoff = float(initial_backoff_s)
         for attempt in range(int(max_retries) + 1):
             try:
-                with self.acquire_claim(product=product, domain=domain, owner_id=run_id):
+                with (
+                    self.acquire_claim(
+                        product=product,
+                        domain=domain,
+                        owner_id=run_id,
+                        describe_conflict=False,
+                    ),
+                    self._holding(domain, run_id),
+                ):
                     return self._apply_slot_model_precedence(product, model, run_id)
             except ClaimConflictError:
                 # Unified 5-row convergence policy (mirrors
@@ -1483,18 +1873,13 @@ class ChunkManager:
                 f"cp_record={cp_record!r} attrs_hash={attrs_hash!r}"
             )
 
-    def _open_zarr_root_for_mirror(self, product: str) -> Any:
-        """Open the zarr root group for attribute mirroring, tolerating the
-        ``open_group(mode="a")`` check-then-create race that surfaces when
-        the claim-holding winner and Row-1 re-mirror losers race
-        to create the group. Returns the opened zarr group.
+    def _open_store_for_mirror(self, product: str) -> Any:
+        """Build the store behind the zarr root for attribute mirroring.
 
-        The retry is safe because ``mode="a"`` opens the group in place once
-        it exists — no divergent state can be written between attempts.
+        Only constructs the store: nothing is read or created here. A missing
+        root group is created later, under the mirror's metadata authority.
         """
-        import zarr
-        from zarr.errors import ContainsGroupError
-        from zarr.storage import LocalStore
+        from zarr.storage import FsspecStore, LocalStore
 
         from firecube.core.filesystem.store_factory import create_zarr_store
         from firecube.core.uris import is_remote_target, local_path_from_target
@@ -1507,21 +1892,52 @@ class ChunkManager:
                     "storage_config is required to open the remote zarr root for attr mirroring"
                 )
             handle = create_zarr_store(uri=product_root, storage_config=storage_config, mode="a")
-            open_kwargs: dict[str, Any] = {**handle.zarr_kwargs(), "mode": "a", "zarr_format": 3}
-        else:
-            store = LocalStore(str(local_path_from_target(product_root)))
-            open_kwargs = {"store": store, "mode": "a", "zarr_format": 3}
+            kwargs = handle.zarr_kwargs()
+            store = kwargs["store"]
+            if isinstance(store, str):
+                # The fsspec driver hands back a URL plus options; the metadata
+                # authority needs the configured Store object itself.
+                return FsspecStore.from_url(
+                    store, storage_options=kwargs.get("storage_options"), read_only=False
+                )
+            return store
+        return LocalStore(str(local_path_from_target(product_root)))
 
-        last_exc: BaseException | None = None
-        for attempt in range(4):
-            try:
-                return zarr.open_group(**open_kwargs)
-            except ContainsGroupError as exc:
-                last_exc = exc
-                if attempt == 3:
-                    raise
-                time.sleep(0.005 * (attempt + 1))
-        raise RuntimeError("failed to open zarr root for mirror after retries") from last_exc
+    @contextlib.contextmanager
+    def _holding(self, domain: WriteDomain, owner_id: str) -> Generator[None, None, None]:
+        """Name the claim the calling winner holds, for the root mirrors inside it.
+
+        Only a winner, inside its ``with acquire_claim(...)`` block, enters this.
+        The mirrors read it to build their authority; code outside it (the
+        Row-1 losers) sees nothing and mirrors under a process-local authority.
+        """
+        token = _HELD_CLAIM.set(HeldClaim(domain_id=domain.identifier, owner_id=owner_id))
+        try:
+            yield
+        finally:
+            _HELD_CLAIM.reset(token)
+
+    def _write_root_mirror(self, product: str, category: str, attrs: Mapping[str, Any]) -> None:
+        """Write *attrs* to the zarr root through a metadata authority.
+
+        The authority adopts the ``<category>:current`` claim when the caller is
+        a winner holding it (see `_holding`); otherwise it is PROCESS_LOCAL (no claim is held).
+        """
+        store = self._open_store_for_mirror(product)
+        scope = MetadataScope(
+            _store_identity(str(self.get_product_root(product)), store),
+            backing=store,
+        )
+        held = _HELD_CLAIM.get()
+        expected = WriteDomain(product=product, category=category, name="current").identifier
+        authority_cm = (
+            adopt_held_claim(scope, held)
+            if held is not None and held.domain_id == expected
+            else hold_authority(scope, claim=None)
+        )
+        with authority_cm as authority:
+            ensure_group(authority, store, "")
+            set_attributes(authority, store, "", attrs)
 
     def _mirror_attrs(self, product: str, record: SlotIndexModelRecord) -> None:
         """Write the slot-index model attrs to the zarr root group.
@@ -1535,12 +1951,13 @@ class ChunkManager:
         same value deterministically from the CP record, so concurrent
         invocations converge on identical attrs.
         """
-        root = self._open_zarr_root_for_mirror(product)
-        root.attrs.update(
+        self._write_root_mirror(
+            product,
+            "slot_index_model",
             {
                 SLOT_INDEX_MODEL_ATTR: record.model.canonical_bytes().decode("utf-8"),
                 SLOT_INDEX_MODEL_IDENTITY_HASH_ATTR: record.identity_hash,
-            }
+            },
         )
 
     def _mirror_resolved_index_attrs(self, product: str, record: ResolvedIndexRecord) -> None:
@@ -1555,12 +1972,13 @@ class ChunkManager:
         same value deterministically from the CP record, so concurrent
         invocations converge on identical attrs.
         """
-        root = self._open_zarr_root_for_mirror(product)
-        root.attrs.update(
+        self._write_root_mirror(
+            product,
+            "resolved_index",
             {
                 RESOLVED_INDEX_ATTR: canonical_index_bytes(record.index).decode("utf-8"),
                 RESOLVED_INDEX_IDENTITY_HASH_ATTR: record.identity_hash,
-            }
+            },
         )
 
     def _read_root_index_attrs_hash(
@@ -1581,11 +1999,13 @@ class ChunkManager:
                 handle = create_zarr_store(
                     uri=product_root, storage_config=storage_config, mode="r"
                 )
-                root = zarr.open_group(**handle.zarr_kwargs(), mode="r", zarr_format=3)
+                root = zarr.open_group(
+                    **handle.zarr_kwargs(), mode="r", zarr_format=3, use_consolidated=False
+                )
             else:
                 local = local_path_from_target(product_root)
                 store = LocalStore(str(local))
-                root = zarr.open_group(store=store, mode="r", zarr_format=3)
+                root = zarr.open_group(store=store, mode="r", zarr_format=3, use_consolidated=False)
         except FileNotFoundError:
             return None
         except (PermissionError, OSError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
@@ -1640,6 +2060,75 @@ class ChunkManager:
         )
 
 
+def _abandon_operation(product_uri: str, run_id: str) -> Operation:
+    """Name the abandon of one run, its reason left as a placeholder."""
+    return Operation(
+        "abandon_run", product_name=product_uri, run_id=run_id, reason=Placeholder('"<reason>"')
+    )
+
+
+def _clear_operation(product_uri: str, domain_id: str, *, force: bool) -> Operation:
+    """Name the clear of one claim domain; pass `force=True` for a claim that is not stale."""
+    return Operation("clear_claim", product_name=product_uri, domain_id=domain_id, force=force)
+
+
+def maintenance_refusal_message(
+    *,
+    repo: ManifestRepository,
+    product: str,
+    operation: str,
+    detail: str,
+    claims: Sequence[ClaimInfo],
+) -> Message:
+    """Return the message that refuses a maintenance operation, with its recovery operations.
+
+    Name each blocking claim and its owner, the clear operation for it (forced when the
+    claim is fresh) and, when its owner resolves to exactly one recorded run, the abandon
+    operation. Read errors drop the owner line and the abandon, never the clear.
+    """
+    refusal = "Cannot run {operation} for product {product}: {detail}."
+    facts: dict[str, object] = {"operation": operation, "product": product, "detail": detail}
+    if not claims:
+        return Message(refusal, **facts)
+    try:
+        product_uri = repo.get_product_root_uri(product)
+    except Exception as exc:
+        return Message(
+            refusal + " The product root could not be resolved: {error}.", **facts, error=str(exc)
+        )
+    lines: list[str] = [Message(refusal, **facts, product_uri=product_uri)]
+    owner_runs: dict[str, Any] = {}
+    for claim in claims:
+        if claim.owner_id not in owner_runs:
+            try:
+                owner_runs[claim.owner_id] = repo.resolve_claim_owner(
+                    product=product, owner_id=claim.owner_id
+                ).run
+            except Exception:
+                owner_runs[claim.owner_id] = None
+        run = owner_runs[claim.owner_id]
+        abandon: str = ""
+        if run is not None:
+            abandon = Message(
+                "\nor abandon run {run_id} (status: {status}), which releases the claims "
+                "it alone owns:\n  {abandon}",
+                run_id=run.run_id,
+                status=run.status,
+                abandon=_abandon_operation(product_uri, run.run_id),
+            )
+        lines.append(
+            Message(
+                "\nIf no process of {claim_owner} is running, clear the claim {claim_domain}:"
+                "\n  {clear}{abandon}",
+                claim_owner=claim.owner_id,
+                claim_domain=claim.domain,
+                clear=_clear_operation(product_uri, claim.domain, force=not claim.stale),
+                abandon=abandon,
+            )
+        )
+    return Message.join("", lines)
+
+
 def check_legacy_index_record(
     chunk_manager: ChunkManager,
     *,
@@ -1673,7 +2162,14 @@ def check_legacy_index_record(
     legacy_path = f"{control_root.rstrip('/')}/{SLOT_INDEX_DIRNAME}/{SLOT_INDEX_CURRENT_FILENAME}"
     product_uri = chunk_manager.get_product_root(product)
     raise LegacyIndexRecordError(
-        f"Legacy index record detected at {legacy_path}. "
-        f"Run `firecube zarr index rebuild --target {product_uri} --plugin {plugin_name} "
-        f"--product-name {product}` to migrate."
+        Message(
+            "Legacy index record detected at {legacy_path}. Run `{rebuild}` to migrate.",
+            legacy_path=legacy_path,
+            rebuild=Operation(
+                "rebuild_index", target=product_uri, plugin=plugin_name, product_name=product
+            ),
+            product=product,
+            product_uri=product_uri,
+            plugin=plugin_name,
+        )
     )

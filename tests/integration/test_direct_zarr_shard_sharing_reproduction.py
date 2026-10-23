@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from firecube.cli._slot_planning import _resolve_per_group_slot_sizes
+from firecube.core.zarr.planning import resolve_per_group_slot_sizes
 from firecube.ingestor.api import ZarrArraySpec, ZarrGroupSpec
 from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.types.planned_range import validate_chunk_alignment
@@ -68,7 +68,7 @@ def test_slot_planning_uses_shard_size_for_time_indexed_sharded_arrays() -> None
         )
     ]
 
-    assert _resolve_per_group_slot_sizes(schema, explicit=None) == {"data": 4}
+    assert resolve_per_group_slot_sizes(schema, explicit=None) == {"data": 4}
     with pytest.raises(ConfigurationError):
         validate_chunk_alignment(
             0,

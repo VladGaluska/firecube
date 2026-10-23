@@ -44,17 +44,6 @@ def _first_present_int(*candidates: Any) -> int:
     return 0
 
 
-def _first_present_float(*candidates: Any) -> float:
-    for value in candidates:
-        if value is None:
-            continue
-        try:
-            return max(float(value), 0.0)
-        except (TypeError, ValueError):
-            continue
-    return 0.0
-
-
 def extract_rows_processed(metrics: ResultMetrics | None) -> int:
     """Best-effort row extraction from typed batch-level metrics."""
     if metrics is None:

@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 import pytest
-import xarray as xr
+import zarr
 
 from firecube.core.index_spec import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.api import (
@@ -46,7 +46,7 @@ class _ParallelDirectZarrTestIngestor(DirectZarrIngestor):
                 arrays=[
                     ZarrArraySpec(
                         name="data",
-                        chunks=(10,),
+                        chunks=(1,),
                         shape=(100,),
                         dtype=np.float32,
                     )
@@ -82,26 +82,21 @@ class _ParallelDirectZarrTestIngestor(DirectZarrIngestor):
 
 
 @pytest.mark.integration
-def test_slot_range_parallel_path_runs_existing_cube_mismatch_check(tmp_path, monkeypatch, caplog):
+def test_slot_range_parallel_path_runs_existing_cube_mismatch_check(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger="firecube.ingestor.engine")
 
     target = tmp_path / "out.zarr"
-    bad_ds = xr.Dataset(
-        {"data": (("timestamp",), np.zeros((3,), dtype=np.float32))},
-        coords={"timestamp": np.array([0.0, 1.0, 2.0])},
-    )
-    bad_ds.to_zarr(target, group="PARALLEL_GROUP", mode="w", zarr_format=3, consolidated=False)
-
-    # This RED test isolates the existing-cube-check bypass. The required narrow
-    # [0, 1) slot range is intentionally not chunk-aligned for chunks=(10,), so
-    # bypass alignment validation to reach the engine's pre-batch filter branch.
-    monkeypatch.setattr(
-        "firecube.ingestor.types.planned_range.validate_chunk_alignment",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "firecube.ingestor.types.planned_range.warn_if_misaligned",
-        lambda *args, **kwargs: None,
+    # Same schema as the plugin (one-slot chunks, so the [0, 1) window is
+    # aligned) except for the time dimension name: only the existing-cube
+    # check can object.
+    root = zarr.open_group(store=str(target), mode="w", zarr_format=3)
+    root.require_group("PARALLEL_GROUP").create_array(
+        "data",
+        shape=(100,),
+        chunks=(1,),
+        dtype=np.float32,
+        dimension_names=("timestamp",),
+        fill_value=0.0,
     )
 
     ctx = make_test_context(

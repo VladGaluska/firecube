@@ -21,7 +21,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -80,9 +80,68 @@ from firecube.core.uris import is_remote_target
 log = logging.getLogger(__name__)
 
 
+class UnparseableSpanBoundsError(ManifestError):
+    """A time-range filter met spans whose recorded bounds cannot be compared.
+
+    Such spans (for example a ``360_day`` span ending on Feb 30) cannot be
+    placed relative to a Gregorian time window, so the query refuses them
+    instead of silently leaving them out of the result.
+
+    Attributes:
+        spans: One `(span key, time_min, time_max)` entry per refused span, with the
+            bounds as recorded.
+    """
+
+    def __init__(self, spans: Iterable[tuple[str, str, str]]) -> None:
+        """Build the error and its sentence from the refused spans.
+
+        Args:
+            spans: `(span key, time_min, time_max)` for each refused span.
+        """
+        self.spans = tuple(spans)
+        rendered = "; ".join(
+            f"{key} (time_min={time_min!r}, time_max={time_max!r})"
+            for key, time_min, time_max in self.spans
+        )
+        super().__init__(
+            f"Cannot apply a time-range filter: {len(self.spans)} span(s) have recorded bounds "
+            f"that do not parse as dates in the proleptic Gregorian calendar: {rendered}. "
+            "Nothing was filtered or deleted."
+        )
+
+
 @dataclass(slots=True)
 class _RunEntriesCache:
     entries_by_product: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+
+def _owner_candidates(owner_id: str) -> list[str]:
+    """Return each non-empty prefix of `owner_id` ending just before a `:`, then the id itself."""
+    prefixes = [owner_id[:index] for index, char in enumerate(owner_id) if char == ":"]
+    return [candidate for candidate in (*prefixes, owner_id) if candidate]
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimOwner:
+    """Recorded runs among the candidate run ids of one claim owner id.
+
+    Attributes:
+        owner_id: The claim's owner id.
+        runs: Every candidate recorded as a run of the product, shortest id first.
+    """
+
+    owner_id: str
+    runs: tuple[RunInfo, ...]
+
+    @property
+    def run(self) -> RunInfo | None:
+        """Return the owner run when exactly one candidate is recorded, else None."""
+        return self.runs[0] if len(self.runs) == 1 else None
+
+    @property
+    def ambiguous(self) -> bool:
+        """Return True when two or more candidates are recorded runs."""
+        return len(self.runs) > 1
 
 
 class _ControlRootResolver:
@@ -148,12 +207,6 @@ class ManifestRepository:
     @property
     def base_uri(self) -> str:
         return self._base_uri.to_str()
-
-    def record_entry(self, product: str, entry: dict[str, Any]) -> None:
-        raise ManifestError(
-            "ChunkManager v2 no longer accepts arbitrary chunk-entry writes. Use record_run_started(), "
-            "record_span(), and record_run_terminal() instead."
-        )
 
     @contextmanager
     def run_entries_cache_scope(self) -> Generator[None, None, None]:
@@ -395,6 +448,7 @@ class ManifestRepository:
         time_max_before: str | None = None,
         time_overlaps: tuple[str, str] | None = None,
         filter_fn: Callable[[ChunkInfo], bool] | None = None,
+        refuse_unparseable: bool = False,
     ) -> list[ChunkInfo]:
         return self._projection.list_chunks(
             pattern=pattern,
@@ -409,6 +463,7 @@ class ManifestRepository:
             time_max_before=time_max_before,
             time_overlaps=time_overlaps,
             filter_fn=filter_fn,
+            refuse_unparseable=refuse_unparseable,
         )
 
     def mark_chunks_replaced(
@@ -454,6 +509,39 @@ class ManifestRepository:
             self._ensure_bound()
         assert self.claims is not None
         return self.claims.clear_claim(product=product, domain_id=domain_id, force=force)
+
+    def list_product_claims(self, *, product: str) -> list[ClaimInfo]:
+        """List one product's claims from a fresh listing; raise when the listing fails.
+
+        See `FilesystemClaimService.list_product_claims`.
+        """
+        if self.claims is None:
+            self._ensure_bound()
+        assert self.claims is not None
+        return self.claims.list_product_claims(product=product)
+
+    def resolve_claim_owner(self, *, product: str, owner_id: str) -> ClaimOwner:
+        """Return the recorded runs among the candidate run ids of a claim owner id.
+
+        The candidates are the owner id and each of its prefixes ending just before a `:`.
+        Reads one run entry per candidate, never a product-wide run listing. A candidate that
+        is not a valid run id is not a run. Read errors propagate.
+        """
+        self._ensure_bound()
+        assert self._resolver is not None
+        assert self._wal_reader is not None
+        runs: list[RunInfo] = []
+        for candidate in _owner_candidates(owner_id):
+            try:
+                run_dir, run_uri = run_dir_for(self._resolver, product, candidate)
+            except ValueError:
+                continue
+            entry = self._wal_reader.read_run_entry(
+                product=product, run_dir=run_dir, run_uri=run_uri, run_id=candidate
+            )
+            if entry is not None:
+                runs.append(self._run_info_from_entry(product, {**entry, "run_id": candidate}))
+        return ClaimOwner(owner_id=owner_id, runs=tuple(runs))
 
     def rebuild_snapshot(self, product: str) -> dict[str, Any]:
         _rebuild_t0 = time.time()
@@ -755,6 +843,28 @@ class ManifestRepository:
         if parsed.tzinfo is None:
             return parsed
         return parsed.astimezone(UTC).replace(tzinfo=None)
+
+    def _unparseable_bounds(
+        self, meta: dict[str, Any] | None, fields: tuple[str, ...]
+    ) -> tuple[str, str] | None:
+        """Return the recorded `(time_min, time_max)` when any of ``fields`` is set but unparseable.
+
+        Absent (``None``) or blank bounds are not unparseable: such spans stay outside
+        time-range filters, as before.
+        """
+        if not isinstance(meta, dict):
+            return None
+        for field_name in fields:
+            raw = meta.get(field_name)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                continue
+            if self._parse_iso_dt(raw) is None:
+                return str(meta.get("time_min")), str(meta.get("time_max"))
+        return None
+
+    def _refuse_unparseable_spans(self, spans: list[tuple[str, str, str]]) -> None:
+        if spans:
+            raise UnparseableSpanBoundsError(spans)
 
     def _meta_time_overlaps(
         self,

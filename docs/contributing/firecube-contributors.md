@@ -89,15 +89,11 @@ Install the test and documentation dependencies before relying on the full suite
 uv sync --extra test --group docs
 ```
 
-Pytest session startup requires the in-tree fixture plugins to be installed as
-editable packages:
+Pytest session startup requires the in-tree fixture plugins to be installed.
+One editable install provides all of them:
 
 ```bash
-uv pip install -e tests/fixtures/cli_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_capable_test_plugin
-uv pip install -e tests/fixtures/direct_zarr_non_capable_test_plugin
-uv pip install -e tests/fixtures/multi_group_capable_test_plugin
-uv pip install -e tests/fixtures/cf_time_dim_test_plugin
+uv pip install -e tests/fixtures/firecube_test_plugins
 ```
 
 The CI-style invocation builds the docs first so built-site checks inspect fresh
@@ -116,7 +112,7 @@ During local development, run a focused subset first:
 
 ```bash
 uv run pytest -q
-uv run pytest --strict-deps -m "not slow and not s3"
+uv run pytest --strict-deps -m "not slow and not s3 and not docs_static and not snapshot and not race" -q --tb=short
 uv run pytest tests/unit/test_chunk_manager.py -q
 ```
 

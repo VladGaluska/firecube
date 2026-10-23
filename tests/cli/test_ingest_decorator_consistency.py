@@ -25,6 +25,7 @@ from click.testing import CliRunner
 
 from firecube.cli.main import cli, ingest
 from firecube.ingestor.api import IngestContext, IngestResult, OutputPaths
+from tests.helpers.rows import table_row
 
 
 def _ingest_option(name: str) -> click.Option:
@@ -34,38 +35,40 @@ def _ingest_option(name: str) -> click.Option:
     raise AssertionError(f"--{name.replace('_', '-')} not registered on ingest command")
 
 
-def test_ingest_storage_type_uses_shared_decorator_case_insensitive() -> None:
-    """--storage-type on ``firecube ingest`` accepts case-insensitive values."""
-    option = _ingest_option("storage_type")
-    assert isinstance(option.type, click.Choice)
-    assert tuple(option.type.choices) == ("local", "s3")
-    assert option.type.case_sensitive is False, (
-        "T15: --storage-type must be case-insensitive on the ingest command"
-    )
-    assert option.required is False, (
-        "T15: Click option must stay non-required so IngestCommandConfig.__post_init__ "
-        "can aggregate all missing-flag errors at once"
-    )
+_ROWS = [
+    (
+        "test_ingest_storage_type_uses_shared_decorator_case_insensitive",
+        "storage_type",
+        ("local", "s3"),
+    ),
+    (
+        "test_ingest_storage_driver_uses_shared_decorator_case_insensitive",
+        "storage_driver",
+        ("fsspec", "obstore"),
+    ),
+    (
+        "test_ingest_write_mode_uses_shared_decorator_case_insensitive",
+        "write_mode",
+        ("staged", "direct"),
+    ),
+]
 
 
-def test_ingest_storage_driver_uses_shared_decorator_case_insensitive() -> None:
-    option = _ingest_option("storage_driver")
-    assert isinstance(option.type, click.Choice)
-    assert tuple(option.type.choices) == ("fsspec", "obstore")
-    assert option.type.case_sensitive is False, (
-        "T15: --storage-driver must be case-insensitive on the ingest command"
-    )
-    assert option.required is False
+def test_ingest_shared_decorator_options_are_case_insensitive(
+    subtests: Any, tmp_path: Path
+) -> None:
+    """The shared flags on ``firecube ingest`` are case-insensitive, non-required Choices.
 
-
-def test_ingest_write_mode_uses_shared_decorator_case_insensitive() -> None:
-    option = _ingest_option("write_mode")
-    assert isinstance(option.type, click.Choice)
-    assert tuple(option.type.choices) == ("staged", "direct")
-    assert option.type.case_sensitive is False, (
-        "T15: --write-mode must be case-insensitive on the ingest command"
-    )
-    assert option.required is False
+    They stay non-required so ``IngestCommandConfig.__post_init__`` can
+    aggregate all missing-flag errors at once.
+    """
+    for row_id, name, choices in _ROWS:
+        with table_row(subtests, row_id, tmp_path):
+            option = _ingest_option(name)
+            assert isinstance(option.type, click.Choice)
+            assert tuple(option.type.choices) == choices
+            assert option.type.case_sensitive is False
+            assert option.required is False
 
 
 def test_ingest_accepts_uppercase_storage_flags(tmp_path: Path) -> None:

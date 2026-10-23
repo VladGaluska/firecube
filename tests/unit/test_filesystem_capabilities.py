@@ -19,6 +19,7 @@ import pytest
 from firecube.core.filesystem.fsspec_backend import FsspecFilesystem
 from firecube.core.filesystem.obstore_backend import ObstoreFilesystem
 from firecube.core.filesystem.protocol import (
+    AtomicPublish,
     AtomicWriter,
     Multipart,
     MultipartUploader,
@@ -28,6 +29,7 @@ from firecube.core.filesystem.protocol import (
     StorageFilesystemFull,
 )
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.rows import table_row
 from tests.helpers.storage import make_test_binding
 
 
@@ -42,7 +44,7 @@ def test_fsspec_capabilities_includes_multipart(tmp_path):
 def test_obstore_capabilities_includes_ranged_read(tmp_path):
     fs = ObstoreFilesystem.from_local(str(tmp_path))
 
-    assert fs.capabilities() == {Multipart, RangedRead}
+    assert fs.capabilities() == {Multipart, RangedRead, AtomicPublish}
 
 
 @pytest.mark.unit
@@ -95,39 +97,27 @@ def test_obstore_read_range_returns_requested_slice(tmp_path):
 
 
 @pytest.mark.unit
-def test_fsspec_direct_construction_is_fully_wired(tmp_path):
+def test_direct_construction_is_fully_wired(subtests, tmp_path):
     """Direct construction (bypassing from_binding / create_filesystem) must
     still yield a fully usable object.
 
     The factory is the sanctioned entry point, but ``__init__`` is the seam that
     guarantees a backend can never exist in a half-built state where
-    ``capabilities()`` advertises Multipart while the uploader is missing. This
-    pins that invariant so a future regression in default wiring is caught.
+    ``capabilities()`` advertises Multipart while the uploader is missing. The
+    two backends stay symmetric so neither can drift back to None-defaulted writers.
     """
-    fs = FsspecFilesystem(make_test_binding(tmp_path))
+    for row_id, backend, driver in [
+        ("fsspec_direct_construction_is_fully_wired", FsspecFilesystem, "fsspec"),
+        ("obstore_direct_construction_is_fully_wired", ObstoreFilesystem, "obstore"),
+    ]:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _):
+            fs = backend(make_test_binding(workdir, driver=driver))
 
-    assert isinstance(fs.atomic_writer, AtomicWriter)
-    assert isinstance(fs.multipart_uploader, MultipartUploader)
+            assert isinstance(fs.atomic_writer, AtomicWriter)
+            assert isinstance(fs.multipart_uploader, MultipartUploader)
 
-    uri = StorageUri.from_local_path(tmp_path).join("claim.txt")
-    fs.atomic_writer.write_atomic(uri, b"claimed")
-    assert fs.exists(uri)
-    with pytest.raises(FileExistsError):
-        fs.atomic_writer.write_atomic(uri, b"again")
-
-
-@pytest.mark.unit
-def test_obstore_direct_construction_is_fully_wired(tmp_path):
-    """Cross-backend twin of the fsspec direct-construction guard: keeps the two
-    backends symmetric so neither can drift back to None-defaulted writers.
-    """
-    fs = ObstoreFilesystem(make_test_binding(tmp_path, driver="obstore"))
-
-    assert isinstance(fs.atomic_writer, AtomicWriter)
-    assert isinstance(fs.multipart_uploader, MultipartUploader)
-
-    uri = StorageUri.from_local_path(tmp_path).join("claim.txt")
-    fs.atomic_writer.write_atomic(uri, b"claimed")
-    assert fs.exists(uri)
-    with pytest.raises(FileExistsError):
-        fs.atomic_writer.write_atomic(uri, b"again")
+            uri = StorageUri.from_local_path(workdir).join("claim.txt")
+            fs.atomic_writer.write_atomic(uri, b"claimed")
+            assert fs.exists(uri)
+            with pytest.raises(FileExistsError):
+                fs.atomic_writer.write_atomic(uri, b"again")

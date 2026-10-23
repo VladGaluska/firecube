@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 from firecube.core.controlplane.types import ResolvedIndexRecord, canonical_index_bytes
 from firecube.core.index_resolve import resolve_index_spec
@@ -199,3 +200,25 @@ def test_regular_only_identity_hash_diverges_from_legacy_slot_index_model() -> N
 
     assert legacy is not None
     assert resolved.identity_hash != legacy.identity_hash
+
+
+def test_calendar_axis_payload_carries_calendar_and_has_no_legacy_model() -> None:
+    axis = RegularTimeAxis(
+        coordinate="time",
+        epoch="2049-01-01T12:00:00Z",
+        cadence_s=86400,
+        slot_count=90,
+        calendar="360_day",
+    )
+    resolved = resolve_index_spec(
+        IndexSpec(name="calendar_v1", groups={"data": axis}), time_dim_name="time"
+    )
+
+    payload = resolved.canonical_index_payload()
+    json.dumps(payload)
+    params = payload["groups"]["data"]["params"]
+    assert params["calendar"] == "360_day"
+    assert params["epoch"] == "2049-01-01T12:00:00Z"
+    assert params["cadence_s"] == 86400
+    assert params["mode"] == "exact"
+    assert resolved.as_legacy_slot_index_model() is None

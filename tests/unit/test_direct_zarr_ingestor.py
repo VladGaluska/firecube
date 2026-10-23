@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -24,6 +27,11 @@ import zarr
 from firecube.ingestor.runtime.zarr.strategies.indexed_region import (
     IndexedRegionStrategy,
 )
+from firecube.ingestor.runtime.zarr.write_session import (
+    SessionState,
+    WriteSessionStateError,
+    ZarrWriteSession,
+)
 from firecube.ingestor.templates.direct_zarr import (
     DirectZarrIngestor,
     WriteIntent,
@@ -31,6 +39,7 @@ from firecube.ingestor.templates.direct_zarr import (
     ZarrGroupSpec,
 )
 from firecube.ingestor.types.context import PipelineBatch, PluginContext
+from tests.helpers.storage import begin_write_session, make_test_context
 
 
 class _StubDirectIngestor(DirectZarrIngestor):
@@ -137,6 +146,7 @@ class TestDirectZarrProcessBatch:
         batch = PipelineBatch(batch_id="b1", data_path=Path("/tmp"), items=[])
 
         with patch.object(ingestor, "resolve_output_uri", return_value="/tmp/test.zarr"):
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is True
@@ -152,6 +162,7 @@ class TestDirectZarrProcessBatch:
         batch = PipelineBatch(batch_id="b1", data_path=Path("/tmp"), items=["f1.nc"])
 
         with patch.object(ingestor, "resolve_output_uri", side_effect=RuntimeError("boom")):
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is False
@@ -374,6 +385,7 @@ class TestDirectZarrLifecycleHooks:
                 "coverage": [],
                 "duration_s": 0.0,
             }
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is True, f"expected success; got error={result.error}"
@@ -419,6 +431,7 @@ class TestDirectZarrLifecycleHooks:
         batch = PipelineBatch(batch_id="b1", data_path=Path("/tmp"), items=[])
 
         with patch.object(ingestor, "resolve_output_uri", return_value="/tmp/test.zarr"):
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is True
@@ -468,6 +481,7 @@ class TestDirectZarrLifecycleHooks:
             MockStrategy.return_value.write_groups.side_effect = RuntimeError(
                 "strategy dispatch boom"
             )
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is False, "PipelineResult must reflect failure"
@@ -507,6 +521,7 @@ class TestDirectZarrLifecycleHooks:
                 "coverage": [{"group": "data_1km"}],
                 "duration_s": 0.0,
             }
+            begin_write_session(ingestor, ctx)
             result = ingestor._process_batch(batch, ctx)
 
         assert result.success is True, f"expected success; got error={result.error}"
@@ -524,6 +539,149 @@ class TestDirectZarrLifecycleHooks:
         assert metrics["coverage"] == [{"group": "data_1km"}], (
             f"template coverage must survive merge; got {metrics['coverage']}"
         )
+
+
+class _HeldBatch:
+    """One admitted batch of a session held open on another thread until released."""
+
+    def __init__(self) -> None:
+        self.admitted = threading.Event()
+        self.release = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self, session: ZarrWriteSession) -> None:
+        def batch() -> None:
+            with session.admit_write():
+                self.admitted.set()
+                self.release.wait(30)
+
+        self.thread = threading.Thread(target=batch, daemon=True)
+        self.thread.start()
+        assert self.admitted.wait(5), "the held batch was never admitted"
+
+    def finish(self) -> None:
+        self.release.set()
+        if self.thread is not None:
+            self.thread.join(10)
+            assert not self.thread.is_alive()
+
+
+class _StagedRunIngestor(_StubDirectIngestor):
+    """One full-chunk slot per run; optionally leaves a second batch in flight."""
+
+    held: _HeldBatch | None = None
+
+    def discover_source_files(self, ctx: PluginContext) -> list[str]:
+        return ["f1.nc"]
+
+    def build_write_intents(self, batch: PipelineBatch, ctx: PluginContext) -> list[WriteIntent]:
+        if self.held is not None:
+            session = self._write_session()
+            session._drain_timeout = 0.05  # the drains below give up on the held batch
+            self.held.start(session)
+        return [
+            WriteIntent(
+                group="data_1km",
+                array="timestamp",
+                ts_index=0,
+                data=None,
+                kind="timestamp",
+                timestamp_val=np.datetime64("2025-01-01T00:00:00", "s"),
+            ),
+            WriteIntent(
+                group="data_1km",
+                array="counts",
+                ts_index=0,
+                data=np.ones((100, 100), dtype=np.float32),
+                kind="region",
+                y_slice=slice(0, 100),
+            ),
+        ]
+
+
+def _staged_run_ctx(tmp_path: Path, workspace: Path) -> Any:
+    return make_test_context(
+        tmp_path,
+        product="stub.zarr",
+        options={
+            "write_mode": "staged",
+            "workspace": str(workspace),
+            "pipeline_workers": 1,
+            "no_progress": True,
+            "cleanup_workspace": True,
+        },
+    )
+
+
+class TestRunStateClose:
+    """A run whose write session cannot drain keeps the session and its workspace."""
+
+    def test_host_keeps_its_session_after_a_failed_close(self) -> None:
+        ingestor = _StubDirectIngestor()
+        ingestor.engine_config = MagicMock(
+            write_mode="direct", slot_start=None, slot_end=None, slot_group=None
+        )
+        ctx = MagicMock(spec=PluginContext)
+        ctx.output_name = "test_product"
+        ctx.run_id = "run-001"
+        ctx.option = MagicMock(return_value="unknown")
+        with patch.object(ingestor, "resolve_output_uri", return_value="/tmp/test.zarr"):
+            session = begin_write_session(ingestor, ctx)
+            session._drain_timeout = 0.05
+            held = _HeldBatch()
+            held.start(session)
+            try:
+                with pytest.raises(WriteSessionStateError, match="still in flight"):
+                    ingestor._close_run_state()
+                assert ingestor._zarr_write_session is session
+                # A retry meets the same session and the same failure.
+                with pytest.raises(WriteSessionStateError, match="still in flight"):
+                    ingestor._close_run_state()
+                # So does the next run on this host: it is refused, the session stays.
+                with pytest.raises(WriteSessionStateError, match="still in flight"):
+                    begin_write_session(ingestor, ctx)
+                assert ingestor._write_session() is session
+            finally:
+                held.finish()
+            ingestor._close_run_state()
+        assert ingestor._zarr_write_session is None
+        assert session.state is SessionState.TERMINAL
+
+    def test_run_keeps_the_workspace_when_its_session_cannot_drain(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workspace = tmp_path / "ws"
+        host = _StagedRunIngestor()
+        host.held = held = _HeldBatch()
+        try:
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(WriteSessionStateError, match="promotion refused"),
+            ):
+                host.run(_staged_run_ctx(tmp_path, workspace))
+            assert (workspace / "stub.zarr").is_dir(), "the workspace was deleted under a write"
+            kept = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.ERROR and str(workspace) in r.getMessage()
+            ]
+            assert len(kept) == 1 and "left in place" in kept[0].getMessage()
+            assert host._zarr_write_session is not None
+        finally:
+            held.finish()
+        host._close_run_state()
+        assert host._zarr_write_session is None
+
+    def test_run_cleans_the_workspace_when_its_session_closes(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workspace = tmp_path / "ws"
+        host = _StagedRunIngestor()
+        with caplog.at_level(logging.WARNING):
+            host.run(_staged_run_ctx(tmp_path, workspace))
+        assert not workspace.exists()
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert host._zarr_write_session is None
 
 
 class TestApiReExports:

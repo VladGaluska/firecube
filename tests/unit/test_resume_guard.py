@@ -36,9 +36,11 @@ from typing import Any
 
 import pytest
 
+from firecube.cli._errors import render
 from firecube.core.controlplane import ChunkManager, SpanCoverage
 from firecube.ingestor.errors import ResumeConflictError
 from firecube.ingestor.runtime.resume_guard import ResumeGuard
+from tests.helpers.cli_hints import run_hint
 from tests.helpers.storage import make_test_binding
 
 pytestmark = pytest.mark.unit
@@ -93,72 +95,22 @@ def _record_running_run(manager: ChunkManager, *, run_id: str) -> None:
     )
 
 
-def _record_completed_span(
+def _record_span_run(
     manager: ChunkManager,
     *,
     run_id: str,
     batch_id: str,
+    failed: bool = False,
     group: str = "G",
     time_min: str = "2024-01-01T00:00:00Z",
     time_max: str = "2024-01-02T00:00:00Z",
 ) -> None:
-    output_path = f"{manager.base_uri.rstrip('/')}/{_PRODUCT}"
-    meta = {
-        "plugin": _PLUGIN,
-        "group": group,
-        "time_min": time_min,
-        "time_max": time_max,
-        "batch_id": batch_id,
-    }
-    manager.record_run_started(
-        product=_PRODUCT,
-        run_id=run_id,
-        output_path=output_path,
-        output_format="zarr",
-        size=0,
-        meta={"plugin": _PLUGIN},
-    )
-    manager.record_span(
-        product=_PRODUCT,
-        run_id=run_id,
-        batch_id=batch_id,
-        group=group,
-        status="active",
-        coverage=SpanCoverage(
-            group=group,
-            arrays=[f"{group}/data"],
-            time_index_ranges=[[0, 1]],
-            time_min=time_min,
-            time_max=time_max,
-        ),
-        meta=meta,
-    )
-    manager.record_run_terminal(
-        product=_PRODUCT,
-        run_id=run_id,
-        output_path=output_path,
-        output_format="zarr",
-        size=1,
-        meta={"plugin": _PLUGIN},
-        status="complete",
-    )
+    """A run that wrote one active span, then ended ``complete`` or ``failed``.
 
-
-def _record_failed_run_with_completed_span(
-    manager: ChunkManager,
-    *,
-    run_id: str,
-    batch_id: str,
-    group: str = "G",
-    time_min: str = "2024-01-01T00:00:00Z",
-    time_max: str = "2024-01-02T00:00:00Z",
-) -> None:
-    """A run that wrote a span successfully then failed at terminal.
-
-    The active span survives in the WAL projection (spans are only sealed
-    by a subsequent replacement run), and the owning run's terminal status
-    is ``failed``. That combination is the ``failed-run-spans exist``
-    conflict the guard must refuse loudly.
+    With ``failed=True`` the span survives in the WAL projection (spans are
+    only sealed by a replacement run) while the owning run's terminal status
+    is ``failed``: the ``failed-run-spans exist`` conflict the guard must
+    refuse loudly.
     """
     output_path = f"{manager.base_uri.rstrip('/')}/{_PRODUCT}"
     meta = {
@@ -198,9 +150,20 @@ def _record_failed_run_with_completed_span(
         output_format="zarr",
         size=1,
         meta={"plugin": _PLUGIN},
-        status="failed",
-        error="simulated batch failure",
+        status="failed" if failed else "complete",
+        error="simulated batch failure" if failed else None,
     )
+
+
+def _reopened_guard_after(
+    tmp_path: Path, *, failed: bool, run_id: str, batch_id: str
+) -> ResumeGuard:
+    manager = _fresh_manager(tmp_path)
+    _record_span_run(manager, run_id=run_id, batch_id=batch_id, failed=failed)
+    manager.close()
+    manager = _fresh_manager(tmp_path)
+    manager.rebuild_snapshot(_PRODUCT)
+    return _make_guard(manager)
 
 
 def test_non_terminal_run_blocks_and_names_abandon_command(tmp_path: Path) -> None:
@@ -213,10 +176,14 @@ def test_non_terminal_run_blocks_and_names_abandon_command(tmp_path: Path) -> No
 
     message = str(excinfo.value)
     assert "run-alive" in message
+    assert "Abandoning the run also releases the write claims it alone owns." in message
+    assert "ChunkManager.abandon_run" in message and "firecube chunks" not in message
+    root = manager.get_product_root(_PRODUCT)
+    printed = render(excinfo.value)
     assert (
-        f"firecube chunks runs abandon --product-name {_PRODUCT} --run-id run-alive "
-        '--reason "<reason>"'
-    ) in message
+        f'firecube chunks runs abandon --product-name {root} --run-id run-alive --reason "<reason>"'
+    ) in printed
+    run_hint(printed, "firecube chunks runs abandon", "--dry-run")
 
 
 def test_resume_existing_does_not_bypass_non_terminal_run(tmp_path: Path) -> None:
@@ -246,37 +213,10 @@ def test_fresh_product_proceeds(tmp_path: Path) -> None:
 
 
 def test_existing_completed_span_blocks_without_resume_or_force(tmp_path: Path) -> None:
-    manager = _fresh_manager(tmp_path)
-    _record_completed_span(manager, run_id="run-past", batch_id="b01")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
+    guard = _reopened_guard_after(tmp_path, failed=False, run_id="run-past", batch_id="b01")
 
     with pytest.raises(ResumeConflictError, match=f"Existing entries for product '{_PRODUCT}'"):
         guard.enforce(ctx=_GuardCtx(), product=_PRODUCT)
-
-
-def test_force_reingest_bypasses_existing_completed_span(tmp_path: Path) -> None:
-    manager = _fresh_manager(tmp_path)
-    _record_completed_span(manager, run_id="run-past", batch_id="b01")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
-
-    guard.enforce(ctx=_GuardCtx(force_reingest=True), product=_PRODUCT)
-
-
-def test_resume_existing_bypasses_existing_completed_span(tmp_path: Path) -> None:
-    manager = _fresh_manager(tmp_path)
-    _record_completed_span(manager, run_id="run-past", batch_id="b01")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
-
-    guard.enforce(ctx=_GuardCtx(options={"resume_existing": True}), product=_PRODUCT)
 
 
 def test_resume_guard_fail_loud_end_to_end(tmp_path: Path) -> None:
@@ -287,12 +227,7 @@ def test_resume_guard_fail_loud_end_to_end(tmp_path: Path) -> None:
     ``resume_existing`` or ``force_reingest`` the guard must refuse and
     name both escape hatches so the operator can pick the safe one.
     """
-    manager = _fresh_manager(tmp_path)
-    _record_failed_run_with_completed_span(manager, run_id="run-failed", batch_id="b02")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
+    guard = _reopened_guard_after(tmp_path, failed=True, run_id="run-failed", batch_id="b02")
 
     with pytest.raises(ResumeConflictError) as excinfo:
         guard.enforce(ctx=_GuardCtx(), product=_PRODUCT)
@@ -305,25 +240,17 @@ def test_resume_guard_fail_loud_end_to_end(tmp_path: Path) -> None:
     assert "force_reingest=true" in message
 
 
-def test_resume_guard_fail_loud_bypassed_by_resume_existing(tmp_path: Path) -> None:
-    """The failed-run block is a soft failure: resume_existing must clear it."""
-    manager = _fresh_manager(tmp_path)
-    _record_failed_run_with_completed_span(manager, run_id="run-failed", batch_id="b02")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
+@pytest.mark.parametrize("failed", [False, True], ids=["completed_span", "failed_run_span"])
+@pytest.mark.parametrize(
+    "ctx",
+    [
+        pytest.param(_GuardCtx(force_reingest=True), id="force_reingest"),
+        pytest.param(_GuardCtx(options={"resume_existing": True}), id="resume_existing"),
+    ],
+)
+def test_bypass_flag_clears_existing_span_block(
+    tmp_path: Path, failed: bool, ctx: _GuardCtx
+) -> None:
+    guard = _reopened_guard_after(tmp_path, failed=failed, run_id="run-past", batch_id="b01")
 
-    guard.enforce(ctx=_GuardCtx(options={"resume_existing": True}), product=_PRODUCT)
-
-
-def test_resume_guard_fail_loud_bypassed_by_force_reingest(tmp_path: Path) -> None:
-    """force_reingest also clears the failed-run block."""
-    manager = _fresh_manager(tmp_path)
-    _record_failed_run_with_completed_span(manager, run_id="run-failed", batch_id="b02")
-    manager.close()
-    manager = _fresh_manager(tmp_path)
-    manager.rebuild_snapshot(_PRODUCT)
-    guard = _make_guard(manager)
-
-    guard.enforce(ctx=_GuardCtx(force_reingest=True), product=_PRODUCT)
+    guard.enforce(ctx=ctx, product=_PRODUCT)

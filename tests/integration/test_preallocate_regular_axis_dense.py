@@ -47,15 +47,18 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import math
+import re
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
+import cftime
 import irregular_axis_test_plugin as _irregular_plugin_module
 import numpy as np
 import pytest
 import regular_axis_test_plugin as _regular_plugin_module
+import xarray as xr
 import zarr
 from click.testing import CliRunner
 
@@ -143,32 +146,6 @@ def _count_chunk_files(coord_dir: Path) -> int:
     return sum(1 for p in chunk_root.rglob("*") if p.is_file())
 
 
-def test_preallocate_with_coord_spec_produces_dense_chunks(tmp_path: Path) -> None:
-    target_path = tmp_path / "cube.zarr"
-
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args(
-            "regular_axis_dense_coord",
-            "regular_axis_dense_coord",
-            target_path,
-        ),
-    )
-
-    assert result.exit_code == 0, result.output
-    coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
-    assert coord.shape == (_SLOT_COUNT,)
-    assert tuple(coord.chunks) == (_EXPECTED_CHUNK_LEN,)
-    assert coord.attrs[ATTR_PREALLOCATED] is True
-
-    chunk_file_count = _count_chunk_files(target_path / _GROUP / _COORD_NAME)
-    assert chunk_file_count == _EXPECTED_CHUNK_FILE_COUNT
-    assert chunk_file_count < _SLOT_COUNT
-
-    values = np.asarray(coord[:])
-    assert np.array_equal(values, _EXPECTED_VALUES)
-
-
 def test_preallocate_no_coord_spec_falls_back_to_dense_defaults(tmp_path: Path) -> None:
     target_path = tmp_path / "cube.zarr"
 
@@ -190,55 +167,6 @@ def test_preallocate_no_coord_spec_falls_back_to_dense_defaults(tmp_path: Path) 
     chunk_file_count = _count_chunk_files(target_path / _GROUP / _COORD_NAME)
     assert chunk_file_count == _EXPECTED_CHUNK_FILE_COUNT
 
-    values = np.asarray(coord[:])
-    assert np.array_equal(values, _EXPECTED_VALUES)
-
-
-def test_preallocate_dense_dry_run_performs_no_mutation(tmp_path: Path) -> None:
-    target_path = tmp_path / "cube.zarr"
-
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args(
-            "regular_axis_dense_coord",
-            "regular_axis_dense_coord",
-            target_path,
-            dry_run=True,
-        ),
-    )
-
-    assert result.exit_code == 0, result.output
-    assert not target_path.exists(), (
-        f"dry-run must not create the target store; found {list(target_path.iterdir())}"
-    )
-
-
-def test_preallocate_is_idempotent_on_dense_coord_array(tmp_path: Path) -> None:
-    target_path = tmp_path / "cube.zarr"
-    runner = CliRunner()
-
-    first = runner.invoke(
-        cli,
-        _preallocate_args(
-            "regular_axis_dense_coord",
-            "regular_axis_dense_coord",
-            target_path,
-        ),
-    )
-    second = runner.invoke(
-        cli,
-        _preallocate_args(
-            "regular_axis_dense_coord",
-            "regular_axis_dense_coord",
-            target_path,
-        ),
-    )
-
-    assert first.exit_code == 0, first.output
-    assert second.exit_code == 0, second.output
-    coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
-    assert tuple(coord.chunks) == (_EXPECTED_CHUNK_LEN,)
-    assert coord.attrs[ATTR_PREALLOCATED] is True
     values = np.asarray(coord[:])
     assert np.array_equal(values, _EXPECTED_VALUES)
 
@@ -357,94 +285,130 @@ def test_preallocate_boundary_sizes_produce_ceil_chunks(
     assert chunk_file_count == math.ceil(slot_count / expected_chunk_shape[0])
 
 
-def _preallocate_dense_cube(tmp_path: Path) -> Path:
+def test_dense_coord_lifecycle(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """Dry run, creation, replay, parallel pod no-op writes and one drifting pod.
+
+    One cube walks the whole exact-mode lifecycle; each step is a former test of
+    this module (step id = old test name) and starts from the state the
+    previous step left behind.
+    """
     target_path = tmp_path / "cube.zarr"
-    result = CliRunner().invoke(
-        cli,
-        _preallocate_args(
-            "regular_axis_dense_coord",
-            "regular_axis_dense_coord",
-            target_path,
-        ),
-    )
-    assert result.exit_code == 0, result.output
-    return target_path
+    runner = CliRunner()
+    args = _preallocate_args("regular_axis_dense_coord", "regular_axis_dense_coord", target_path)
 
-
-def test_parallel_pods_produce_zero_time_chunk_writes(tmp_path: Path) -> None:
-    target_path = _preallocate_dense_cube(tmp_path)
-    before = _snapshot_time_chunks(target_path)
-    assert before, "preallocate should have produced at least one time chunk file"
-
-    n_pods = 8
-    slots_per_pod = _SLOT_COUNT // n_pods
-    ranges = [
-        range(i * slots_per_pod, (i + 1) * slots_per_pod if i < n_pods - 1 else _SLOT_COUNT)
-        for i in range(n_pods)
-    ]
-    assert sum(len(r) for r in ranges) == _SLOT_COUNT
-    assert set().union(*ranges) == set(range(_SLOT_COUNT))
-
-    def _pod_write(slot_range: range) -> None:
-        pod_writer = RegionZarrWriter(
-            str(target_path),
-            coord_names=frozenset({_COORD_NAME}),
-            time_coord_name=_COORD_NAME,
+    with subtests.test(msg="test_preallocate_dense_dry_run_performs_no_mutation"):
+        result = runner.invoke(
+            cli,
+            _preallocate_args(
+                "regular_axis_dense_coord",
+                "regular_axis_dense_coord",
+                target_path,
+                dry_run=True,
+            ),
         )
-        for slot in slot_range:
-            pod_writer.write_timestamp(_GROUP, slot, _EXPECTED_VALUES[slot])
 
-    with ThreadPoolExecutor(max_workers=n_pods) as pool:
-        futures = [pool.submit(_pod_write, r) for r in ranges]
-        for f in futures:
-            f.result()
+        assert result.exit_code == 0, result.output
+        assert not target_path.exists(), (
+            f"dry-run must not create the target store; found {list(target_path.iterdir())}"
+        )
 
-    after = _snapshot_time_chunks(target_path)
-    assert after == before, (
-        "marker-aware write_timestamp must be a no-op on matching values; "
-        f"chunk files changed: added={set(after) - set(before)!r} "
-        f"removed={set(before) - set(after)!r} "
-        f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
-    )
+    with subtests.test(msg="test_preallocate_with_coord_spec_produces_dense_chunks"):
+        result = runner.invoke(cli, args)
 
-    coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
-    assert np.array_equal(np.asarray(coord[:]), _EXPECTED_VALUES)
+        assert result.exit_code == 0, result.output
+        coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
+        assert coord.shape == (_SLOT_COUNT,)
+        assert tuple(coord.chunks) == (_EXPECTED_CHUNK_LEN,)
+        assert coord.attrs[ATTR_PREALLOCATED] is True
 
+        chunk_file_count = _count_chunk_files(target_path / _GROUP / _COORD_NAME)
+        assert chunk_file_count == _EXPECTED_CHUNK_FILE_COUNT
+        assert chunk_file_count < _SLOT_COUNT
 
-def test_drift_on_one_pod_isolated_from_correct_pods(tmp_path: Path) -> None:
-    target_path = _preallocate_dense_cube(tmp_path)
-    before = _snapshot_time_chunks(target_path)
+        values = np.asarray(coord[:])
+        assert np.array_equal(values, _EXPECTED_VALUES)
 
-    writer_a = RegionZarrWriter(
-        str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
-    )
-    writer_b = RegionZarrWriter(
-        str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
-    )
-    writer_c = RegionZarrWriter(
-        str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
-    )
+    with subtests.test(msg="test_preallocate_is_idempotent_on_dense_coord_array"):
+        second = runner.invoke(cli, args)
 
-    writer_a.write_timestamp(_GROUP, 10, _EXPECTED_VALUES[10])
+        assert second.exit_code == 0, second.output
+        coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
+        assert tuple(coord.chunks) == (_EXPECTED_CHUNK_LEN,)
+        assert coord.attrs[ATTR_PREALLOCATED] is True
+        values = np.asarray(coord[:])
+        assert np.array_equal(values, _EXPECTED_VALUES)
 
-    wrong_value = _EXPECTED_VALUES[10] + np.timedelta64(1, "s")
-    with pytest.raises(SchemaDriftError, match=r"slot 10"):
-        writer_b.write_timestamp(_GROUP, 10, wrong_value)
+    with subtests.test(msg="test_parallel_pods_produce_zero_time_chunk_writes"):
+        before = _snapshot_time_chunks(target_path)
+        assert before, "preallocate should have produced at least one time chunk file"
 
-    writer_c.write_timestamp(_GROUP, 20, _EXPECTED_VALUES[20])
+        n_pods = 8
+        slots_per_pod = _SLOT_COUNT // n_pods
+        ranges = [
+            range(i * slots_per_pod, (i + 1) * slots_per_pod if i < n_pods - 1 else _SLOT_COUNT)
+            for i in range(n_pods)
+        ]
+        assert sum(len(r) for r in ranges) == _SLOT_COUNT
+        assert set().union(*ranges) == set(range(_SLOT_COUNT))
 
-    coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
-    values = np.asarray(coord[:])
-    assert values[10] == _EXPECTED_VALUES[10], "slot 10 must retain preallocated value"
-    assert values[20] == _EXPECTED_VALUES[20], "slot 20 must retain preallocated value"
-    assert np.array_equal(values, _EXPECTED_VALUES)
+        def _pod_write(slot_range: range) -> None:
+            pod_writer = RegionZarrWriter(
+                str(target_path),
+                coord_names=frozenset({_COORD_NAME}),
+                time_coord_name=_COORD_NAME,
+            )
+            for slot in slot_range:
+                pod_writer.write_timestamp(_GROUP, slot, _EXPECTED_VALUES[slot])
 
-    after = _snapshot_time_chunks(target_path)
-    assert after == before, (
-        "no chunk files may be added, removed, or modified by marker-aware writes; "
-        f"delta added={set(after) - set(before)!r} removed={set(before) - set(after)!r} "
-        f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
-    )
+        with ThreadPoolExecutor(max_workers=n_pods) as pool:
+            futures = [pool.submit(_pod_write, r) for r in ranges]
+            for f in futures:
+                f.result()
+
+        after = _snapshot_time_chunks(target_path)
+        assert after == before, (
+            "marker-aware write_timestamp must be a no-op on matching values; "
+            f"chunk files changed: added={set(after) - set(before)!r} "
+            f"removed={set(before) - set(after)!r} "
+            f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
+        )
+
+        coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
+        assert np.array_equal(np.asarray(coord[:]), _EXPECTED_VALUES)
+
+    with subtests.test(msg="test_drift_on_one_pod_isolated_from_correct_pods"):
+        before = _snapshot_time_chunks(target_path)
+
+        writer_a = RegionZarrWriter(
+            str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
+        )
+        writer_b = RegionZarrWriter(
+            str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
+        )
+        writer_c = RegionZarrWriter(
+            str(target_path), coord_names=frozenset({_COORD_NAME}), time_coord_name=_COORD_NAME
+        )
+
+        writer_a.write_timestamp(_GROUP, 10, _EXPECTED_VALUES[10])
+
+        wrong_value = _EXPECTED_VALUES[10] + np.timedelta64(1, "s")
+        with pytest.raises(SchemaDriftError, match=r"slot 10"):
+            writer_b.write_timestamp(_GROUP, 10, wrong_value)
+
+        writer_c.write_timestamp(_GROUP, 20, _EXPECTED_VALUES[20])
+
+        coord = cast(Any, _root(target_path)[f"{_GROUP}/{_COORD_NAME}"])
+        values = np.asarray(coord[:])
+        assert values[10] == _EXPECTED_VALUES[10], "slot 10 must retain preallocated value"
+        assert values[20] == _EXPECTED_VALUES[20], "slot 20 must retain preallocated value"
+        assert np.array_equal(values, _EXPECTED_VALUES)
+
+        after = _snapshot_time_chunks(target_path)
+        assert after == before, (
+            "no chunk files may be added, removed, or modified by marker-aware writes; "
+            f"delta added={set(after) - set(before)!r} removed={set(before) - set(after)!r} "
+            f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
+        )
 
 
 def _preallocate_floor_cube(tmp_path: Path) -> Path:
@@ -605,3 +569,132 @@ def test_auto_irregular_axis_preallocate_stamps_marker_and_allows_matching_write
         f"removed={set(before) - set(after)!r} "
         f"modified={ {k for k in before & after.keys() if before[k] != after[k]}!r}"
     )
+
+
+def _calendar_run(
+    command: str, target: Path, *extra: str, calendar: str = "360_day", mode: str = "direct"
+) -> Any:
+    head = ["zarr", "preallocate"] if command == "preallocate" else ["ingest"]
+    args = [*head, "regular_axis_calendar", "--target", f"file://{target}"]
+    args += ["--product-name", "regular_axis_calendar", "--storage-type", "local"]
+    args += ["--storage-driver", "fsspec", "--write-mode", mode]
+    args += ["--option", "no_progress=true", "--option", f"calendar={calendar}"]
+    args += ["--option", "slot_count=90", *extra]
+    return CliRunner().invoke(cli, args)
+
+
+def _product_files(target: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(target).as_posix(): p.read_bytes()
+        for p in sorted(target.rglob("*"))
+        if p.is_file() and ".firecube" not in p.relative_to(target).parts
+    }
+
+
+def _assert_calendar_store(target: Path) -> None:
+    units = "seconds since 2049-01-01 00:00:00"
+    coord = _root(target)["data/time"]
+    attrs = (coord.dtype, coord.attrs["calendar"], coord.attrs["units"])
+    assert attrs == (np.dtype("int64"), "360_day", units)
+    assert coord.attrs[ATTR_PREALLOCATED] is True
+    ds = xr.open_zarr(str(target), group="data", consolidated=False, zarr_format=3)
+    expected = cftime.num2date(np.arange(90) * 86400, units, calendar="360_day")
+    assert [v.isoformat() for v in ds["time"].values] == [v.isoformat() for v in expected]
+    assert list(np.asarray(_root(target)["data/values"][:]).reshape(-1)) == list(range(90))
+
+
+def test_calendar_axis_preallocate_and_ingest_decode_to_declared_dates(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    assert _calendar_run("preallocate", target).exit_code == 0
+    result = _calendar_run("ingest", target)
+    assert result.exit_code == 0, result.output
+    _assert_calendar_store(target)
+
+
+def test_refused_calendar_relabel_leaves_store_and_earlier_partial_group_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unbounded "aux" group means no resolved-index record, so the coordinate's own
+    # attrs are the only record of its calendar and the relabel check must refuse.
+    base = _regular_plugin_module.RegularAxisCalendarIngestor
+
+    class _Mixed(base):
+        PRODUCT_NAME: ClassVar[str] = "regular_axis_calendar"
+
+        def index_spec(self, ctx: PluginContext) -> IndexSpec:
+            greg = RegularTimeAxis(
+                coordinate="time", epoch="2049-01-01T00:00:00Z", cadence_s=86400, slot_count=90
+            )
+            aux = RegularTimeAxis(coordinate="time", epoch="2049-01-01T00:00:00Z", cadence_s=86400)
+            groups = {"greg": greg, **super().index_spec(ctx).groups, "aux": aux}
+            return IndexSpec(name="mixed_v1", groups=groups)
+
+        def zarr_schema(self, ctx: PluginContext) -> list[ZarrGroupSpec]:
+            (data,) = super().zarr_schema(ctx)
+            return [
+                ZarrGroupSpec(group="greg", arrays=data.arrays),
+                data,
+                ZarrGroupSpec(group="aux", arrays=data.arrays),
+            ]
+
+    _loader.discover_ingestors()
+    monkeypatch.setitem(_loader.AVAILABLE_INGESTORS, "regular_axis_calendar", _Mixed)
+    target = tmp_path / "cube.zarr"
+    assert (
+        _calendar_run("preallocate", target, "--slot-start", "0", "--slot-end", "1").exit_code == 0
+    )
+    assert int(np.isnat(np.asarray(_root(target)["greg/time"][:])).sum()) == 89
+    before = _product_files(target)
+    # The plugin now declares only the bounded group, so a resolved-index record is negotiated.
+    monkeypatch.setitem(_loader.AVAILABLE_INGESTORS, "regular_axis_calendar", base)
+
+    result = _calendar_run("preallocate", target, calendar="noleap")
+
+    assert result.exit_code != 0, result.output
+    assert "360_day" in f"{result.output}\n{result.exception}"
+    assert _product_files(target) == before  # includes the root zarr.json
+    retry = _calendar_run("preallocate", target)  # the original 360_day, after the refusal
+    assert retry.exit_code == 0, f"{retry.output}\n{retry.exception}"
+
+
+def test_staged_ingest_needs_calendar_preallocate_and_names_the_command(tmp_path: Path) -> None:
+    refused = _calendar_run("ingest", tmp_path / "a.zarr", mode="staged")
+    assert refused.exit_code != 0
+    assert "firecube zarr preallocate" in f"{refused.output}\n{refused.exception}"
+
+    target = tmp_path / "b.zarr"
+    assert _calendar_run("preallocate", target, mode="staged").exit_code == 0
+    result = _calendar_run("ingest", target, mode="staged")
+    assert result.exit_code == 0, f"{result.output}\n{result.exception}"
+    _assert_calendar_store(target)
+
+
+def test_calendar_dry_run_prints_calendar_dates(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    result = _calendar_run("preallocate", target, "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "first=2049-01-01T00:00:00 (360_day);" in result.output
+    assert "last=2049-03-30T00:00:00 (360_day);" in result.output
+    assert not target.exists()
+
+
+def test_gregorian_dry_run_carries_no_calendar_suffix(tmp_path: Path) -> None:
+    target = tmp_path / "g.zarr"
+    result = CliRunner().invoke(
+        cli, _preallocate_args("regular_axis_dense_coord", "p", target, dry_run=True)
+    )
+    assert result.exit_code == 0, result.output
+    assert not re.search(
+        r"\((?:360_day|noleap|gregorian|standard|julian|all_leap)\)", result.output
+    )
+    assert "first=2024-01-01T00:00:00;" in result.output
+    assert not target.exists()
+
+
+def test_calendar_slot_window_still_writes_the_whole_grid(tmp_path: Path) -> None:
+    target = tmp_path / "cube.zarr"
+    result = _calendar_run("preallocate", target, "--slot-start", "10", "--slot-end", "20")
+    assert result.exit_code == 0, result.output
+    assert "window not applied to calendar coordinate" in result.output
+    coord = np.asarray(_root(target)["data/time"][:])
+    assert np.array_equal(coord, np.arange(90, dtype=np.int64) * 86400)

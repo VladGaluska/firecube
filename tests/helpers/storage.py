@@ -122,16 +122,6 @@ def assert_no_fsspec_bypass():
             raise AssertionError(f"Expected no _open_fsspec_url calls; observed {total}: {details}")
 
 
-def make_obstore_test_session(target_uri: str | StorageUri) -> StorageSession:
-    """Build an obstore-backed StorageSession."""
-    uri = _storage_uri_from_target(target_uri)
-    binding = StorageBinding(
-        identity=ProductIdentity.from_uri(uri, "zarr", product_name="test_product"),
-        driver=StorageDriverConfig(driver="obstore"),
-    )
-    return StorageSession(binding)
-
-
 def make_test_binding(
     tmp_path: Path,
     *,
@@ -198,3 +188,16 @@ def make_test_context(
         options=options or {},
         storage=StorageContext(output=session),
     )
+
+
+def begin_write_session(host: Any, ctx: Any, *, engine_config: Any | None = None) -> Any:
+    """Build a DirectZarr host's run write session, as pod startup does.
+
+    For tests that call ``_process_batch`` or an engine function without
+    ``run()``: the template refuses a batch or promotion without a session.
+    ``engine_config`` is set on the host first when given (window, slot group
+    and write mode come from it).
+    """
+    if engine_config is not None:
+        host.engine_config = engine_config
+    return host._begin_write_session(ctx)

@@ -20,11 +20,19 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
-from firecube.core.filesystem.protocol import AtomicWriter, Multipart, MultipartUploader, RangedRead
+from firecube.core.filesystem import publication
+from firecube.core.filesystem.protocol import (
+    AtomicPublish,
+    AtomicWriter,
+    Multipart,
+    MultipartUploader,
+    RangedRead,
+)
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
@@ -178,11 +186,17 @@ class ObstoreFilesystem:
         except Exception:
             return self.isdir(uri)
 
-    def ls(self, uri: StorageUri, detail: bool = False) -> list:
+    def ls(self, uri: StorageUri, detail: bool = False, refresh: bool = False) -> list:
+        # ``refresh`` is accepted for the Protocol and ignored: obstore lists the
+        # store on every call.
         rel_path = self._resolve_path(uri).rstrip("/")
         prefix = rel_path + "/" if rel_path else ""
         result = self._store.list_with_delimiter(prefix=prefix)
-        objects = result.get("objects", [])
+        objects = [
+            obj
+            for obj in result.get("objects", [])
+            if not publication.is_publication_temp(obj["path"])
+        ]
         prefixes = result.get("common_prefixes", [])
         if detail:
             items: list[dict[str, Any]] = [
@@ -243,7 +257,11 @@ class ObstoreFilesystem:
         prefix = rel_path + "/" if rel_path else ""
         paths: list[StorageUri] = []
         for batch in self._store.list(prefix=prefix):
-            paths.extend(self._from_path(item["path"]) for item in batch)
+            paths.extend(
+                self._from_path(item["path"])
+                for item in batch
+                if not publication.is_publication_temp(item["path"])
+            )
         return paths
 
     def info(self, uri: StorageUri) -> dict:
@@ -256,7 +274,10 @@ class ObstoreFilesystem:
         }
 
     def capabilities(self) -> set[type]:
-        return {Multipart, RangedRead}
+        return {Multipart, RangedRead, AtomicPublish}
+
+    def publish_atomic(self, dst_uri: StorageUri, write: Callable[[StorageUri], None]) -> None:
+        publication.publish_atomic(dst_uri, write)
 
     @property
     def atomic_writer(self) -> AtomicWriter:

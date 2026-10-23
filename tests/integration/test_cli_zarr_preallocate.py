@@ -98,7 +98,7 @@ def test_preallocate_emits_index_ensured_wal_and_telemetry(
 
     monkeypatch.setattr(ChunkManager, "record_index_ensured_event", record_spy)
     monkeypatch.setattr(
-        "firecube.cli.zarr._preallocate.observability.create_ingestion_telemetry",
+        "firecube.core.observability.create_ingestion_telemetry",
         lambda **_kwargs: telemetry,
     )
 

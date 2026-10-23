@@ -29,55 +29,59 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 from firecube.ingestor.templates.direct_zarr import IndexedWrite
+from tests.helpers.rows import table_row
 
 
-def test_region_builder_populates_fields() -> None:
-    coord = datetime(2024, 1, 1, tzinfo=UTC)
-    data = np.zeros((100, 2048))
-    iw = IndexedWrite.region(
-        group="data",
-        array="counts",
-        coordinate=coord,
-        data=data,
-        y_slice=slice(0, 100),
-        channel_index=3,
-    )
+def test_write_intent_builders_and_exports(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "region_builder_populates_fields", tmp_path):
+        coord = datetime(2024, 1, 1, tzinfo=UTC)
+        data = np.zeros((100, 2048))
+        iw = IndexedWrite.region(
+            group="data",
+            array="counts",
+            coordinate=coord,
+            data=data,
+            y_slice=slice(0, 100),
+            channel_index=3,
+        )
 
-    assert iw.group == "data"
-    assert iw.array == "counts"
-    assert iw.coordinate is coord
-    assert iw.data is data
-    assert iw.y_slice == slice(0, 100)
-    assert iw.channel_index == 3
-    assert iw._kind == "region"
+        assert iw.group == "data"
+        assert iw.array == "counts"
+        assert iw.coordinate is coord
+        assert iw.data is data
+        assert iw.y_slice == slice(0, 100)
+        assert iw.channel_index == 3
+        assert iw._kind == "region"
 
+    with table_row(subtests, "slot_builder_populates_fields", tmp_path):
+        coord = datetime(2024, 1, 1, tzinfo=UTC)
+        data = np.zeros((4,))
+        iw = IndexedWrite.slot(
+            group="data",
+            array="qa",
+            coordinate=coord,
+            data=data,
+        )
 
-def test_slot_builder_populates_fields() -> None:
-    coord = datetime(2024, 1, 1, tzinfo=UTC)
-    data = np.zeros((4,))
-    iw = IndexedWrite.slot(
-        group="data",
-        array="qa",
-        coordinate=coord,
-        data=data,
-    )
+        assert iw.group == "data"
+        assert iw.array == "qa"
+        assert iw.coordinate is coord
+        assert iw.data is data
+        assert iw.y_slice is None
+        assert iw.channel_index is None
+        assert iw._kind == "slot"
 
-    assert iw.group == "data"
-    assert iw.array == "qa"
-    assert iw.coordinate is coord
-    assert iw.data is data
-    assert iw.y_slice is None
-    assert iw.channel_index is None
-    assert iw._kind == "slot"
-
-
-def test_coordinate_none_rejected() -> None:
-    with pytest.raises(ValueError, match="coordinate must not be None"):
+    with (
+        table_row(subtests, "coordinate_none_rejected", tmp_path),
+        pytest.raises(ValueError, match="coordinate must not be None"),
+    ):
         IndexedWrite.slot(
             group="data",
             array="qa",
@@ -85,9 +89,10 @@ def test_coordinate_none_rejected() -> None:
             data=np.zeros((4,)),
         )
 
-
-def test_y_slice_non_slice_rejected() -> None:
-    with pytest.raises(ValueError, match="y_slice must be a slice"):
+    with (
+        table_row(subtests, "y_slice_non_slice_rejected", tmp_path),
+        pytest.raises(ValueError, match="y_slice must be a slice"),
+    ):
         IndexedWrite(
             group="data",
             array="counts",
@@ -96,33 +101,28 @@ def test_y_slice_non_slice_rejected() -> None:
             y_slice=42,  # type: ignore[arg-type]
         )
 
+    with table_row(subtests, "no_static_builder", tmp_path):
+        assert not callable(getattr(IndexedWrite, "static", None))
 
-def test_no_static_builder() -> None:
-    assert not callable(getattr(IndexedWrite, "static", None))
+    with table_row(subtests, "coordinate_is_field_not_classmethod", tmp_path):
+        assert not callable(getattr(IndexedWrite, "coordinate", None))
 
+    with table_row(subtests, "frozen_instance_rejects_mutation", tmp_path):
+        iw = IndexedWrite.slot(
+            group="data",
+            array="qa",
+            coordinate=datetime(2024, 1, 1, tzinfo=UTC),
+            data=np.zeros((4,)),
+        )
+        with pytest.raises(FrozenInstanceError):
+            iw.group = "other"  # type: ignore[misc]
 
-def test_coordinate_is_field_not_classmethod() -> None:
-    assert not callable(getattr(IndexedWrite, "coordinate", None))
+    with table_row(subtests, "reexport_from_core_api", tmp_path):
+        from firecube.core.api import IndexedWrite as CoreIndexedWrite
 
+        assert CoreIndexedWrite is IndexedWrite
 
-def test_frozen_instance_rejects_mutation() -> None:
-    iw = IndexedWrite.slot(
-        group="data",
-        array="qa",
-        coordinate=datetime(2024, 1, 1, tzinfo=UTC),
-        data=np.zeros((4,)),
-    )
-    with pytest.raises(FrozenInstanceError):
-        iw.group = "other"  # type: ignore[misc]
+    with table_row(subtests, "reexport_from_ingestor_api", tmp_path):
+        from firecube.ingestor.api import IndexedWrite as IngestorIndexedWrite
 
-
-def test_reexport_from_core_api() -> None:
-    from firecube.core.api import IndexedWrite as CoreIndexedWrite
-
-    assert CoreIndexedWrite is IndexedWrite
-
-
-def test_reexport_from_ingestor_api() -> None:
-    from firecube.ingestor.api import IndexedWrite as IngestorIndexedWrite
-
-    assert IngestorIndexedWrite is IndexedWrite
+        assert IngestorIndexedWrite is IndexedWrite

@@ -22,6 +22,7 @@ legacy ``_open_fsspec_url`` adapter when a session is supplied.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -29,6 +30,7 @@ import xarray as xr
 
 from firecube.core.config import StorageConfig
 from firecube.core.tensogram.metadata import extract_zarr_array_metadata
+from tests.helpers.rows import table_row
 from tests.helpers.storage import assert_no_fsspec_bypass, make_test_session
 
 pytestmark = pytest.mark.unit
@@ -42,42 +44,42 @@ def _seed_zarr_group(target: Path, group: str = "G") -> None:
     ds.to_zarr(str(target), group=group, mode="w", zarr_format=3)
 
 
-def test_extract_zarr_array_metadata_no_bypass(tmp_path: Path) -> None:
-    target = tmp_path / "product.zarr"
-    _seed_zarr_group(target, "G")
+def test_driver_parity_zarr_to_tgm_no_bypass(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "extract_zarr_array_metadata_no_bypass", tmp_path) as (workdir, _):
+        target = workdir / "product.zarr"
+        _seed_zarr_group(target, "G")
 
-    session = make_test_session(tmp_path, product="product.zarr")
-    config = StorageConfig(storage_type="local")
-    config.target_path = str(tmp_path)  # type: ignore[attr-defined]
+        session = make_test_session(workdir, product="product.zarr")
+        config = StorageConfig(storage_type="local")
+        config.target_path = str(workdir)  # type: ignore[attr-defined]
 
-    with assert_no_fsspec_bypass():
-        meta = extract_zarr_array_metadata(
-            str(target),
-            "G",
-            storage_config=config,
-            session=session,
+        with assert_no_fsspec_bypass():
+            meta = extract_zarr_array_metadata(
+                str(target),
+                "G",
+                storage_config=config,
+                session=session,
+            )
+
+        assert "val" in meta
+        assert meta["val"]["chunks"]
+        assert meta["val"]["dtype"] == "float32"
+
+    with table_row(subtests, "zarr_to_tgm_no_bypass", tmp_path) as (workdir, _):
+        from firecube.core.tensogram.converter import zarr_to_tgm
+
+        src = workdir / "test.zarr"
+        tgt = workdir / "test.tgm"
+        ds = xr.Dataset(
+            {"FWI": (["t", "y"], np.ones((3, 4), dtype="float32"))},
+            coords={"t": [0, 1, 2], "y": [1, 2, 3, 4]},
         )
+        ds.to_zarr(str(src))
 
-    assert "val" in meta
-    assert meta["val"]["chunks"]
-    assert meta["val"]["dtype"] == "float32"
+        session = make_test_session(workdir, product="test.zarr")
 
+        with assert_no_fsspec_bypass():
+            result = zarr_to_tgm(str(src), str(tgt), session=session)
 
-def test_zarr_to_tgm_no_bypass(tmp_path: Path) -> None:
-    from firecube.core.tensogram.converter import zarr_to_tgm
-
-    src = tmp_path / "test.zarr"
-    tgt = tmp_path / "test.tgm"
-    ds = xr.Dataset(
-        {"FWI": (["t", "y"], np.ones((3, 4), dtype="float32"))},
-        coords={"t": [0, 1, 2], "y": [1, 2, 3, 4]},
-    )
-    ds.to_zarr(str(src))
-
-    session = make_test_session(tmp_path, product="test.zarr")
-
-    with assert_no_fsspec_bypass():
-        result = zarr_to_tgm(str(src), str(tgt), session=session)
-
-    assert tgt.exists()
-    assert result["variables"] == ["FWI"]
+        assert tgt.exists()
+        assert result["variables"] == ["FWI"]

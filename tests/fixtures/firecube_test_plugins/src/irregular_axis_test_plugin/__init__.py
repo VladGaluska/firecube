@@ -41,6 +41,7 @@ from collections.abc import Iterable
 from typing import Any, ClassVar
 
 import numpy as np
+from regular_axis_test_plugin import RegularAxisCalendarConfig, RegularAxisCalendarIngestor
 
 from firecube.core.api import AUTO, IndexSpec, IrregularTimeAxis, ItemInfo
 from firecube.ingestor.api import (
@@ -307,3 +308,30 @@ class IrregularAxisConcreteIngestor(DirectZarrIngestor):
             slot = resolved.position("data", info.coordinate)
             intents.append(WriteIntent.slot(group="data", array="values", index=slot, data=None))
         return intents
+
+
+_CALENDAR_DAY_OFFSETS = (0, 29, 30, 59, 60)  # 360_day: Jan 1, Jan 30, Feb 1, Feb 30, Mar 1
+
+
+@register_ingestor("irregular_axis_calendar")
+class IrregularAxisCalendarIngestor(RegularAxisCalendarIngestor):
+    """Five explicit ``cftime`` values on a CF calendar (``calendar`` option); item ``i`` writes ``i``."""
+
+    PRODUCT_NAME: ClassVar[str] = "irregular_axis_calendar"
+
+    def _slot_count(self) -> int:
+        return len(_CALENDAR_DAY_OFFSETS)
+
+    def _coordinate(self, item: int) -> Any:
+        return super()._coordinate(_CALENDAR_DAY_OFFSETS[item])  # the parent counts days
+
+    def index_spec(self, ctx: PluginContext) -> IndexSpec:
+        assert isinstance(self.plugin_config, RegularAxisCalendarConfig)
+        values = tuple(self._coordinate(i) for i in range(self._slot_count()))
+        axis = IrregularTimeAxis(
+            coordinate="time",
+            values=values,
+            calendar=self.plugin_config.calendar,
+            units="days since 2049-01-01 00:00:00",
+        )
+        return IndexSpec(name="irregular_axis_calendar_v1", groups={"data": axis})

@@ -47,16 +47,6 @@ def _storage_probe(
     click.echo(json.dumps({"anonymous": storage_config.anonymous}))
 
 
-def test_anonymous_env_sets_storage_config() -> None:
-    storage_config = build_storage_config(
-        {"storage": {"type": "s3"}},
-        {"FIRECUBE_S3_ANONYMOUS": "true"},
-        {},
-    )
-
-    assert storage_config.anonymous is True
-
-
 def test_anonymous_cli_sets_storage_config() -> None:
     result = CliRunner().invoke(_storage_probe, ["--storage-anonymous"])
 

@@ -16,9 +16,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import xarray as xr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
+from firecube.core.controlplane import ChunkManager
+from tests.helpers.storage import make_test_binding
 
 
 def _invoke_create(args: list[str]):
@@ -97,3 +101,34 @@ def test_create_resolves_file_uri_archive(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert seen["target"] == str(archive_path)
+
+
+def test_create_refuses_a_360_day_time_coordinate_and_records_the_run_failed(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "product.zarr"
+    times = xr.date_range("2020-01-01", periods=5, freq="D", calendar="360_day", use_cftime=True)
+    xr.Dataset({"FWI": (["time"], np.arange(5, dtype="float32"))}, coords={"time": times}).to_zarr(
+        src
+    )
+    manager = ChunkManager(binding=make_test_binding(tmp_path), workspace=tmp_path)
+    try:
+        manager.record_run_started(
+            product="product.zarr", run_id="seed", output_path=str(src),
+            output_format="zarr", size=0, meta={},
+        )  # fmt: skip
+    finally:
+        manager.close()
+    args = ["--source", src.as_uri(), "--archive", (tmp_path / "out.tgm").as_uri()]
+    args += ["--storage-type", "local", "--storage-driver", "fsspec"]
+    env = {"FIRECUBE_STORAGE_TYPE": "local", "FIRECUBE_TARGET_PATH": str(tmp_path)}
+
+    result = CliRunner().invoke(cli, ["archive", "create", *args], env=env)
+
+    assert result.exit_code != 0, result.output
+    assert "Cannot archive time coordinate 'time': calendar='360_day' is not Gregorian-like" in (
+        result.output
+    )
+    assert "Traceback" not in result.output
+    events = "".join(p.read_text() for p in (src / ".firecube" / "runs").glob("archive-create-*/*"))
+    assert "maintenance_failed" in events

@@ -22,8 +22,10 @@ from typing import Any
 
 import click
 
+from firecube.cli._errors import render
 from firecube.core.config import get_plugin_defaults, load_config_file
-from firecube.core.formats._input_filters import (
+from firecube.core.errors import ConfigFileError
+from firecube.core.formats.input_filters import (
     reject_legacy_input_patterns,
     validate_input_filters,
 )
@@ -45,7 +47,7 @@ def _parse_input_filters(
         return validate_input_filters(parsed)
     except (ValueError, TypeError) as exc:
         raise click.BadParameter(
-            f"{exc}. Use a quoted JSON list, for example: "
+            f"{render(exc)}. Use a quoted JSON list, for example: "
             '--input-filters \'["*.csv","!draft_*.csv"]\'',
             ctx=ctx,
             param=param,
@@ -78,11 +80,14 @@ def resolve_input_filters(
     """Resolve only input filters, keeping other command defaults untouched."""
     if defaults is None:
         config_file = (ctx.obj or {}).get("config_file")
-        cfg = load_config_file(config_file, strict=config_file is not None)
+        try:
+            cfg = load_config_file(config_file, strict=config_file is not None)
+        except ConfigFileError as exc:
+            raise click.UsageError(render(exc, ctx), ctx=ctx) from exc
         defaults = get_plugin_defaults(cfg, plugin)
     try:
         reject_legacy_input_patterns(defaults)
         configured = validate_input_filters(defaults.get("input_filters"))
         return configured if supplied is None else validate_input_filters(supplied)
     except ValueError as exc:
-        raise click.UsageError(str(exc), ctx=ctx) from exc
+        raise click.UsageError(render(exc, ctx), ctx=ctx) from exc

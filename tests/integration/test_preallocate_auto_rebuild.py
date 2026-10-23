@@ -134,7 +134,7 @@ def test_preallocate_auto_rebuild_uses_bound_spec(
             return None
 
     monkeypatch.setattr(
-        "firecube.cli.zarr._preallocate.observability.create_ingestion_telemetry",
+        "firecube.core.observability.create_ingestion_telemetry",
         lambda **_kwargs: _FakeTelemetry(),
     )
 

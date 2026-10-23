@@ -111,11 +111,51 @@ Each create is recorded as an `archive-create-…` run in the source product,
 with status `complete` or `failed`:
 
 ```bash
-firecube chunks runs list --target "$PRODUCT_URI" --product-name MY_PRODUCT.zarr
+firecube chunks runs list --product-name "$PRODUCT_URI"
 ```
 
-Products without a `.firecube/` control plane are archived without a record
+If Firecube cannot write the record, the run can stay `started`. See
+[Access And Claims](#access-and-claims).
+
+The record holds the start time, group, date window, variables and size of the
+archive.
+
+Products without a `.firecube/schema.json` file are archived without a record
 and are not modified.
+
+## Access And Claims
+
+If the source has a `.firecube/schema.json` file, `archive create` writes to
+the control plane of the source. Use credentials with write access to the
+source.
+
+- The command takes the maintenance claim of the product for the whole create.
+  If another claim is active on the product, the command stops and names it.
+- The command refuses anonymous storage access (`--storage-anonymous`) and
+  exits with code 2. Use credentials that can write to the source.
+- If the command cannot write the record, it exits with code 1. The archive
+  file stays in place. The message names the archive path and the record error.
+  The run of the failed create can stay `started`. Recover with these steps:
+  1. Fix the cause of the record error.
+  2. List the runs that have the status `started`:
+
+     ```bash
+     firecube chunks runs list --product-name "$PRODUCT_URI" --status started
+     ```
+
+  3. Abandon the earlier `archive-create-…` run:
+
+     ```bash
+     firecube chunks runs abandon \
+       --product-name "$PRODUCT_URI" \
+       --run-id <run-id> \
+       --reason "archive create record failed" \
+       --yes-i-really-mean-it
+     ```
+
+  4. Run the create again with `--overwrite --yes-i-really-mean-it`.
+
+A source without a `.firecube/schema.json` file gets no claim and no record.
 
 ## Next Steps
 

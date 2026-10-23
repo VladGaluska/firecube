@@ -28,14 +28,18 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import click
 import numpy as np
 import pytest
 import xarray as xr
 import zarr
+from click.testing import CliRunner
 
+from firecube.cli._errors import render, wrap_user_facing_errors
 from firecube.core.config import StorageConfig
 from firecube.ingestor.errors import AppendOverwriteRefused
 from firecube.ingestor.runtime.zarr.append_services import AppendResumeService
+from tests.helpers.cli_hints import parse_hint
 
 pytestmark = pytest.mark.unit
 
@@ -105,8 +109,9 @@ def test_error_message_points_at_zarr_validate(tmp_path: Path) -> None:
 
     message = str(exc_info.value)
     assert "unsorted_existing_coord" in message
-    assert "firecube zarr validate" in message
-    assert "validate" in message
+    assert "`firecube.core.zarr.validation.validate_group_with_fs`" in message
+    assert "firecube zarr validate" not in message
+    assert "firecube zarr validate" in render(exc_info.value)
 
 
 def test_unsorted_incoming_refused_via_classify_dataset(tmp_path: Path) -> None:
@@ -127,3 +132,13 @@ def test_unsorted_incoming_refused_via_classify_dataset(tmp_path: Path) -> None:
     message = str(exc_info.value)
     assert "build_dataset" in message
     assert "pipeline_batch_size" in message
+
+
+def test_repro_unsorted_existing_validate_command_parses() -> None:
+    @click.command()
+    @wrap_user_facing_errors
+    def refuse() -> None:
+        raise AppendOverwriteRefused(["2024-01-01"], "unsorted_existing_coord")
+
+    result = CliRunner().invoke(refuse)
+    assert parse_hint(result.output, "firecube zarr validate") == "zarr validate"

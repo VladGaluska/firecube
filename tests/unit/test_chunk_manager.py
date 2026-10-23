@@ -16,13 +16,29 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import time
+from contextlib import ExitStack, closing
+from pathlib import Path
+from typing import Any
+
 import pytest
 
+from firecube.cli._errors import render
+from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkInfo, ChunkManager, SpanCoverage, build_span_entry
+from firecube.core.controlplane.manager import maintenance_refusal_message
+from firecube.core.controlplane.types import WriteDomain
+from firecube.core.errors import ClaimConflictError, ManifestError
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.uri import StorageUri
+from tests.helpers.cli_hints import run_hint
+from tests.helpers.rows import table_row
+from tests.helpers.storage import make_test_binding
+from tests.unit._helpers.counting_fs import CountingFilesystem, make_counting_local_fs
 
 
 def _chunk_manager(workspace, base_uri: str | None = None) -> ChunkManager:
@@ -233,122 +249,49 @@ class TestChunkManager:
         assert len(run_entries) == 1
         assert run_entries[0].chunk_type == "run"
 
-    def test_list_chunks_time_range_time_min_after(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
+    def test_list_chunks_time_range_filters(self, subtests: Any, temp_workspace: Path) -> None:
+        # Q2 ends exactly on the time_max_before bound and starts exactly on the
+        # time_min_after bound: both bounds are inclusive.
+        quarters = (
+            ("Q1", "2024-01-01T00:00:00", "2024-03-31T23:59:59"),
+            ("Q2", "2024-04-01T00:00:00", "2024-06-01T00:00:00"),
+            ("Q3", "2024-07-01T00:00:00", "2024-09-30T23:59:59"),
         )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-30T23:59:59",
+        rows: tuple[tuple[str, dict[str, Any], set[str]], ...] = (
+            (
+                "test_list_chunks_time_range_time_min_after",
+                {"time_min_after": "2024-04-01T00:00:00"},
+                {"Q2", "Q3"},
+            ),
+            (
+                "test_list_chunks_time_range_time_max_before",
+                {"time_max_before": "2024-06-01T00:00:00"},
+                {"Q1", "Q2"},
+            ),
+            (
+                "test_list_chunks_time_overlap_returns_partial_matches",
+                {"time_overlaps": ("2024-02-01T00:00:00", "2024-05-01T00:00:00")},
+                {"Q1", "Q2"},
+            ),
         )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
+        for row_id, query, expected in rows:
+            with table_row(subtests, row_id, temp_workspace) as (workdir, _):
+                manager = _chunk_manager(workdir)
+                for n, (group, time_min, time_max) in enumerate(quarters, start=1):
+                    _record_completed_span_run(
+                        manager,
+                        product="test_product",
+                        run_id=f"run-00{n}",
+                        group=group,
+                        batch_id=f"batch-00{n}",
+                        time_min=time_min,
+                        time_max=time_max,
+                    )
 
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_min_after="2024-04-01T00:00:00",
-        )
+                chunks = manager.list_chunks(product="test_product", chunk_type="span", **query)
 
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q2", "Q3"}
-
-    def test_list_chunks_time_range_time_max_before(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-01T00:00:00",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
-
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_max_before="2024-06-01T00:00:00",
-        )
-
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q1", "Q2"}
-
-    def test_list_chunks_time_overlap_returns_partial_matches(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-001",
-            group="Q1",
-            batch_id="batch-001",
-            time_min="2024-01-01T00:00:00",
-            time_max="2024-03-31T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-002",
-            group="Q2",
-            batch_id="batch-002",
-            time_min="2024-04-01T00:00:00",
-            time_max="2024-06-30T23:59:59",
-        )
-        _record_completed_span_run(
-            manager,
-            product="test_product",
-            run_id="run-003",
-            group="Q3",
-            batch_id="batch-003",
-            time_min="2024-07-01T00:00:00",
-            time_max="2024-09-30T23:59:59",
-        )
-
-        chunks = manager.list_chunks(
-            product="test_product",
-            chunk_type="span",
-            time_overlaps=("2024-02-01T00:00:00", "2024-05-01T00:00:00"),
-        )
-
-        assert len(chunks) == 2
-        assert {_chunk_group(chunk) for chunk in chunks} == {"Q1", "Q2"}
+                assert len(chunks) == 2
+                assert {_chunk_group(chunk) for chunk in chunks} == expected
 
     def test_list_chunks_time_overlap_excludes_non_overlapping_spans(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)
@@ -454,20 +397,17 @@ class TestChunkManager:
         assert _chunk_group(chunks[0]) == "F024"
         assert chunks[0].status == "active"
 
-    def test_span_coverage_timestamps_written_counts_ranges(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[[0, 9], [20, 29]])
+    def test_span_coverage_timestamps_written(self, subtests: Any, temp_workspace: Path) -> None:
+        rows = (
+            ("test_span_coverage_timestamps_written_counts_ranges", [[0, 9], [20, 29]], 20),
+            ("test_span_coverage_timestamps_written_single_timestamp", [[0, 0]], 1),
+            ("test_span_coverage_timestamps_written_empty_ranges", [], 0),
+        )
+        for row_id, ranges, expected in rows:
+            with table_row(subtests, row_id, temp_workspace):
+                coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=ranges)
 
-        assert coverage.timestamps_written == 20
-
-    def test_span_coverage_timestamps_written_single_timestamp(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[[0, 0]])
-
-        assert coverage.timestamps_written == 1
-
-    def test_span_coverage_timestamps_written_empty_ranges(self):
-        coverage = SpanCoverage(group="G", arrays=["G/x"], time_index_ranges=[])
-
-        assert coverage.timestamps_written == 0
+                assert coverage.timestamps_written == expected
 
     def test_build_span_entry_includes_timestamps_written(self):
         entry = build_span_entry(
@@ -494,134 +434,65 @@ class TestChunkManager:
 
         assert chunk.timestamps_written == 20
 
-    def test_list_runs_filters_by_status_started(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
+    def test_list_runs_filters(self, subtests: Any, temp_workspace: Path) -> None:
+        # (row id, list_runs filter, expected run id, expected status, expected is_terminal)
+        rows: tuple[tuple[str, dict[str, Any], str, str, bool], ...] = (
+            (
+                "test_list_runs_filters_by_status_started",
+                {"status": "started"},
+                "run-started",
+                "started",
+                False,
+            ),
+            (
+                "test_list_runs_filters_non_terminal_runs",
+                {"non_terminal": True},
+                "run-started",
+                "started",
+                False,
+            ),
+            (
+                "test_list_runs_filters_by_status_complete",
+                {"status": "complete"},
+                "run-complete",
+                "complete",
+                True,
+            ),
         )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
+        for row_id, query, run_id, status, terminal in rows:
+            with table_row(subtests, row_id, temp_workspace) as (workdir, _):
+                manager = _chunk_manager(workdir)
+                _record_started_run(manager, product="P", run_id="run-started")
+                _record_completed_span_run(
+                    manager,
+                    product="P",
+                    run_id="run-complete",
+                    group="F024",
+                    batch_id="batch-001",
+                )
+                manager.record_run_terminal(
+                    product="P",
+                    run_id="run-failed",
+                    output_path=str(manager.workspace / "P"),
+                    output_format="zarr",
+                    size=0,
+                    meta={"plugin": "test"},
+                    status="failed",
+                    error="boom",
+                )
+                _record_started_run(manager, product="P", run_id="run-abandoned")
+                manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
 
-        runs = manager.list_runs(product="P", status="started")
+                runs = manager.list_runs(product="P", **query)
 
-        assert [run.status for run in runs] == ["started"]
-        assert [run.run_id for run in runs] == ["run-started"]
-
-    def test_list_runs_filters_non_terminal_runs(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", non_terminal=True)
-
-        assert [run.status for run in runs] == ["started"]
-        assert [run.run_id for run in runs] == ["run-started"]
-
-    def test_list_runs_filters_by_status_complete(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", status="complete")
-
-        assert [run.status for run in runs] == ["complete"]
-        assert [run.run_id for run in runs] == ["run-complete"]
+                assert [run.status for run in runs] == [status]
+                assert [run.run_id for run in runs] == [run_id]
+                assert [run.is_terminal for run in runs] == [terminal]
 
     def test_list_runs_empty_product_returns_empty_list(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)
 
         assert manager.list_runs(product="P") == []
-
-    def test_list_runs_non_terminal_excludes_terminal_runs(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_started_run(manager, product="P", run_id="run-started")
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-complete",
-            group="F024",
-            batch_id="batch-001",
-        )
-        manager.record_run_terminal(
-            product="P",
-            run_id="run-failed",
-            output_path=str(manager.workspace / "P"),
-            output_format="zarr",
-            size=0,
-            meta={"plugin": "test"},
-            status="failed",
-            error="boom",
-        )
-        _record_started_run(manager, product="P", run_id="run-abandoned")
-        manager.abandon_run(product="P", run_id="run-abandoned", reason="stale")
-
-        runs = manager.list_runs(product="P", non_terminal=True)
-
-        assert [run.run_id for run in runs] == ["run-started"]
-        assert all(not run.is_terminal for run in runs)
-
-    def test_time_coverage_summary_returns_expected_shape(self, temp_workspace):
-        manager = _chunk_manager(temp_workspace)
-        _record_completed_span_run(
-            manager,
-            product="P",
-            run_id="run-001",
-            group="G1",
-            batch_id="batch-001",
-        )
-
-        time_coverage_summary = manager.time_coverage_summary
-        summary = time_coverage_summary(product="P")
-
-        assert isinstance(summary, list)
-        assert summary == [
-            {
-                "group": "G1",
-                "time_min": "2024-01-01T00:00:00",
-                "time_max": "2024-01-02T00:00:00",
-                "span_count": 1,
-                "total_timestamps_written": 2,
-            }
-        ]
 
     def test_time_coverage_summary_aggregates_per_group(self, temp_workspace):
         manager = _chunk_manager(temp_workspace)
@@ -797,3 +668,131 @@ class TestChunkManagerIntegration:
         with pytest.raises(AttributeError):
             attr_name = "output_base_uri"
             setattr(manager, attr_name, "s3://test-bucket/data")
+
+
+def _claim(manager, stack, name, owner):
+    domain = WriteDomain(product="test_product", category="zarr_region", name=name)
+    return stack.enter_context(
+        manager.acquire_claim(product="test_product", domain=domain, owner_id=owner)
+    )
+
+
+def test_abandon_releases_only_claims_the_run_owns(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    with closing(manager), ExitStack() as stack:
+        for run_id in ("run-r", "run-r__slot=0-4", "run-r:x"):
+            _record_started_run(manager, product=product, run_id=run_id)
+        for name, owner in (
+            ("grp:slot=0", "run-r:grp:slot=0"),
+            ("grp:schema", "run-r:grp"),
+            ("grp:slot=1", "run-r__slot=0-4:grp:slot=1"),
+            ("grp:slot=2", "run-r:x:grp:slot=2"),
+        ):
+            _claim(manager, stack, name, owner)
+        result = manager.abandon_run(product=product, run_id="run-r", reason="killed writer")
+        left = {claim.owner_id for claim in manager.list_claims(product=product)}
+        assert left == {"run-r__slot=0-4:grp:slot=1", "run-r:x:grp:slot=2"}
+        _claim(manager, stack, "grp:slot=0", "other")
+        prefix = f"{product}:zarr_region:"
+        assert result["released_claims"] == [f"{prefix}grp:schema", f"{prefix}grp:slot=0"]
+        assert result["skipped_claims"] == [f"{prefix}grp:slot=2"]
+
+
+def test_abandon_of_terminal_run_releases_leftover_claims(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        manager.record_run_terminal(
+            product=product, run_id="run-r", output_path="o", output_format="zarr",
+            size=0, meta={}, status="abandoned",
+        )  # fmt: skip
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        result = manager.abandon_run(product=product, run_id="run-r", reason="finish")
+        assert manager.list_claims(product=product) == []
+        assert (result["abandoned"], result["status"]) == (False, "abandoned")
+        assert result["released_claims"] == [f"{product}:zarr_region:grp:slot=0"]
+
+
+def test_claim_conflict_names_owner_run_and_clear_command(temp_workspace):
+    product, manager = "test_product", _chunk_manager(temp_workspace)
+    domain = f"{product}:zarr_region:grp:slot=0"
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        with pytest.raises(ClaimConflictError) as excinfo:
+            _claim(manager, stack, "grp:slot=0", "other")
+        message, root = str(excinfo.value), manager.get_product_root(product)
+        printed = render(excinfo.value)
+        clear = f"firecube chunks claims clear --product-name {root} --domain {domain}"
+        assert f"{clear} --force" in printed
+        assert message.startswith(f"Write-domain claim conflict for {domain}")
+        assert "run-r" in message and "started" in message
+        assert "which releases the claims it alone owns" in message
+        assert "ChunkManager.clear_claim" in message and "firecube chunks" not in message
+        run_hint(printed, "firecube chunks claims clear", "--yes-i-really-mean-it")
+        assert manager.list_claims(product=product) == []
+
+
+def test_maintenance_refusal_resolves_a_shared_owner_once(temp_workspace):
+    product, fs = "test_product", CountingFilesystem(make_counting_local_fs(temp_workspace)[1])
+    binding = make_test_binding(temp_workspace, product=product)
+    manager = ChunkManager(binding=binding, workspace=temp_workspace, filesystem=fs)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        for k in range(10):
+            _claim(manager, stack, f"grp:slot={k}", "run-r:grp")
+        claims, ls_calls, unnamed = manager.list_claims(product=product), [], []
+        for batch in (claims, claims[:1]):
+            fs.reset()
+            message = maintenance_refusal_message(
+                repo=manager.repo, product=product, operation="scrub", detail="busy", claims=batch
+            )
+            ls_calls.append(fs.counts["ls"])
+            unnamed += [c.domain for c in batch if f"--domain {c.domain}" not in render(message)]
+        assert unnamed == []
+        assert ls_calls[0] == ls_calls[1], f"owner resolved once per claim: {ls_calls}"
+
+
+@pytest.mark.contract
+def test_abandon_refuses_when_claims_cannot_be_listed(temp_workspace):
+    class _Unlistable(CountingFilesystem):
+        broken = True
+
+        def ls(self, uri, detail=False, refresh=False):
+            if self.broken and uri.path.endswith("/claims"):
+                raise PermissionError("claims directory not listable")
+            return super().ls(uri, detail=detail, refresh=refresh)
+
+    product, fs = "test_product", _Unlistable(make_counting_local_fs(temp_workspace)[1])
+    binding = make_test_binding(temp_workspace, product=product)
+    manager = ChunkManager(binding=binding, workspace=temp_workspace, filesystem=fs)
+    with closing(manager), ExitStack() as stack:
+        _record_started_run(manager, product=product, run_id="run-r")
+        _claim(manager, stack, "grp:slot=0", "run-r:grp:slot=0")
+        with pytest.raises(ManifestError, match=r"(?s)run-r.*again") as excinfo:
+            manager.abandon_run(product=product, run_id="run-r", reason="killed writer")
+        assert excinfo.value.context.product_uri == manager.get_product_root(product)
+        assert excinfo.value.context.run_id == "run-r"
+        (abandon,) = excinfo.value.recovery
+        assert (abandon.name, abandon.arguments["run_id"]) == ("abandon_run", "run-r")
+        assert [run.status for run in manager.list_runs(product=product)] == ["abandoned"]
+        fs.broken = False
+        assert [c.owner_id for c in manager.list_claims(product=product)] == ["run-r:grp:slot=0"]
+
+
+def test_repro_stale_snapshot_warning_names_only_options_snapshots_rebuild_has(
+    temp_workspace, monkeypatch, caplog
+):
+    with closing(_chunk_manager(temp_workspace)) as manager:
+        _record_completed_span_run(manager, product="p", run_id="run-1", group="g", batch_id="b")
+        manager.rebuild_snapshot("p")
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now + 2 * 86400)
+
+    with closing(_chunk_manager(temp_workspace)) as manager, caplog.at_level(logging.WARNING):
+        manager.list_chunks(product="p", chunk_type="span")
+
+    command = cli.commands["chunks"].commands["snapshots"].commands["rebuild"]  # type: ignore[attr-defined]
+    known = {opt for param in command.params for opt in param.opts} | {"--help"}
+    printed = set(re.findall(r"--[a-z][\w-]*", caplog.text))
+    assert "hours old" in caplog.text and printed <= known, (caplog.text, printed - known)

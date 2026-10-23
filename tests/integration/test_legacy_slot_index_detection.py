@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 from click.testing import CliRunner
 
+from firecube.cli._errors import render
 from firecube.cli.main import cli
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.manager import check_legacy_index_record
@@ -59,6 +60,7 @@ from firecube.ingestor.api import (
     register_ingestor,
 )
 from firecube.ingestor.registry import loader
+from tests.helpers.cli_hints import parse_hint
 
 pytestmark = pytest.mark.integration
 
@@ -187,28 +189,6 @@ def _preallocate_args(target_dir: Path) -> list[str]:
     ]
 
 
-def test_helper_raises_when_only_legacy_record_present(tmp_path: Path) -> None:
-    target_dir = tmp_path / "legacy-only.zarr"
-    manager = _manager(target_dir)
-    _seed_legacy_record(manager)
-    assert _legacy_current_path(target_dir).exists()
-    assert not _index_current_path(target_dir).exists()
-
-    with pytest.raises(LegacyIndexRecordError) as excinfo:
-        check_legacy_index_record(
-            manager,
-            product=PRODUCT_NAME,
-            plugin_name=PLUGIN_NAME,
-        )
-
-    message = str(excinfo.value)
-    legacy_path = _legacy_current_path(target_dir)
-    assert "Legacy index record detected at" in message
-    assert str(legacy_path) in message
-    assert "firecube zarr index rebuild" in message
-    assert f"--plugin {PLUGIN_NAME}" in message
-
-
 def test_helper_passes_when_both_records_present(tmp_path: Path) -> None:
     target_dir = tmp_path / "both-records.zarr"
     manager = _manager(target_dir)
@@ -232,19 +212,6 @@ def test_helper_passes_when_both_records_present(tmp_path: Path) -> None:
     )
 
 
-def test_helper_passes_on_fresh_cube(tmp_path: Path) -> None:
-    target_dir = tmp_path / "fresh.zarr"
-    manager = _manager(target_dir)
-    assert not _legacy_current_path(target_dir).exists()
-    assert not _index_current_path(target_dir).exists()
-
-    check_legacy_index_record(
-        manager,
-        product=PRODUCT_NAME,
-        plugin_name=PLUGIN_NAME,
-    )
-
-
 def test_direct_zarr_startup_raises_on_legacy_only_cube(tmp_path: Path) -> None:
     target_dir = tmp_path / "startup-legacy-only.zarr"
     manager = _manager(target_dir)
@@ -259,7 +226,10 @@ def test_direct_zarr_startup_raises_on_legacy_only_cube(tmp_path: Path) -> None:
 
     message = str(excinfo.value)
     assert "Legacy index record detected at" in message
-    assert "firecube zarr index rebuild" in message
+    assert str(_legacy_current_path(target_dir)) in message
+    assert "`firecube.ingestor.runtime.index_record.rebuild_index_record`" in message
+    assert "firecube zarr" not in message
+    assert f"--plugin {ingestor.name} " in render(excinfo.value)
     assert not _index_current_path(target_dir).exists(), (
         "resolved-index current.json must NOT be written when legacy detection fires"
     )
@@ -300,3 +270,12 @@ def test_preallocate_cli_succeeds_on_fresh_cube(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert _index_current_path(target_dir).exists()
     assert not _legacy_current_path(target_dir).exists()
+
+
+def test_repro_legacy_rebuild_command_quotes_target_with_space(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target with space.zarr"
+    _seed_legacy_record(_manager(target_dir))
+    args = _preallocate_args(target_dir)
+    args[args.index("--target") + 1] = f"file://{target_dir}"  # as_uri() would encode the space
+    result = CliRunner().invoke(cli, args)
+    assert parse_hint(result.output, "firecube zarr index rebuild") == "zarr index rebuild"

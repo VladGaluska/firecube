@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from typing import Any
+
 import pytest
 from zarr.codecs import BloscCodec, BytesCodec
 
@@ -24,85 +27,48 @@ from firecube.ingestor.api import ZarrArraySpec
 pytestmark = pytest.mark.unit
 
 
-@pytest.fixture()
-def writer(tmp_path) -> RegionZarrWriter:
-    return RegionZarrWriter(str(tmp_path / "codec-drift.zarr"))
+_BLOSC_5 = [BloscCodec(cname="zstd", clevel=5)]
+_BLOSC_9 = ({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 9}},)
+_CODEC_DRIFT_ROWS: tuple[tuple[str, dict[str, Any], dict[str, Any], str | None], ...] = (
+    # (row id, stored-array kwargs, declared-spec kwargs, expected drifted field or None)
+    (
+        "declared_compressor_level_drift_raises",
+        {"compressors": _BLOSC_5},
+        {"compressors": _BLOSC_9},
+        "compressors",
+    ),
+    (
+        "static_array_declared_compressor_drift_raises",
+        {"compressors": _BLOSC_5},
+        {"time_indexed": False, "compressors": _BLOSC_9},
+        "compressors",
+    ),
+    (
+        "declared_serializer_endian_drift_raises",
+        {"dtype": "i4", "serializer": BytesCodec(endian="little")},
+        {"dtype": "i4", "serializer": {"name": "bytes", "configuration": {"endian": "big"}}},
+        "serializer",
+    ),
+    ("undeclared_codecs_do_not_drift_against_zarr_defaults", {}, {}, None),
+    (
+        "declared_compressor_key_order_does_not_drift",
+        {"compressors": _BLOSC_5},
+        {"compressors": ({"configuration": {"clevel": 5, "cname": "zstd"}, "name": "blosc"},)},
+        None,
+    ),
+)
 
 
-def test_declared_compressor_level_drift_raises(writer: RegionZarrWriter) -> None:
-    writer.ensure_group(
-        "grp/data",
-        shape=(10,),
-        dtype="f4",
-        compressors=[BloscCodec(cname="zstd", clevel=5)],
-    )
-    spec = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 9}},),
-    )
-
-    with pytest.raises(SchemaDriftError, match="field='compressors'"):
-        writer.verify_array_spec("grp/data", spec, expected_time_count=10)
-
-
-def test_undeclared_codecs_do_not_drift_against_zarr_defaults(writer: RegionZarrWriter) -> None:
-    writer.ensure_group("grp/data", shape=(10,), dtype="f4")
-    spec = ZarrArraySpec(name="data", shape=(10,), dtype="f4")
-
-    writer.verify_array_spec("grp/data", spec, expected_time_count=10)
-
-
-def test_static_array_declared_compressor_drift_raises(writer: RegionZarrWriter) -> None:
-    writer.ensure_group(
-        "grp/data",
-        shape=(10,),
-        dtype="f4",
-        compressors=[BloscCodec(cname="zstd", clevel=5)],
-    )
-    spec = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        time_indexed=False,
-        compressors=({"name": "blosc", "configuration": {"cname": "zstd", "clevel": 9}},),
-    )
-
-    with pytest.raises(SchemaDriftError, match="field='compressors'"):
-        writer.verify_array_spec("grp/data", spec, expected_time_count=10)
-
-
-def test_declared_compressor_key_order_does_not_drift(writer: RegionZarrWriter) -> None:
-    writer.ensure_group(
-        "grp/data",
-        shape=(10,),
-        dtype="f4",
-        compressors=[BloscCodec(cname="zstd", clevel=5)],
-    )
-    spec = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="f4",
-        compressors=({"configuration": {"clevel": 5, "cname": "zstd"}, "name": "blosc"},),
-    )
-
-    writer.verify_array_spec("grp/data", spec, expected_time_count=10)
-
-
-def test_declared_serializer_endian_drift_raises(writer: RegionZarrWriter) -> None:
-    writer.ensure_group(
-        "grp/data",
-        shape=(10,),
-        dtype="i4",
-        serializer=BytesCodec(endian="little"),
-    )
-    spec = ZarrArraySpec(
-        name="data",
-        shape=(10,),
-        dtype="i4",
-        serializer={"name": "bytes", "configuration": {"endian": "big"}},
-    )
-
-    with pytest.raises(SchemaDriftError, match="field='serializer'"):
-        writer.verify_array_spec("grp/data", spec, expected_time_count=10)
+def test_verify_array_spec_codec_drift(subtests, tmp_path) -> None:
+    for row_id, stored, declared, drifted in _CODEC_DRIFT_ROWS:
+        with subtests.test(msg=f"test_{row_id}"):
+            writer = RegionZarrWriter(str(tmp_path / f"{row_id}.zarr"))
+            writer.ensure_group("grp/data", **{"shape": (10,), "dtype": "f4", **deepcopy(stored)})
+            spec = ZarrArraySpec(
+                name="data", **{"shape": (10,), "dtype": "f4", **deepcopy(declared)}
+            )
+            if drifted is None:
+                writer.verify_array_spec("grp/data", spec, expected_time_count=10)
+            else:
+                with pytest.raises(SchemaDriftError, match=f"field='{drifted}'"):
+                    writer.verify_array_spec("grp/data", spec, expected_time_count=10)

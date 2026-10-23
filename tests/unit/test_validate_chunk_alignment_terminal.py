@@ -18,38 +18,38 @@ import pytest
 
 from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.types.planned_range import validate_chunk_alignment
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
 
-def test_aligned_range_passes() -> None:
-    validate_chunk_alignment(0, 100, {"g": [(100,)]})
+def test_validate_chunk_alignment_passes(subtests, tmp_path) -> None:
+    for row_id, start, end, chunks, global_expected in [
+        ("test_aligned_range_passes", 0, 100, {"g": [(100,)]}, None),
+        ("test_misaligned_end_terminal_passes", 900, 950, {"g": [(100,)]}, {"g": 950}),
+    ]:
+        with table_row(subtests, row_id, tmp_path):
+            validate_chunk_alignment(start, end, chunks, global_expected=global_expected)
 
 
-def test_misaligned_start_fails() -> None:
-    with pytest.raises(ConfigurationError):
-        validate_chunk_alignment(50, 200, {"g": [(100,)]}, global_expected={"g": 300})
-
-
-def test_misaligned_end_non_terminal_fails() -> None:
-    with pytest.raises(ConfigurationError):
-        validate_chunk_alignment(100, 250, {"g": [(100,)]}, global_expected={"g": 500})
-
-
-def test_misaligned_end_terminal_passes() -> None:
-    validate_chunk_alignment(900, 950, {"g": [(100,)]}, global_expected={"g": 950})
-
-
-def test_misaligned_end_terminal_without_global_expected_fails() -> None:
-    with pytest.raises(ConfigurationError):
-        validate_chunk_alignment(900, 950, {"g": [(100,)]})
-
-
-def test_multiple_groups_one_terminal_one_not() -> None:
-    with pytest.raises(ConfigurationError):
-        validate_chunk_alignment(
+def test_validate_chunk_alignment_fails(subtests, tmp_path) -> None:
+    for row_id, start, end, chunks, global_expected in [
+        ("test_misaligned_start_fails", 50, 200, {"g": [(100,)]}, {"g": 300}),
+        ("test_misaligned_end_non_terminal_fails", 100, 250, {"g": [(100,)]}, {"g": 500}),
+        (
+            "test_misaligned_end_terminal_without_global_expected_fails",
+            900,
+            950,
+            {"g": [(100,)]},
+            None,
+        ),
+        (
+            "test_multiple_groups_one_terminal_one_not",
             100,
             150,
             {"a": [(50,)], "b": [(100,)]},
-            global_expected={"a": 150, "b": 500},
-        )
+            {"a": 150, "b": 500},
+        ),
+    ]:
+        with table_row(subtests, row_id, tmp_path), pytest.raises(ConfigurationError):
+            validate_chunk_alignment(start, end, chunks, global_expected=global_expected)

@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import ast
 import importlib
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.helpers.rows import table_row
 from tests.helpers.storage import (
     _OPEN_FSSPEC_URL_PATCH_TARGETS,
     assert_no_fsspec_bypass,
@@ -153,3 +156,86 @@ def test_patch_targets_cover_all_module_level_imports() -> None:
         f"site(s) discovered in src/: {sorted(missing)}. "
         f"Add them to tests/helpers/storage.py to prevent the F4 blind spot."
     )
+
+
+class _SwallowingSubtests:
+    """Stand-in for the ``subtests`` fixture: records ids, swallows failures."""
+
+    def __init__(self) -> None:
+        self.ids: list[str] = []
+        self.failed: list[str] = []
+        self.errors: dict[str, Exception] = {}
+
+    @contextmanager
+    def test(self, msg: str):
+        self.ids.append(msg)
+        try:
+            yield
+        except Exception as exc:
+            self.failed.append(msg)
+            self.errors[msg] = exc
+
+
+def test_table_row_gives_each_row_fresh_state(subtests, tmp_path, monkeypatch) -> None:
+    """Rows get their own directory and patches, and a failing row does not stop the next."""
+    probe = "FIRECUBE_TABLE_ROW_PROBE"
+    monkeypatch.delenv(probe, raising=False)
+    dirs: list[Path] = []
+
+    with subtests.test(msg="fresh_dirs_differ_per_row"):
+        for row_id in ("row one", "row/two"):
+            with table_row(subtests, row_id, tmp_path) as (workdir, mp):
+                assert mp is None
+                assert workdir.is_dir()
+                assert list(workdir.iterdir()) == []
+                (workdir / "marker").write_text(row_id)
+                dirs.append(workdir)
+        assert dirs[0] != dirs[1]
+        assert all(d.parent == tmp_path for d in dirs)
+
+    with subtests.test(msg="monkeypatch_is_undone_between_rows"):
+        seen: list[str | None] = []
+        for row_id in ("patch", "observe"):
+            with table_row(subtests, row_id, tmp_path, monkeypatch) as (_, mp):
+                seen.append(os.environ.get(probe))
+                if row_id == "patch":
+                    assert mp is not None
+                    mp.setenv(probe, "set-in-row-1")
+                    assert os.environ[probe] == "set-in-row-1"
+        assert seen == [None, None]
+        assert probe not in os.environ
+
+    with subtests.test(msg="failing_row_does_not_stop_later_rows"):
+        stub = _SwallowingSubtests()
+        ran: list[str] = []
+        for row_id in ("bad", "after"):
+            with table_row(stub, row_id, tmp_path, monkeypatch) as (_, mp):
+                assert mp is not None
+                mp.setenv(probe, row_id)
+                ran.append(row_id)
+                assert row_id != "bad"
+        assert stub.ids == ["bad", "after"]
+        assert stub.failed == ["bad"]
+        assert ran == ["bad", "after"]
+        assert probe not in os.environ
+
+    with subtests.test(msg="distinct_ids_with_same_slug_get_distinct_dirs"):
+        long_id = "x" * 300
+        ids = ["a/b", "a_b", "\u00e9\u00e8", "\u4e2d\u6587", long_id]
+        made: list[Path] = []
+        for row_id in ids:
+            with table_row(subtests, row_id, tmp_path) as (workdir, _):
+                assert workdir.is_dir()
+                made.append(workdir)
+        assert len({d.name for d in made}) == len(ids)
+        assert all(len(d.name) <= 51 for d in made)
+
+    with subtests.test(msg="repeated_row_id_fails_inside_its_own_row"):
+        stub = _SwallowingSubtests()
+        ran = []
+        for row_id in ("dup", "dup", "other"):
+            with table_row(stub, row_id, tmp_path) as (workdir, _):
+                ran.append(row_id)
+        assert ran == ["dup", "dup", "other"]
+        assert stub.failed == ["dup"]
+        assert isinstance(stub.errors["dup"], FileExistsError)

@@ -36,16 +36,24 @@ import concurrent.futures
 import contextlib
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from firecube.core.controlplane.repo import describe_control_plane
+from firecube.core.errors import FirecubeError, Message, Param, PluginOption
 from firecube.core.observability import attach_context, capture_context, detach_context
 from firecube.ingestor.config.engine import EngineConfig
-from firecube.ingestor.contracts.interfaces import PipelineHost
+from firecube.ingestor.contracts.interfaces import (
+    PipelineHost,
+    _IncompleteUnitsRefusal,
+    _SeededCoordinates,
+    _SparseWindowRefusal,
+    _StagedPromotionUnits,
+    _StagedSeedingAuthority,
+)
 from firecube.ingestor.runtime._metrics_helpers import _extract_timestamps_skipped
 from firecube.ingestor.runtime.aggregation import normalize_plugin_aggregate_metrics
 from firecube.ingestor.runtime.index_binding import (
@@ -68,26 +76,68 @@ if TYPE_CHECKING:
     from firecube.ingestor.runtime.base import BaseIngestor
 
 
-class PipelineFailedBatchesError(RuntimeError):
-    """Raised when finalization observes failed batch results."""
+class PipelineFailedBatchesError(FirecubeError, RuntimeError):
+    """Raised when finalization observes failed batch results.
+
+    The message joins the first three failures' messages, so their facts and
+    recovery operations stay readable through `FirecubeError.recovery` and `context`.
+
+    Args:
+        run_id: The run whose batches failed.
+        failed: The failed batch results, in completion order.
+        not_attempted: How many batches the run halted before attempting.
+
+    Attributes:
+        run_id: The run whose batches failed.
+        failed: The failed batch results, in completion order.
+        not_attempted: How many batches the run halted before attempting.
+    """
+
+    def __init__(
+        self, *, run_id: str, failed: Sequence[PipelineResult], not_attempted: int
+    ) -> None:
+        self.run_id = run_id
+        self.failed = tuple(failed)
+        self.not_attempted = not_attempted
+        super().__init__(
+            _failed_batches_message(run_id=run_id, failed=self.failed, not_attempted=not_attempted)
+        )
 
 
 def _failed_batches_message(
-    *, run_id: str, failed: list[PipelineResult], not_attempted: int
-) -> str:
-    """Compose a failure message without promising that retry bypasses validation."""
-    err_summary = "; ".join((res.error or "unknown").rstrip(". ") for res in failed[:3])
-    message = f"Pipeline run {run_id!r} had {len(failed)} failed batch(es): {err_summary}. "
-    if not_attempted:
-        message += (
-            f"{not_attempted} later batch(es) were not attempted: this host stops at the "
-            "first failed batch so no batch appends past a gap. "
-        )
-    return message + (
+    *, run_id: str, failed: Sequence[PipelineResult], not_attempted: int
+) -> Message:
+    """Compose a failure message without promising that retry bypasses validation.
+
+    Each of the first three failures contributes its `FirecubeError` message, or its
+    `error` text when the batch failed on any other exception.
+    """
+    summaries: list[str] = []
+    for res in failed[:3]:
+        message = res.failure.message if res.failure is not None else None
+        text = message or res.error or "unknown"
+        if isinstance(text, Message):
+            summaries.append(text.without_trailing_stop())
+        else:
+            summaries.append(text.rstrip(". "))
+    halted = (
+        f"{not_attempted} later batch(es) were not attempted: this host stops at the "
+        "first failed batch so no batch appends past a gap. "
+        if not_attempted
+        else ""
+    )
+    return Message(
+        "Pipeline run {run_id!r} had {count} failed batch(es): {summary}. {halted}"
         "Run recorded as status=failed. Recovery: resolve the batch error above before retrying. "
-        "For compatible Zarr inputs, --option resume_existing=true skips present timestamps "
-        "and refills failed slots; --option force_reingest=true overwrites existing timestamps. "
-        "Neither option can insert absent timestamps before the stored maximum or bypass schema validation."
+        "For compatible Zarr inputs, {resume} skips present timestamps "
+        "and refills failed slots; {force} overwrites existing timestamps. "
+        "Neither option can insert absent timestamps before the stored maximum or bypass schema validation.",
+        run_id=run_id,
+        count=len(failed),
+        summary=Message.join("; ", summaries),
+        halted=halted,
+        resume=PluginOption("resume_existing", "true"),
+        force=PluginOption("force_reingest", "true"),
     )
 
 
@@ -214,6 +264,7 @@ def _process_batch_timed(
             outputs=OutputPaths(primary=Path("")),
             success=False,
             error=str(exc),
+            failure=exc if isinstance(exc, FirecubeError) else None,
         )
 
     duration_s = max(time.perf_counter() - start_wall, 0.0)
@@ -456,6 +507,7 @@ class PipelineRunner:
                             outputs=OutputPaths(primary=Path("")),
                             success=False,
                             error=str(exc),
+                            failure=exc if isinstance(exc, FirecubeError) else None,
                         )
 
                     halt = self._handle_completed_batch(
@@ -560,13 +612,32 @@ def _zarr_pre_batch_hook(
     from firecube.ingestor.runtime.zarr.batch_runner import seed_staged_metadata_pre_batch
 
     coordinate_arrays: list[str] = [ingestor._resolve_time_dim_name()]
+    seeding_host = ingestor if isinstance(ingestor, _StagedSeedingAuthority) else None
+    noting_host = ingestor if isinstance(ingestor, _SeededCoordinates) else None
 
-    return lambda: seed_staged_metadata_pre_batch(
-        host=ingestor,
-        ctx=ctx,
-        logger=ingestor._log,
-        coordinate_arrays=coordinate_arrays,
-    )
+    def _seed() -> None:
+        if seeding_host is None:
+            seeded = seed_staged_metadata_pre_batch(
+                host=ingestor,
+                ctx=ctx,
+                logger=ingestor._log,
+                coordinate_arrays=coordinate_arrays,
+            )
+        else:
+            # The host names the authority its workspace metadata is seeded
+            # under, asked afresh before each batch.
+            seeded = seed_staged_metadata_pre_batch(
+                host=ingestor,
+                ctx=ctx,
+                logger=ingestor._log,
+                coordinate_arrays=coordinate_arrays,
+                authority=seeding_host._staged_seeding_authority(),
+            )
+        # Promotion leaves alone the seeded chunks of a managed coordinate.
+        if noting_host is not None and seeded is not None:
+            noting_host._note_seeded_coordinates(*seeded)
+
+    return _seed
 
 
 def _create_batches_with_parallel_filter(
@@ -594,7 +665,12 @@ def _create_batches_with_parallel_filter(
         binding = getattr(host, "_index_binding", None)
         if binding is None:
             raise ConfigurationError(
-                "--slot-start/--slot-end require index_spec(); the plugin returned None"
+                Message(
+                    "{slot_start}/{slot_end} require index_spec(); the plugin returned None",
+                    slot_start=Param("slot_start"),
+                    slot_end=Param("slot_end"),
+                    plugin=host.name,
+                )
             )
 
         # The coord-chunk overlap guard is intentionally absent here.
@@ -621,6 +697,15 @@ def _create_batches_with_parallel_filter(
             all_items = list(cached_items)
         original_count = len(all_items)
 
+        # Keep what inspect_item returned for each item, so the window's
+        # planned slots are known without inspecting any item twice.
+        inspected: dict[int, Any] = {}
+
+        def _inspect_and_keep(item: Any, item_ctx: Any) -> Any:
+            info = host.inspect_item(item, item_ctx)
+            inspected[id(item)] = info
+            return info
+
         try:
             filtered = filter_items_by_index(
                 all_items,
@@ -628,7 +713,7 @@ def _create_batches_with_parallel_filter(
                 slot_start,
                 slot_end,
                 engine_config.slot_group,
-                host.inspect_item,
+                _inspect_and_keep,
                 plugin_ctx,
             )
         except Exception as exc:
@@ -659,6 +744,17 @@ def _create_batches_with_parallel_filter(
             )
             return []
 
+        if str(engine_config.write_mode) == "staged":
+            _refuse_sparse_staged_window(
+                host=host,
+                ctx=plugin_ctx,
+                resolved=binding.resolved,
+                window=(slot_start, slot_end),
+                slot_group=engine_config.slot_group,
+                items=filtered_items,
+                inspected=inspected,
+            )
+
         batches = list(
             base_host._batch_planner.create_batches(
                 host,
@@ -674,6 +770,36 @@ def _create_batches_with_parallel_filter(
         return batches
 
     return list(host._create_batches(ctx, batch_size))
+
+
+def _refuse_sparse_staged_window(
+    *,
+    host: PipelineHost,
+    ctx: PluginContext,
+    resolved: Any,
+    window: tuple[int, int],
+    slot_group: str | None,
+    items: Sequence[Any],
+    inspected: Mapping[int, Any],
+) -> None:
+    """Hand the window's planned slots to a host that checks staged unit coverage.
+
+    Runs after the slot filter and before any batch exists, so a refusal
+    comes before any payload write. Skipped when the host has no such check
+    or an item's inspection result is unknown.
+    """
+    if not isinstance(host, _SparseWindowRefusal) or not items:
+        return
+    if any(id(item) not in inspected for item in items):
+        return
+    # Same group the slot filter positions items in (shared axis when unset).
+    group = slot_group if slot_group is not None else resolved.groups[0]
+    planned: set[int] = set()
+    for item in items:
+        info = inspected[id(item)]
+        coordinate = info.coordinate if hasattr(info, "coordinate") else info
+        planned.add(int(resolved.position(group, coordinate)))
+    host._refuse_sparse_staged_window(ctx, frozenset(planned), window=window, slot_group=slot_group)
 
 
 class PipelineExecutor:
@@ -780,11 +906,9 @@ class PipelineExecutor:
             failed = [res for res in state.results if res.attempted and not res.success]
             if failed:
                 raise PipelineFailedBatchesError(
-                    _failed_batches_message(
-                        run_id=ctx.run_id or "unknown",
-                        failed=failed,
-                        not_attempted=len(state.batches_not_attempted),
-                    )
+                    run_id=ctx.run_id or "unknown",
+                    failed=failed,
+                    not_attempted=len(state.batches_not_attempted),
                 )
 
             # Prefer remote path from results if any
@@ -876,7 +1000,21 @@ class PipelineExecutor:
         run_id = ctx.run_id or ""
         output_name = _output_product_name(ctx)
 
-        stored = _storage_completer().complete_output(result, ctx)
+        # Promotion replaces whole objects: a host that tracks its staged
+        # writes refuses here, before the target is touched, when a unit
+        # would be promoted half-written.
+        if effective_write_mode == "staged" and isinstance(host, _IncompleteUnitsRefusal):
+            host._refuse_incomplete_staged_units()
+
+        # A host that reports the units its staged run proved written gets an
+        # object-delta promotion (deletions included); others upload the tree.
+        staged_units = None
+        if effective_write_mode == "staged" and isinstance(host, _StagedPromotionUnits):
+            staged_units = host._staged_promotion_units()
+        if staged_units is None:
+            stored = _storage_completer().complete_output(result, ctx)
+        else:
+            stored = _storage_completer().complete_output(result, ctx, staged_units=staged_units)
 
         result.storage_result = stored
         result.write_mode_applied = effective_write_mode

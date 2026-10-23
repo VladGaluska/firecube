@@ -50,6 +50,7 @@ Patterns covered (W1.7):
 from __future__ import annotations
 
 import ast
+import re
 import tempfile
 from pathlib import Path
 
@@ -772,6 +773,120 @@ def test_no_derive_target_uri_references() -> None:
         excluded_prefixes=("src/firecube/core/config.py",),
     )
     assert not unexpected, "\n".join(["Unexpected derive_target_uri references:", *unexpected])
+
+
+_LIVE_FLAGS = {
+    "zarr": ("use_consolidated", {"open_group", "open", "open_consolidated"}, set()),
+    "xarray": ("consolidated", {"open_zarr"}, {"open_dataset", "open_datatree", "open_mfdataset"}),
+}
+_LIVE_FLAGS["zarr.api.synchronous"] = _LIVE_FLAGS["zarr.api.asynchronous"] = _LIVE_FLAGS["zarr"]
+_LIVE_ROWS: dict[tuple[str, str, str, int], str] = {  # (path, function, callee, count): tag
+    ("core/zarr/coord_consolidation.py", "_refresh_consolidated_metadata", "open_group", 1): (
+        "PERMANENT: the refresh must see whether a group carries a snapshot before it rewrites it"
+    ),
+    ("core/zarr/zip_archive.py", "_refuse_invalid_metadata", "open_group", 1): (
+        "PERMANENT: parses one archive document alone, its consolidated block included"
+    ),
+    ("core/zarr/zip_archive.py", "validate_zip", "open_group", 1): (
+        "PERMANENT: parses every document whole, snapshots included; a second open reads the "
+        "members live"
+    ),
+}
+
+
+def _live_metadata_opens(text: str) -> list[tuple[str, str, int]]:
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    hits: list[tuple[str, str, int]] = []
+
+    def own(node: ast.AST):  # descendants, not crossing into nested scopes
+        for child in ast.iter_child_nodes(node):
+            yield child
+            if not isinstance(child, scopes):
+                yield from own(child)
+
+    def scan(scope: ast.AST, fname: str, mods: dict, names: dict) -> None:
+        mods, names, bound = dict(mods), dict(names), {}
+        for n in own(scope):
+            if isinstance(n, ast.Import):  # ``import a.b`` also binds ``a``
+                mods.update({a.asname or a.name: a.name for a in n.names})
+                mods.update({r: r for a in n.names if not a.asname for r in a.name.split(".")[:1]})
+            elif isinstance(n, ast.ImportFrom) and n.module in _LIVE_FLAGS:
+                names.update({a.asname or a.name: (n.module, a.name) for a in n.names})
+            elif isinstance(n, ast.Assign) and len(n.targets) == 1:  # not a chained binding
+                bound.update({t.id: n.value for t in n.targets if isinstance(t, ast.Name)})
+        ids = [n.id for n in ast.walk(scope) if isinstance(n, ast.Name)]
+        un = [ast.unparse(x) for x in ast.walk(scope) if isinstance(x, ast.keyword) and not x.arg]
+        # qualifies: its one binding, every other use a ``**name`` unpacking
+        assigned = {k: v for k, v in bound.items() if ids.count(k) == 1 + un.count("**" + k)}
+        for n in own(scope):
+            if isinstance(n, scopes):
+                scan(n, getattr(n, "name", fname), mods, names)
+            elif isinstance(n, ast.Call):
+                head, _, callee = ast.unparse(n.func).rpartition(".")
+                root, _, rest = head.partition(".")
+                mod = ".".join(filter(None, [mods.get(root), rest])) if root in mods else ""
+                if not head:
+                    mod, callee = names.get(callee, ("", ""))
+                flag, always, by_engine = _LIVE_FLAGS.get(mod, ("", set(), set()))
+                lit = [(k.arg, getattr(k.value, "value", 1)) for k in n.keywords]
+                for k in n.keywords:  # ``**name``: a dict display bound once, before the call
+                    d = assigned.get(k.value.id) if isinstance(k.value, ast.Name) else None
+                    if k.arg is None and isinstance(d, ast.Dict) and d.lineno < n.lineno:
+                        lit += [
+                            (getattr(a, "value", None), getattr(v, "value", 1))
+                            for a, v in zip(d.keys, d.values, strict=True)
+                        ]
+                if (callee in always or (callee in by_engine and ("engine", "zarr") in lit)) and (
+                    callee == "open_consolidated" or (flag, False) not in lit
+                ):
+                    hits.append((fname, callee, n.lineno))
+
+    scan(ast.parse(text), "<module>", {}, {})
+    return hits
+
+
+def test_zarr_metadata_opens_read_live_metadata() -> None:
+    """Every zarr/xarray Zarr open in src/firecube reads live metadata.
+
+    zarr opens pass ``use_consolidated=False``, xarray opens ``consolidated=False``, so a stale
+    snapshot cannot drive a decision. ``open_array`` is exempt. Descent through a group object
+    is pinned by the red tests, not here.
+    """
+    found: dict[tuple[str, str, str], list[int]] = {}
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        for fname, callee, line in _live_metadata_opens(_read_text(path)):
+            key = (path.relative_to(_SRC_ROOT).as_posix(), fname, callee)
+            found.setdefault(key, []).append(line)
+    rows = {r[:3]: r[3] for r in _LIVE_ROWS}
+    offenders = [
+        f"src/firecube/{k[0]}:{n} `{k[1]}` calls {k[2]}"
+        for k, lines in found.items()
+        if k not in rows
+        for n in lines
+    ]
+    stale = [
+        f"stale row {k}: found {len(found.get(k, []))}, row says {c}"
+        for k, c in rows.items()
+        if len(found.get(k, [])) != c
+    ]
+    assert all(re.match(r"^PERMANENT: \S.*$", tag) for tag in _LIVE_ROWS.values())
+    flagged = _live_metadata_opens(  # nested-dict flag; helper-scope dict; sibling alias
+        "import zarr\ndef g(p):\n o = {'a': {'use_consolidated': False}}\n zarr.open_group(p, **o)\n"
+        "def h(p, o):\n def k():\n  o = {'use_consolidated': False}\n zarr.open_group(p, **o)\n"
+        "def a(p):\n from zarr import open_group as og\n og(p)\n"
+        "def b():\n from xarray import open_dataset as og\n"
+        "def c(p):\n import zarr\n zarr.api.synchronous.open_group(p)\n"  # zarr.api spellings
+        "def d(p):\n from zarr.api.synchronous import open_group as og\n og(p)\n"
+        "def e(p):\n import zarr.api.synchronous as zs\n zs.open_group(p)\n"
+        "def m(p):\n import zarr\n kw = {'use_consolidated': False}\n kw['use_consolidated'] = None\n zarr.open_group(p, **kw)\n"
+        "def n(p):\n import zarr\n kw = {}\n zarr.open_group(p, **kw)\n kw = {'use_consolidated': False}\n"
+    )
+    assert (
+        len(_live_metadata_opens("import zarr.api.synchronous\ndef f(p):\n zarr.open_group(p)\n"))
+        == 1
+    )
+    assert len(flagged) == 8
+    assert not offenders and not stale, "\n".join([*sorted(offenders), *stale])
 
 
 def test_no_raw_create_filesystem_calls_outside_filesystem_boundary() -> None:

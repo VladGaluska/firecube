@@ -17,9 +17,11 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
+from firecube.cli._errors import render
 from firecube.cli._product import require_full_uri
 from firecube.cli._shared_options import dry_run_flag, yes_flag
 from firecube.core.controlplane.types import AbandonSweepResult
@@ -36,11 +38,25 @@ def runs_group() -> None:
     inspect and manage tracked chunk runs."""
 
 
-def _echo_abandon_run_result(*, product_name: str, run_id: str, result: dict[str, object]) -> None:
+def _echo_claims(
+    *, released: list[str], skipped: list[str], indent: str = "", dry_run: bool = False
+) -> None:
+    release, leave = ("Would release", "Would leave") if dry_run else ("Released", "Left")
+    for domain in released:
+        click.echo(f"{indent}{release} claim {domain}")
+    for domain in skipped:
+        click.echo(f"{indent}{leave} claim {domain}")
+
+
+def _echo_abandon_run_result(*, product_name: str, run_id: str, result: dict[str, Any]) -> None:
     if not result.get("abandoned"):
         click.echo(f"Run {run_id} already terminal with status={result.get('status')}")
-        return
-    click.echo(f"Abandoned run {run_id} for {product_name}")
+    else:
+        click.echo(f"Abandoned run {run_id} for {product_name}")
+    _echo_claims(
+        released=result.get("released_claims", []),
+        skipped=result.get("skipped_claims", []),
+    )
 
 
 def _echo_abandon_sweep_result(
@@ -49,14 +65,24 @@ def _echo_abandon_sweep_result(
     result: AbandonSweepResult,
     dry_run: bool,
 ) -> None:
+    """Print a sweep result; claim lines print whenever the result has them."""
     if not result.previewed:
         click.echo("No stale runs found.")
+        _echo_claims(
+            released=result.released_claims, skipped=result.skipped_claims, dry_run=dry_run
+        )
         return
 
     if dry_run:
         click.echo(f"[dry-run] Would abandon stale runs for {product_name}:")
         for run_id in result.previewed:
             click.echo(f"  - {run_id}")
+        _echo_claims(
+            released=result.released_claims,
+            skipped=result.skipped_claims,
+            indent="  ",
+            dry_run=True,
+        )
         return
 
     click.echo(f"Abandoned stale runs for {product_name}:")
@@ -64,6 +90,7 @@ def _echo_abandon_sweep_result(
         click.echo("  Abandoned:")
         for run_id in result.abandoned:
             click.echo(f"    - {run_id}")
+    _echo_claims(released=result.released_claims, skipped=result.skipped_claims, indent="  ")
     if result.skipped_fresh:
         click.echo("  Skipped fresh:")
         for run_id in result.skipped_fresh:
@@ -135,7 +162,7 @@ def list_cmd(
         try:
             product_uri = StorageUri.parse(target)
         except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise click.UsageError(render(exc)) from exc
     else:
         product_name, product_uri = resolve_cli_product(product_name)
     manager = resolve_manager(ctx, workspace, product_uri=product_uri, product_name=product_name)
@@ -260,15 +287,24 @@ def abandon_cmd(
     stuck in 'started' state blocks future ingestion for that product. use this
     after confirming the original process is no longer active.
 
+    abandoning also releases the run's write claims and prints each one; a
+    claim whose owner is ambiguous stays and prints as 'Left claim'. a run that
+    is already terminal keeps its status and still has its claims released.
+    when the claims cannot be listed, the abandon is still recorded and the
+    command exits 1; run it again to release them. a committed --all-stale
+    sweep releases a claim only when it is stale, for the runs it abandons and
+    runs already terminal; a fresh claim prints as 'Left claim'.
+
     --all-stale never prompts. without --yes-i-really-mean-it it lists stale
-    runs as a dry run; with the flag it abandons them. single-run operations
+    runs and the claims it would release as a dry run; with the flag it
+    abandons them. single-run operations
     prompt in a terminal and require the flag in non-TTY contexts."""
     if target is not None:
         require_full_uri(target, option_name="--target")
         try:
             product_uri = StorageUri.parse(target)
         except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+            raise click.UsageError(render(exc)) from exc
     else:
         product_name, product_uri = resolve_cli_product(product_name)
 
@@ -280,11 +316,14 @@ def abandon_cmd(
             ctx, workspace, product_uri=product_uri, product_name=product_name
         )
         effective_dry_run = dry_run or not yes_i_really_mean_it
-        result = manager.abandon_stale_runs(
-            product=product_name,
-            reason=reason,
-            dry_run=effective_dry_run,
-        )
+        try:
+            result = manager.abandon_stale_runs(
+                product=product_name,
+                reason=reason,
+                dry_run=effective_dry_run,
+            )
+        except ManifestError as exc:
+            raise click.ClickException(render(exc)) from exc
         _echo_abandon_sweep_result(
             product_name=product_name,
             result=result,
@@ -312,6 +351,6 @@ def abandon_cmd(
     try:
         result = manager.abandon_run(product=product_name, run_id=run_id, reason=reason)
     except ManifestError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     _echo_abandon_run_result(product_name=product_name, run_id=run_id, result=result)

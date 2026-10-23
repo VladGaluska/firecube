@@ -35,6 +35,7 @@ from firecube.ingestor.templates.direct_zarr import (
     ZarrGroupSpec,
     _setup_global_zarr_schema,
 )
+from tests.helpers.storage import begin_write_session
 
 pytestmark = pytest.mark.unit
 
@@ -62,7 +63,9 @@ class _ChunkManager:
     def __init__(self) -> None:
         self.domains: list[WriteDomain] = []
 
-    def acquire_claim(self, *, product: str, domain: WriteDomain, owner_id: str):
+    def acquire_claim(
+        self, *, product: str, domain: WriteDomain, owner_id: str, describe_conflict: bool = True
+    ):
         _ = (product, owner_id)
         self.domains.append(domain)
         return nullcontext()
@@ -155,30 +158,28 @@ def test_parallel_schema_uses_global_expected_not_batch_local(
         storage=None,
         option=lambda key, default=None: default,
     )
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(cast(Any, SimpleNamespace(items=["x"])), cast(Any, ctx))
 
     assert result.success is True
     assert captured["slot_range"] == (0, 10)
 
 
-def test_empty_global_dict_fails(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="empty"):
+@pytest.mark.parametrize(
+    ("global_expected", "match"),
+    [
+        pytest.param({}, "empty", id="empty_global_dict_fails"),
+        pytest.param({"data": 0}, "non-positive", id="non_positive_global_count_fails"),
+    ],
+)
+def test_invalid_global_expected_fails(
+    tmp_path: Path, global_expected: dict[str, int], match: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=match):
         _setup_global_zarr_schema(
             strategy=SimpleNamespace(_store_uri=str(tmp_path / "out.zarr"), _storage_config=None),
             schema=_schema(),
-            global_expected={},
-            product="product",
-            run_id="run-1",
-            chunk_manager=_ChunkManager(),
-        )
-
-
-def test_non_positive_global_count_fails(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="non-positive"):
-        _setup_global_zarr_schema(
-            strategy=SimpleNamespace(_store_uri=str(tmp_path / "out.zarr"), _storage_config=None),
-            schema=_schema(),
-            global_expected={"data": 0},
+            global_expected=global_expected,
             product="product",
             run_id="run-1",
             chunk_manager=_ChunkManager(),
@@ -260,6 +261,7 @@ def test_no_slot_range_uses_phase2_batch_local_path(
         storage=None,
         option=lambda key, default=None: default,
     )
+    begin_write_session(ingestor, ctx)
     result = ingestor._process_batch(cast(Any, SimpleNamespace(items=["x"])), cast(Any, ctx))
 
     assert result.success is True

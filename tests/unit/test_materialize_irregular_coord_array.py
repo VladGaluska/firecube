@@ -22,12 +22,9 @@ import pytest
 import zarr
 
 from firecube.core.errors import SchemaDriftError
+from firecube.core.zarr._coord_common import build_irregular_coord_attrs, values_all_nat
 from firecube.core.zarr._sealing_markers import ATTR_PREALLOCATED
-from firecube.core.zarr.coord_materialization import (
-    build_irregular_coord_attrs,
-    materialize_irregular_coord_array,
-    values_all_nat,
-)
+from firecube.core.zarr.coord_materialization import materialize_irregular_coord_array
 from firecube.core.zarr.region_writer import RegionZarrWriter
 from firecube.ingestor.templates.direct_zarr import ZarrArraySpec
 
@@ -237,6 +234,14 @@ def test_schema_mismatch_shape_raises(
 
     with pytest.raises(SchemaDriftError, match="shape: expected"):
         materialize_irregular_coord_array(writer=writer, root=root, group_name="data", axis=axis(5))
+
+
+def test_fractional_calendar_values_are_not_truncated_to_int64(writer_and_root: Any) -> None:
+    writer, root = writer_and_root
+    ax = SimpleNamespace(coordinate="t", values=[0, 0.5], calendar="360_day", units="days since 0")
+    materialize_irregular_coord_array(writer=writer, root=root, group_name="g", axis=ax)
+    assert (a := root["g/t"])[:].tolist() == [0, 0.5] and np.isnan(a.fill_value)
+    assert (a.dtype, a.attrs["units"], a.attrs["calendar"]) == (np.float64, ax.units, ax.calendar)
 
 
 def test_spec_dimension_names_honored(

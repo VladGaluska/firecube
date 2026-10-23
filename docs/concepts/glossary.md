@@ -52,6 +52,10 @@ path directly.
 **Pipeline worker** — A worker inside one Firecube run that can prepare or write
 batches concurrently when the plugin class and output format allow it.
 
+**Slot** — One step of the time axis of a product. The cadence of the axis sets
+the length of the step. The axis declares how many slots it has with
+`slot_count` or `end_date`. See [Chunk Ownership](output-formats/zarr/chunk-ownership.md#what-a-slot-is).
+
 **Slot range** — A fixed index range assigned to a direct-Zarr worker. Slot
 ranges must be disjoint and chunk-aligned for safe parallel writes.
 

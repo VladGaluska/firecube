@@ -36,6 +36,7 @@ from firecube.ingestor.api import (
 )
 from firecube.ingestor.runtime import engine as engine_module
 from firecube.ingestor.runtime.batching import BatchPlanner
+from tests.helpers.storage import begin_write_session
 
 pytestmark = pytest.mark.unit
 
@@ -141,6 +142,7 @@ def test_run_sequential_filters_batches_to_configured_slot_range() -> None:
     host = _SlotFilteringHost(_batch())
     cfg = EngineConfig(slot_start=1, slot_end=4)
     host._bind_index_at_startup(PluginContext(ctx))
+    begin_write_session(host, PluginContext(ctx), engine_config=cfg)
 
     state = engine_module.run_sequential(
         ctx=ctx,

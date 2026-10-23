@@ -17,14 +17,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from firecube.core.errors import Message, Param
 from firecube.core.uris import is_remote_target
 
 if TYPE_CHECKING:
     from firecube.core.storage.session import StorageSession
 
-_DUCKDB_OBSTORE_REMOTE_MESSAGE = (
+_DUCKDB_OBSTORE_REMOTE_MESSAGE = Message(
     "DuckDB remote parquet is not supported under storage_driver=obstore. "
-    "Re-run this command with --storage-driver=fsspec."
+    "Re-run this command with {storage_driver}=fsspec.",
+    storage_driver=Param("storage_driver"),
 )
 
 
@@ -52,7 +54,13 @@ def apply_duckdb_storage(
         source_is_remote = product_uri.is_remote()
         output_is_remote = is_remote_target(output_uri) if output_uri else False
         if source_is_remote or output_is_remote:
-            raise RuntimeError(_DUCKDB_OBSTORE_REMOTE_MESSAGE)
+            raise RuntimeError(
+                Message(
+                    "{reason}",
+                    reason=_DUCKDB_OBSTORE_REMOTE_MESSAGE,
+                    product_uri=str(product_uri),
+                )
+            )
         return None
 
     if not product_uri.is_remote():

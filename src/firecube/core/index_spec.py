@@ -25,10 +25,10 @@ releases.
 
 from __future__ import annotations
 
-import datetime as dt
 import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final, Literal
 
 import numpy as np
@@ -38,6 +38,11 @@ from firecube.core.slot_index import (
     iso_to_epoch_s,
     normalize_epoch_iso,
 )
+from firecube.core.time import canonical as _canonical
+
+# Only imported lazily, at __post_init__ time, when calendar is set: avoids
+# importing xarray (and transitively cftime) for the common case of plugins
+# that never declare a calendar axis.
 
 
 class AxisSpec:
@@ -78,17 +83,12 @@ Importable from ``firecube.core.api`` and ``firecube.ingestor.api``.
 
 
 def _canonical_coordinate_value(value: Any) -> Any:
-    if isinstance(value, np.datetime64):
-        return np.datetime_as_string(value, unit="ns", timezone="UTC")
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, dt.datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=dt.UTC)
-        else:
-            value = value.astimezone(dt.UTC)
-        return value.isoformat().replace("+00:00", "Z")
-    return value
+    return _canonical._canonical_coordinate_value(value)
+
+
+def _canonicalise_irregular_value(value: Any, *, calendar: str, units: str | None) -> Any:
+    """Delegate to `firecube.core.time.canonical._canonicalise_irregular_value`."""
+    return _canonical._canonicalise_irregular_value(value, calendar=calendar, units=units)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -109,11 +109,37 @@ class RegularTimeAxis(AxisSpec):
             be set.
         slot_count: Optional total number of slots. Must be positive.
             At most one of ``end_date`` and ``slot_count`` may be set.
+        calendar: CF calendar name (e.g. ``"360_day"``, ``"noleap"``,
+            ``"proleptic_gregorian"``). Defaults to ``"proleptic_gregorian"``.
+            ``"standard"`` and ``"gregorian"`` are accepted as aliases and
+            normalised to ``"proleptic_gregorian"``; Gregorian time is stored
+            as ``datetime64`` and accepts only datetime-typed coordinate
+            values, never bare numbers. A non-Gregorian calendar makes the
+            coordinate an encoded integer (or float) axis instead: ``units``
+            is derived from ``epoch`` as ``"seconds since <epoch>"`` (see
+            `encoded_units`), and slot *n* has the exact value
+            ``n * cadence_s`` in that unit. Non-Gregorian calendars require
+            ``slot_count`` and are incompatible with ``mode="floor"`` and
+            with ``end_date`` (each raises ``ValueError`` naming the
+            alternative), because a calendar coordinate must be fully
+            materialized before any value is known, which only
+            fixed-cadence, ``exact``-mode axes can guarantee up front.
 
     Note:
         Both ``end_date`` and ``slot_count`` may be ``None`` for serial-mode
-        plugins that do not declare a fixed horizon. The parallel gate will
-        raise ``ConfigurationError`` if it cannot determine the extent.
+        plugins that do not declare a fixed horizon, on a Gregorian calendar
+        only. The parallel gate will raise ``ConfigurationError`` if it
+        cannot determine the extent.
+
+    Examples:
+        >>> RegularTimeAxis(
+        ...     coordinate="time",
+        ...     epoch="2049-01-01T12:00:00Z",
+        ...     cadence_s=86400,
+        ...     slot_count=90,
+        ...     calendar="360_day",
+        ... ).encoded_units
+        'seconds since 2049-01-01 12:00:00'
     """
 
     coordinate: str
@@ -157,6 +183,11 @@ class RegularTimeAxis(AxisSpec):
     serial-mode plugins without a fixed horizon.
     """
 
+    calendar: str = "proleptic_gregorian"
+    """CF calendar name. Defaults to ``"proleptic_gregorian"``. See the
+    class-level `Attributes:` entry for the full contract.
+    """
+
     def __post_init__(self) -> None:
         if not isinstance(self.cadence_s, numbers.Integral) or isinstance(self.cadence_s, bool):
             raise TypeError(
@@ -169,6 +200,15 @@ class RegularTimeAxis(AxisSpec):
         valid_modes = {"exact", "floor"}
         if self.mode not in valid_modes:
             raise ValueError(f"mode must be one of {sorted(valid_modes)!r}; got {self.mode!r}")
+
+        from firecube.core.time.calendar import is_gregorian_like, normalise_calendar
+
+        normalised_calendar = normalise_calendar(self.calendar)
+        object.__setattr__(self, "calendar", normalised_calendar)
+
+        if not is_gregorian_like(normalised_calendar):
+            _validate_regular_calendar_axis(self)
+            return
 
         epoch_s = _utc_explicit_epoch_s(self.epoch, "epoch")
 
@@ -197,6 +237,55 @@ class RegularTimeAxis(AxisSpec):
 
         if self.slot_count is not None and self.slot_count <= 0:
             raise ValueError(f"slot_count must be positive; got {self.slot_count}")
+
+    @property
+    def encoded_units(self) -> str:
+        """CF ``units`` derived from ``epoch``.
+
+        Returns ``"seconds since <epoch>"``, derived textually from
+        ``epoch`` (never parsed as a date). Defined for every calendar; a
+        Gregorian axis stores ``datetime64`` values and has no encoded array
+        of its own.
+        """
+
+        from firecube.core.time.calendar import derive_regular_axis_units
+
+        return derive_regular_axis_units(self.epoch)
+
+
+def _validate_regular_calendar_axis(axis: RegularTimeAxis) -> None:
+    """Validate a `RegularTimeAxis` on a non-Gregorian calendar.
+
+    Called from ``__post_init__`` after ``axis.calendar`` has already been
+    normalised (`normalise_calendar`) and confirmed not Gregorian-like.
+
+    Raises:
+        ValueError: ``mode="floor"`` is set, ``end_date`` is set,
+            ``slot_count`` is missing or non-positive, or (``epoch``,
+            ``calendar``) cannot be validated together.
+    """
+
+    from firecube.core.time.calendar import derive_regular_axis_units, validate_calendar_units
+
+    if axis.mode == "floor":
+        raise ValueError(
+            'calendar is not supported with mode="floor" (observed sensing times on a '
+            'calendar axis are not supported); use mode="exact" instead'
+        )
+    if axis.end_date is not None:
+        raise ValueError("calendar is not supported with end_date; use slot_count instead")
+    if axis.slot_count is None:
+        raise ValueError(
+            "RegularTimeAxis with calendar= requires slot_count; leaving both "
+            "slot_count and end_date None is not valid for a calendar axis "
+            "(a calendar coordinate must be fully materialized before any "
+            "value is known, so the axis extent must be fixed up front)"
+        )
+    if axis.slot_count <= 0:
+        raise ValueError(f"slot_count must be positive; got {axis.slot_count}")
+
+    units = derive_regular_axis_units(axis.epoch)
+    validate_calendar_units(units=units, calendar=axis.calendar)
 
 
 def effective_regular_time_policy(axis: RegularTimeAxis) -> Literal["grid", "observed"]:
@@ -246,6 +335,7 @@ class TimeAxis:
         slot_count: int | None = None,
         end_date: str | None = None,
         placement: Literal["exact", "floor"] = "exact",
+        calendar: str = "proleptic_gregorian",
     ) -> RegularTimeAxis:
         """A fixed-cadence axis whose coordinate carries the grid labels.
 
@@ -261,9 +351,21 @@ class TimeAxis:
             cadence_s: Slot cadence in seconds (positive integer).
             slot_count: Total slots; mutually exclusive with ``end_date``.
             end_date: Exclusive UTC-explicit axis end; mutually exclusive
-                with ``slot_count``. Leave both ``None`` for serial mode.
+                with ``slot_count``. With a Gregorian calendar, leave both
+                ``None`` for serial mode; a non-Gregorian calendar requires
+                ``slot_count`` and rejects ``end_date``.
             placement: Must be ``"exact"``; ``"floor"`` raises ``ValueError``
                 (use :meth:`observed` for floor placement).
+            calendar: CF calendar name; see `RegularTimeAxis`. Defaults to
+                ``"proleptic_gregorian"``.
+
+        Raises:
+            ValueError: ``placement`` is ``"floor"``; both ``slot_count`` and
+                ``end_date`` are set; ``cadence_s`` or ``slot_count`` is not
+                positive; a non-Gregorian ``calendar`` has no ``slot_count``
+                or sets ``end_date``; or ``epoch`` is invalid for the
+                calendar.
+            TypeError: ``cadence_s`` is not an integer.
         """
         if placement == "floor":
             raise ValueError(
@@ -278,6 +380,7 @@ class TimeAxis:
             mode=placement,
             slot_count=slot_count,
             end_date=end_date,
+            calendar=calendar,
         )
 
     @staticmethod
@@ -315,7 +418,13 @@ class TimeAxis:
         )
 
     @staticmethod
-    def explicit(*, coordinate: str, values: Sequence[Any]) -> IrregularTimeAxis:
+    def explicit(
+        *,
+        coordinate: str,
+        values: Sequence[Any],
+        calendar: str = "proleptic_gregorian",
+        units: str | None = None,
+    ) -> IrregularTimeAxis:
         """An axis whose timeline is a known, explicit list of timestamps.
 
         Use when the product has no fixed cadence but the full timeline is
@@ -329,7 +438,16 @@ class TimeAxis:
             coordinate: Name of the time coordinate dimension.
             values: Non-empty sequence of distinct coordinate values
                 (``datetime``, ``numpy.datetime64``, or integers). Strings,
-                bytes, duplicates, and empty input are rejected.
+                bytes, duplicates, and empty input are rejected. With a
+                non-Gregorian ``calendar``, must instead be calendar-valued
+                objects (e.g. ``cftime`` instances) or already-encoded
+                numbers; see `IrregularTimeAxis`.
+            calendar: CF calendar name. Defaults to
+                ``"proleptic_gregorian"``. A non-Gregorian calendar requires
+                ``units``; ``units`` on a Gregorian calendar is rejected.
+            units: CF ``units`` string for a non-Gregorian calendar axis
+                (e.g. ``"days since 1850-01-01"``); required when
+                ``calendar`` is non-Gregorian, rejected otherwise.
 
         Examples:
             >>> import numpy as np
@@ -342,10 +460,14 @@ class TimeAxis:
             ...     ),
             ... )
         """
-        return IrregularTimeAxis(coordinate=coordinate, values=values)
+        return IrregularTimeAxis(
+            coordinate=coordinate, values=values, calendar=calendar, units=units
+        )
 
     @staticmethod
-    def discovered(*, coordinate: str) -> IrregularTimeAxis:
+    def discovered(
+        *, coordinate: str, calendar: str = "proleptic_gregorian", units: str | None = None
+    ) -> IrregularTimeAxis:
         """An axis whose timeline is discovered from the source items.
 
         Use when only the inputs can reveal the timestamps. Before
@@ -373,8 +495,16 @@ class TimeAxis:
 
         Args:
             coordinate: Name of the time coordinate dimension.
+            calendar: CF calendar name. Defaults to
+                ``"proleptic_gregorian"``. A non-Gregorian calendar requires
+                ``units``, and ``inspect_item`` must then return
+                calendar-valued objects (e.g. ``cftime`` instances) or
+                already-encoded numbers for this axis's coordinate.
+            units: CF ``units`` string for a non-Gregorian calendar axis;
+                required when ``calendar`` is non-Gregorian, rejected
+                otherwise.
         """
-        return IrregularTimeAxis(coordinate=coordinate, values=AUTO)
+        return IrregularTimeAxis(coordinate=coordinate, values=AUTO, calendar=calendar, units=units)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -437,6 +567,24 @@ class IrregularTimeAxis(AxisSpec):
             ``ValueError``. A non-``Sequence`` raises ``TypeError``. Empty input
             raises ``ValueError``. The engine sorts concrete values ascending
             and assigns slot indices in that order.
+        calendar: CF calendar name (e.g. ``"360_day"``, ``"noleap"``,
+            ``"proleptic_gregorian"``). Defaults to
+            ``"proleptic_gregorian"``. ``"standard"`` and ``"gregorian"`` are
+            accepted as aliases and normalised to ``"proleptic_gregorian"``.
+            A non-Gregorian calendar requires ``units`` (there is no epoch
+            on an irregular axis to derive it from); ``units`` on a
+            Gregorian calendar is rejected. When non-Gregorian and
+            ``values`` is not ``AUTO``, every value is converted to an
+            encoded number at construction time, so stored ``values`` are
+            plain, hashable, JSON-serialisable numbers. A Gregorian axis
+            stores ``values`` unchanged, except that a ``cftime`` value on a
+            Gregorian calendar is converted to ``numpy.datetime64``. Looking
+            up a ``cftime`` Gregorian value matches a ``datetime`` or
+            ``datetime64`` stored value for the same instant.
+        units: CF ``units`` string for a non-Gregorian calendar axis (e.g.
+            ``"days since 1850-01-01"``). Required when ``calendar`` is
+            non-Gregorian; rejected (``ValueError``) when ``calendar`` is
+            Gregorian.
 
     Note:
         ``AUTO`` triggers planning-time discovery: the engine scans the full
@@ -450,7 +598,39 @@ class IrregularTimeAxis(AxisSpec):
     values: Sequence[Any] | _AutoSentinel
     """Explicit coordinate values, or ``AUTO`` for planning-time discovery."""
 
+    calendar: str = "proleptic_gregorian"
+    """CF calendar name. Defaults to ``"proleptic_gregorian"``. See the
+    class-level `Attributes:` entry for the full contract.
+    """
+
+    units: str | None = None
+    """CF ``units`` string; required exactly when ``calendar`` is non-Gregorian."""
+
     def __post_init__(self) -> None:
+        from firecube.core.time.calendar import is_gregorian_like, normalise_calendar
+
+        normalised_calendar = normalise_calendar(self.calendar)
+        object.__setattr__(self, "calendar", normalised_calendar)
+        axis_is_gregorian = is_gregorian_like(normalised_calendar)
+
+        units = self.units
+        if axis_is_gregorian:
+            if units is not None:
+                raise ValueError(
+                    "units is only used with a non-Gregorian calendar; "
+                    f"calendar={self.calendar!r} is Gregorian-like, so units={units!r} "
+                    "is rejected -- omit units for Gregorian time"
+                )
+        elif units is None:
+            raise ValueError(
+                "calendar requires units to also be set "
+                "(an irregular axis has no epoch to derive units from)"
+            )
+        else:
+            from firecube.core.time.calendar import validate_calendar_units
+
+            validate_calendar_units(units=units, calendar=normalised_calendar)
+
         if self.values is AUTO:
             return
         if isinstance(self.values, (str, bytes)):
@@ -459,9 +639,15 @@ class IrregularTimeAxis(AxisSpec):
             raise TypeError("values must be AUTO or a non-empty Sequence")
         if not self.values:
             raise ValueError("values must be a non-empty Sequence")
-        if len(set(self.values)) != len(self.values):
+
+        values_to_check = tuple(
+            _canonicalise_irregular_value(value, calendar=normalised_calendar, units=units)
+            for value in self.values
+        )
+
+        if len(set(values_to_check)) != len(values_to_check):
             raise ValueError("values must not contain duplicates")
-        object.__setattr__(self, "values", tuple(self.values))
+        object.__setattr__(self, "values", values_to_check)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -536,16 +722,83 @@ class ItemInfo:
     """Metadata returned by ``inspect_item`` describing a single source item.
 
     The engine uses ``coordinate`` to map the item to a position on its
-    assigned axis.
+    assigned axis, and ``values`` to fill the item's slot in arrays the
+    engine writes itself (``ZarrArraySpec(engine_owned=True)``).
 
     Attributes:
         coordinate: The item's coordinate value. For ``RegularTimeAxis`` this
             is a UTC-explicit timestamp. For ``IntegerAxis`` this is an integer
             coordinate.
+        values: Per-slot scalars for engine-owned arrays, keyed by array name,
+            or ``None`` when the schema has none. ``firecube zarr preallocate``
+            collects them from every item and writes each engine-owned array
+            whole, once; ingest pods never write those arrays, they only
+            verify. Firecube reads ``values`` only when the schema declares
+            an engine-owned array; otherwise it ignores the mapping without
+            checking its keys. When one is declared, each key must name an
+            engine-owned array, and every engine-owned array of the item's
+            group needs a key. Values are scalars (a Python number, a NumPy
+            scalar or a 0-d array), cast to the array's dtype with NumPy's
+            casting rules, so a value outside those checks can be truncated
+            or rounded silently. ``firecube zarr preallocate`` refuses NaN
+            or infinity, a fraction or an out-of-range number for an integer
+            array, anything but a bool for a bool array, and a finite real
+            number that would overflow to infinity in a float array. The
+            integer checks apply to values whose NumPy dtype is bool,
+            integer, float, string or object (a ``datetime.datetime`` or an
+            object-dtype complex value is refused). Values of complex,
+            datetime64 or timedelta64 dtype skip them and are cast; a
+            complex value can therefore be truncated, or become infinity in
+            a float array. The mapping is stored read-only and does not take
+            part in ``hash(info)``. A 0-d array is copied at construction
+            (the copy is read-only), so reusing one buffer for every item is
+            safe.
+
+    Raises:
+        TypeError: If ``values`` is not a mapping, a key is not a string, or a
+            value is ``None`` or not a scalar.
+
+    Examples:
+        >>> from datetime import UTC, datetime
+        >>> info = ItemInfo(
+        ...     coordinate=datetime(2024, 1, 1, 0, 10, tzinfo=UTC),
+        ...     values={"platform_lon": 0.25},
+        ... )
+        >>> info.values["platform_lon"]
+        0.25
     """
 
     coordinate: Any = None
     """Coordinate value used by the resolver to compute a position."""
+
+    values: Mapping[str, Any] | None = field(default=None, hash=False)
+    """Per-slot scalars for engine-owned arrays, keyed by array name."""
+
+    def __post_init__(self) -> None:
+        if self.values is None:
+            return
+        if not isinstance(self.values, Mapping):
+            raise TypeError(
+                f"ItemInfo.values must be a mapping of array name to scalar, "
+                f"got {type(self.values).__name__}"
+            )
+        frozen: dict[str, Any] = {}
+        for name, value in self.values.items():
+            if not isinstance(name, str):
+                raise TypeError(f"ItemInfo.values keys must be array names (str), got {name!r}")
+            if value is None or callable(value) or np.ndim(value) != 0:
+                raise TypeError(
+                    f"ItemInfo.values[{name!r}] must be a scalar, got {value!r}; "
+                    "engine-owned arrays hold one value per slot"
+                )
+            # A 0-D array is copied (dtype and byte order kept) and made
+            # read-only, so a caller refilling one buffer per item cannot change
+            # a value already handed over. Other scalars are immutable already.
+            if isinstance(value, np.ndarray):
+                value = np.array(value, copy=True)
+                value.flags.writeable = False
+            frozen[name] = value
+        object.__setattr__(self, "values", MappingProxyType(frozen))
 
 
 def _utc_explicit_epoch_s(value: str, field_name: str) -> int:

@@ -23,6 +23,18 @@ temp-store shape overwrites the cumulative target shape.
 
 Best-effort for fresh ingests (no final target yet); strict (raises
 ``StagedMetadataError``) when resuming into an existing target.
+
+With a metadata authority (DirectZarr), every ``zarr.json`` document written
+into the workspace is put under it, serialised per node with the run's other
+metadata changes: a group or array document only where the workspace holds
+none, decided under the node lock (`publish_document_if_absent`), so a
+document a concurrent batch's writer created or changed is never reverted;
+the root document is replaced when it differs from the seeded bytes, as without
+an authority (`update_document`).
+A refused authority (`MetadataAuthorityError`) always propagates, in strict
+and best-effort mode alike, and leaves no document or directory behind.
+Without one, the documents are written as plain files. Coordinate chunks are
+object copies either way.
 """
 
 from __future__ import annotations
@@ -30,14 +42,22 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import zarr
-from zarr.core.sync import sync
+from zarr.storage import LocalStore
 
 from firecube.core.storage.uri import StorageUri
-from firecube.core.zarr.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr._zarr_compat import sync
+from firecube.core.zarr.guard.chunk_geometry import chunk_index_to_region
+from firecube.core.zarr.guard.metadata_authority import (
+    MetadataAuthority,
+    MetadataAuthorityError,
+    publish_document_if_absent,
+    update_document,
+)
 from firecube.ingestor.errors import SeedingFailedError, StagedMetadataError
 
 if TYPE_CHECKING:
@@ -73,7 +93,9 @@ def seed_touched_data_chunks(
     from firecube.core.uris import storage_uri_from_target
 
     ws_handle = session.zarr.create_store(uri=storage_uri_from_target(temp_store_uri), mode="a")
-    ws_root = zarr.open_group(**ws_handle.zarr_kwargs(), mode="a", zarr_format=3)
+    ws_root = zarr.open_group(
+        **ws_handle.zarr_kwargs(), mode="a", zarr_format=3, use_consolidated=False
+    )
     try:
         target_handle = session.zarr.create_store(
             uri=storage_uri_from_target(final_target_uri), mode="r"
@@ -89,16 +111,20 @@ def seed_touched_data_chunks(
 
     try:
         for group_name, arrays in touched_chunks.items():
-            ws_group = _get_child(ws_root, group_name)
-            target_group = _get_child(target_root, group_name)
-            if ws_group is None or target_group is None:
+            if (
+                _get_child(ws_root, group_name) is None
+                or _get_child(target_root, group_name) is None
+            ):
                 continue
 
             for array_name, chunk_indices in arrays.items():
                 if not chunk_indices:
                     continue
-                ws_arr = _get_child(ws_group, array_name)
-                target_arr = _get_child(target_group, array_name)
+                # A group object keeps its own consolidated snapshot: read each array by
+                # its full path from the live root.
+                array_path = "/".join(part for part in (group_name.strip("/"), array_name) if part)
+                ws_arr = _get_child(ws_root, array_path)
+                target_arr = _get_child(target_root, array_path)
                 if ws_arr is None or target_arr is None:
                     continue
 
@@ -239,6 +265,7 @@ def seed_staged_store_metadata(
     strict: bool = True,
     session: StorageSession,
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> dict[str, Any]:
     """Copy zarr.json metadata files (and optionally named coordinate-array chunks) from final_target_uri into temp_store_uri.
 
@@ -266,7 +293,16 @@ def seed_staged_store_metadata(
     semantically identical and both preserve exact legacy metadata-only
     behavior.
 
-    Returns {group: {"seeded": bool, "files": int}} for logging.
+    With ``authority``, every ``zarr.json`` written into the workspace goes
+    through it (a ``PROCESS_LOCAL`` authority over the workspace store, for a
+    DirectZarr run); group and array documents are put only where none
+    exists, decided under the node lock. A refusal raises
+    `MetadataAuthorityError` whatever ``strict`` is, and the refused document
+    is not written. ``None`` writes the documents as plain files.
+
+    Returns {group: {"seeded": bool, "files": int, "coordinates": set[str]}}.
+    ``coordinates`` holds the ``group/array`` path of each named coordinate
+    array whose chunk the workspace holds, copied now or found there already.
     """
     if groups is None:
         groups = _discover_zarr_groups(session, final_target_uri)
@@ -278,10 +314,11 @@ def seed_staged_store_metadata(
             temp_store_uri=temp_store_uri,
             final_target_uri=final_target_uri,
             strict=strict,
+            authority=authority,
         )
 
     for group in groups:
-        results[group] = {"seeded": False, "files": 0}
+        results[group] = {"seeded": False, "files": 0, "coordinates": set()}
         try:
             _seed_group_via_session(
                 session=session,
@@ -291,6 +328,7 @@ def seed_staged_store_metadata(
                 strict=strict,
                 results=results,
                 coordinate_arrays=coordinate_arrays,
+                authority=authority,
             )
 
             if results[group]["files"] > 0:
@@ -301,7 +339,7 @@ def seed_staged_store_metadata(
                     "metadata + coord files" if coordinate_arrays else "zarr.json files",
                     group,
                 )
-        except StagedMetadataError:
+        except (StagedMetadataError, MetadataAuthorityError):
             raise
         # Boundary: strict mode wraps any failure as StagedMetadataError (docstring contract).
         except Exception as e:
@@ -320,6 +358,7 @@ def _seed_root_metadata(
     temp_store_uri: str,
     final_target_uri: str,
     strict: bool,
+    authority: MetadataAuthority | None = None,
 ) -> None:
     """Copy root Zarr group metadata needed for handle-based reads of seeded groups."""
     from firecube.core.uris import is_remote_target, local_path_from_target
@@ -337,9 +376,20 @@ def _seed_root_metadata(
             continue
         dst_path = temp_root / name
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            if authority is None or name != "zarr.json":
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
             with fs.open(src_uri, "rb") as fh:
-                dst_path.write_bytes(fh.read())
+                raw = fh.read()
+            if name == "zarr.json":
+                # Replaced when it differs, as without an authority: a root the
+                # writer created empty differs and takes the target's root metadata.
+                _write_document(
+                    dst_path, raw, temp_root=temp_root, key=name, authority=authority, replace=True
+                )
+            else:
+                dst_path.write_bytes(raw)
+        except MetadataAuthorityError:
+            raise
         # Boundary: strict mode wraps any failure as StagedMetadataError (docstring contract).
         except Exception as e:
             if strict:
@@ -405,10 +455,35 @@ def _is_coordinate_chunk(path: str, coords: list[str] | None) -> bool:
         _is_coordinate_chunk("data/timestamp/c/0", []) -> False
         _is_coordinate_chunk("data/timestamp/c/0", None) -> False
     """
+    return _chunk_coordinate(path, coords) is not None
+
+
+def _chunk_coordinate(path: str, coords: list[str] | None) -> str | None:
+    """Return the coordinate array path holding the chunk at ``path``, or ``None``.
+
+    Matches as `_is_coordinate_chunk` does: ``"data/timestamp/c/0"`` gives
+    ``"data/timestamp"``.
+    """
     if not coords:
-        return False
+        return None
     parts = path.rstrip("/").split("/")
-    return any(parts[i] in coords and parts[i + 1] == "c" for i in range(len(parts) - 2))
+    for i in range(len(parts) - 2):
+        if parts[i] in coords and parts[i + 1] == "c":
+            return "/".join(parts[: i + 1])
+    return None
+
+
+def _is_in_flight_write(path: str) -> bool:
+    """True for a temporary that a concurrent writer has not yet renamed into place.
+
+    Covers firecube's reserved publication temporaries and zarr ``LocalStore``'s
+    ``<key>.<uuid>.partial`` files. Under a coordinate's ``c/`` prefix either
+    would otherwise match ``_is_coordinate_chunk``, be seeded into the
+    workspace and published back to the target as a stray object.
+    """
+    from firecube.core.filesystem.publication import is_publication_temp
+
+    return is_publication_temp(path) or path.rstrip("/").endswith(".partial")
 
 
 def _seed_group_via_session(
@@ -420,6 +495,7 @@ def _seed_group_via_session(
     strict: bool,
     results: dict[str, Any],
     coordinate_arrays: list[str] | None = None,
+    authority: MetadataAuthority | None = None,
 ) -> None:
     from firecube.core.uris import is_remote_target, local_path_from_target
 
@@ -438,12 +514,15 @@ def _seed_group_via_session(
     files_to_copy = [
         entry
         for entry in all_entries
-        if entry.path.endswith("zarr.json")
-        or _is_coordinate_chunk(
-            entry.path[len(final_root) + 1 :]
-            if entry.path.startswith(f"{final_root}/")
-            else entry.path.lstrip("/"),
-            coordinate_arrays,
+        if not _is_in_flight_write(entry.path)
+        and (
+            entry.path.endswith("zarr.json")
+            or _is_coordinate_chunk(
+                entry.path[len(final_root) + 1 :]
+                if entry.path.startswith(f"{final_root}/")
+                else entry.path.lstrip("/"),
+                coordinate_arrays,
+            )
         )
     ]
     if not files_to_copy:
@@ -457,11 +536,17 @@ def _seed_group_via_session(
             else src_uri.path.lstrip("/")
         )
         dst_path = temp_root / rel
+        coordinate = _chunk_coordinate(rel, coordinate_arrays)
         if dst_path.exists():
             results[group]["files"] += 1
+            if coordinate is not None:
+                results[group]["coordinates"].add(coordinate)
             continue
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            # Under an authority the store creates a document's directory
+            # once the put is admitted, so a refusal leaves none behind.
+            if authority is None or not rel.endswith("zarr.json"):
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
             with fs.open(src_uri, "rb") as fh:
                 raw = fh.read()
             if rel.endswith("zarr.json"):
@@ -480,13 +565,52 @@ def _seed_group_via_session(
                         # negotiated at preallocate time and MUST survive staged seeding so
                         # ingest startup can verify per-group identity on the temp store.
                         attrs.pop("firecube_static_written", None)
-                dst_path.write_bytes(json.dumps(payload).encode())
+                _write_document(
+                    dst_path,
+                    json.dumps(payload).encode(),
+                    temp_root=temp_root,
+                    key=rel,
+                    authority=authority,
+                    replace=False,
+                )
             else:
                 dst_path.write_bytes(raw)
             results[group]["files"] += 1
+            if coordinate is not None:
+                results[group]["coordinates"].add(coordinate)
+        except MetadataAuthorityError:
+            raise
         except Exception as e:
             if strict:
                 raise StagedMetadataError(
                     f"Failed to seed staged metadata {src_uri.to_str()} -> {dst_path}: {e}"
                 ) from e
             log.warning("Failed to seed staged metadata %s: %s", src_uri.to_str(), e)
+
+
+def _write_document(
+    dst_path: Path,
+    data: bytes,
+    *,
+    temp_root: Path,
+    key: str,
+    authority: MetadataAuthority | None,
+    replace: bool,
+) -> None:
+    """Write one seeded ``zarr.json``: under *authority* when there is one, else as a file.
+
+    *key* is the document's key in the workspace store rooted at *temp_root*
+    (``dst_path`` is that key's file). Under an authority, ``replace=False``
+    puts the document only if the workspace still holds none when the node
+    lock is held: the caller's earlier absence check is only a shortcut.
+    ``replace=True`` writes only when the stored bytes differ from *data*.
+    """
+    if authority is None:
+        if replace and dst_path.is_file() and dst_path.read_bytes() == data:
+            return
+        dst_path.write_bytes(data)
+        return
+    if replace:
+        update_document(authority, LocalStore(temp_root), key, lambda _current: data)
+    else:
+        publish_document_if_absent(authority, LocalStore(temp_root), key, data)

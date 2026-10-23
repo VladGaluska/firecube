@@ -133,7 +133,7 @@ def test_obstore_remote_hard_error() -> None:
         message = str(excinfo.value)
         assert "remote parquet" in message
         assert "storage_driver=obstore" in message
-        assert "--storage-driver=fsspec" in message
+        assert "Re-run this command with storage_driver=fsspec." in message
     finally:
         con.close()
 

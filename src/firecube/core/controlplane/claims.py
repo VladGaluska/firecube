@@ -22,10 +22,10 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from firecube.core.controlplane.types import CLAIMS_DIRNAME, ClaimInfo, WriteDomain
-from firecube.core.errors import ClaimConflictError, ControlPlaneCorruptionError
+from firecube.core.errors import ClaimConflictError, ControlPlaneCorruptionError, Message, Param
 from firecube.core.filesystem import StorageFilesystemFull
 from firecube.core.storage.uri import StorageUri
 
@@ -216,6 +216,27 @@ class FilesystemClaimService:
         claims.sort(key=lambda item: (item.product, item.domain))
         return claims
 
+    def list_product_claims(self, *, product: str) -> list[ClaimInfo]:
+        """List one product's claims from a fresh listing, sorted by domain.
+
+        Asks the driver to bypass any listing cache. An absent claims directory lists as no
+        claims; any other listing error propagates, unlike `list_claims`. Raises
+        ControlPlaneCorruptionError on a malformed claim file.
+        """
+        control_path, _control_uri = self._control_root_resolver(product)
+        claims_dir = control_path.join(CLAIMS_DIRNAME)
+        try:
+            entries = self._fs.ls(claims_dir, detail=False, refresh=True)  # type: ignore[attr-defined]
+        except FileNotFoundError:
+            return []
+        claims: list[ClaimInfo] = []
+        for entry in entries:
+            info = self._read_claim(product=product, claim_path=_entry_to_uri(entry, claims_dir))
+            if info is not None:
+                claims.append(info)
+        claims.sort(key=lambda item: item.domain)
+        return claims
+
     def list_stale_claims(self, *, product: str) -> list[ClaimInfo]:
         """List stale claims for one product."""
         return [claim for claim in self.list_claims(product=product) if claim.stale]
@@ -226,30 +247,62 @@ class FilesystemClaimService:
         Uses targeted claim-name derivation to avoid listing the claims directory.
         Raises ControlPlaneCorruptionError on malformed JSON.
         """
-        domain_product, category, name = domain.split(":", 2)
-        control_path, _control_uri = self._control_root_resolver(product)
-        claims_dir = control_path.join(CLAIMS_DIRNAME)
-        claim_name = WriteDomain(product=domain_product, category=category, name=name).claim_name
-        return self._read_claim(product=product, claim_path=claims_dir.join(claim_name))
+        return self._read_claim(
+            product=product, claim_path=self._claim_path_for(product=product, domain_id=domain)
+        )
+
+    def release_claim_if_unchanged(
+        self, *, product: str, claim: ClaimInfo, stale_only: bool = False
+    ) -> Literal["released", "changed", "missing"]:
+        """Delete a listed claim only if its file still holds that same claim.
+
+        Re-reads the claim file just before the delete. Returns `"missing"` when the file is
+        gone and `"changed"` when its owner or acquisition time differs; the file then stays.
+        With `stale_only`, it also returns `"changed"` when the heartbeat moved since the
+        listing or the re-read claim is fresh. Returns `"released"` after deleting the file.
+        Raises ControlPlaneCorruptionError on a malformed claim file.
+        """
+        claim_path = self._claim_path_for(product=product, domain_id=claim.domain)
+        current = self._read_claim(product=product, claim_path=claim_path)
+        if current is None:
+            return "missing"
+        if current.owner_id != claim.owner_id or current.acquired_at != claim.acquired_at:
+            return "changed"
+        if stale_only and (
+            current.last_heartbeat_at != claim.last_heartbeat_at or not current.stale
+        ):
+            return "changed"
+        try:
+            self._fs.rm(claim_path, recursive=False)
+        except FileNotFoundError:
+            return "missing"
+        return "released"
 
     def clear_claim(self, *, product: str, domain_id: str, force: bool = False) -> bool:
         """Delete a claim file; refuses non-stale claims unless force=True."""
-        domain_product, category, name = domain_id.split(":", 2)
-        control_path, _control_uri = self._control_root_resolver(product)
-        claims_dir = control_path.join(CLAIMS_DIRNAME)
-        claim_path = claims_dir.join(
-            WriteDomain(product=domain_product, category=category, name=name).claim_name
-        )
+        claim_path = self._claim_path_for(product=product, domain_id=domain_id)
         info = self._read_claim(product=product, claim_path=claim_path)
         if info is None:
             return False
         if not force and not info.stale:
             raise ClaimConflictError(
-                f"Refusing to clear active claim {domain_id}; rerun with --force to override."
+                Message(
+                    "Refusing to clear active claim {claim_domain}; rerun with {force} to override.",
+                    claim_domain=domain_id,
+                    force=Param("force", True),
+                    product=product,
+                    claim_owner=info.owner_id,
+                )
             )
         with suppress(FileNotFoundError):
             self._fs.rm(claim_path, recursive=False)
         return True
+
+    def _claim_path_for(self, *, product: str, domain_id: str) -> StorageUri:
+        domain_product, category, name = domain_id.split(":", 2)
+        control_path, _control_uri = self._control_root_resolver(product)
+        claim_name = WriteDomain(product=domain_product, category=category, name=name).claim_name
+        return control_path.join(CLAIMS_DIRNAME).join(claim_name)
 
     def _list_products(self) -> set[str]:
         products: set[str] = set()

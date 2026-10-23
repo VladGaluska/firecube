@@ -24,7 +24,7 @@ import zarr
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
-from firecube.cli.zarr import _consolidate as zarr_cli
+from firecube.core.zarr import coord_consolidation
 from firecube.ingestor.errors import ConfigurationError
 
 pytestmark = pytest.mark.integration
@@ -68,7 +68,7 @@ def test_configuration_error_is_user_facing(
     def boom(*args, **kwargs):
         raise ConfigurationError("test-induced consolidate failure")
 
-    monkeypatch.setattr(zarr_cli, "_read_consolidate_reference_index", boom)
+    monkeypatch.setattr(coord_consolidation, "_read_consolidate_reference_index", boom)
 
     result = CliRunner().invoke(cli, _args(cube))
 

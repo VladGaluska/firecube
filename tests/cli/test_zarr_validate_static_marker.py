@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 import zarr
@@ -23,6 +24,7 @@ from click.testing import CliRunner
 
 from firecube.cli.main import cli
 from firecube.core.api import FIRECUBE_STATIC_WRITTEN_ATTR
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.unit
 
@@ -45,40 +47,32 @@ def _invoke_validate_with_time_dim(store: Path, group: str, time_dim: str = "tim
     )
 
 
-def test_validate_reports_missing_static_marker(tmp_path: Path) -> None:
-    store = _store_with_array(tmp_path, "lat", dimension_names=("lat",))
-
-    result = _invoke_validate_with_time_dim(store, "lat")
-
-    assert result.exit_code == 1, result.output
-    payload = json.loads(result.output)
-    assert payload["static_marker_failures"] == [
-        {"array": "lat", "reason": "missing_or_false_static_marker"}
-    ]
-    assert payload["is_valid"] is False
-
-
-def test_validate_passes_when_all_static_markers_present(tmp_path: Path) -> None:
-    store = _store_with_array(tmp_path, "lat", dimension_names=("lat",))
-    root = zarr.open_group(str(store), mode="a")
-    root["lat"].attrs[FIRECUBE_STATIC_WRITTEN_ATTR] = True
-
-    result = _invoke_validate_with_time_dim(store, "lat")
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["static_marker_failures"] == []
+_ROWS = [
+    (
+        "test_validate_reports_missing_static_marker",
+        "lat",
+        "lat",
+        False,
+        False,
+        [{"array": "lat", "reason": "missing_or_false_static_marker"}],
+    ),
+    ("test_validate_passes_when_all_static_markers_present", "lat", "lat", True, True, []),
+    ("test_validate_ignores_time_indexed_arrays", "temperature", "timestamp", False, False, []),
+]
 
 
-def test_validate_ignores_time_indexed_arrays(tmp_path: Path) -> None:
-    store = _store_with_array(tmp_path, "temperature", dimension_names=("timestamp",))
+def test_validate_static_marker(subtests: Any, tmp_path: Path) -> None:
+    for row_id, array, dim, marked, valid, failures in _ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            store = _store_with_array(workdir, array, dimension_names=(dim,))
+            if marked:
+                zarr.open_group(str(store), mode="a")[array].attrs[FIRECUBE_STATIC_WRITTEN_ATTR] = (
+                    True
+                )
 
-    result = CliRunner().invoke(
-        cli,
-        ["zarr", "validate", "-p", store.as_uri(), "-g", "temperature", "--time-dim", "timestamp"],
-    )
+            result = _invoke_validate_with_time_dim(store, array)
 
-    assert result.exit_code == 1, result.output
-    payload = json.loads(result.output)
-    assert payload["is_valid"] is False
-    assert payload["static_marker_failures"] == []
+            assert result.exit_code == (0 if valid else 1), result.output
+            payload = json.loads(result.output)
+            assert payload["is_valid"] is valid
+            assert payload["static_marker_failures"] == failures

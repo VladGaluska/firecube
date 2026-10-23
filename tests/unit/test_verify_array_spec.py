@@ -147,10 +147,24 @@ def test_shape_time_smaller_fails(writer):
         writer.verify_array_spec("grp/data", _make_spec(shape=(4, 3, 2)), expected_time_count=4)
 
 
-def test_spec_chunks_none_skips_check(writer):
-    _make_array(writer, chunks=(1, 3, 2))
+@pytest.mark.parametrize(
+    ("shape", "stored_chunks"),
+    [((4, 3, 2), (1, 3, 2)), ((12,), (12,))],
+    ids=["finer-chunks", "dense-time-chunk"],
+)
+def test_spec_chunks_none_skips_check(writer, shape, stored_chunks):
+    """Verification never judges a stored layout the spec leaves undeclared.
 
-    writer.verify_array_spec("grp/data", _make_spec(chunks=None), expected_time_count=4)
+    Undeclared time-indexed arrays are created with one slot per chunk, but a
+    store made earlier may hold them densely chunked. Verification must not
+    compare the stored chunks with the creation default; whether such a store
+    is safe for concurrent writers is decided from its actual layout, not here.
+    """
+    _make_array(writer, shape=shape, chunks=stored_chunks)
+
+    writer.verify_array_spec(
+        "grp/data", _make_spec(shape=shape, chunks=None), expected_time_count=shape[0]
+    )
 
 
 def test_verify_array_spec_raises_on_sharded_disk_unsharded_spec(writer):

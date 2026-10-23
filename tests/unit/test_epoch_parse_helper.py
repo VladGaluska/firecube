@@ -21,10 +21,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-from firecube.core.zarr.coord_materialization import (
-    coord_to_datetime64,
-    materialize_regular_coord_array,
-)
+from firecube.core.time.convert import coord_to_datetime64
+from firecube.core.zarr.coord_materialization import materialize_regular_coord_array
 from firecube.core.zarr.region_writer import RegionZarrWriter
 
 pytestmark = pytest.mark.unit

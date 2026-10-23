@@ -304,16 +304,11 @@ def _run_contention_scenario(tmp_path: Path, *, mode_a: str, mode_b: str) -> Non
     _verify_single_run_dir_on_disk(tmp_path, winner)
 
 
-def test_concurrent_both_resume_same_product(tmp_path: Path) -> None:
-    """Two resume-mode ingestors contend; exactly one wins the write claim."""
-    _run_contention_scenario(tmp_path, mode_a="resume", mode_b="resume")
-
-
-def test_concurrent_both_force_same_product(tmp_path: Path) -> None:
-    """Two force-reingest ingestors contend; exactly one wins the write claim."""
-    _run_contention_scenario(tmp_path, mode_a="force", mode_b="force")
-
-
 def test_concurrent_mixed_resume_and_force_same_product(tmp_path: Path) -> None:
-    """A resume + a force ingestor contend; the claim contract is mode-agnostic."""
+    """A resume + a force ingestor contend; the claim contract is mode-agnostic.
+
+    The mode is only a label in the WAL meta; no runtime branch reads it, so
+    one contention with both labels covers the resume/resume and force/force
+    pairings as well.
+    """
     _run_contention_scenario(tmp_path, mode_a="resume", mode_b="force")

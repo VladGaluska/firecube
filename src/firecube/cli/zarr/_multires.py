@@ -21,6 +21,7 @@ import json
 import click
 
 from firecube.cli._ctx import get_storage_config
+from firecube.cli._errors import render
 from firecube.cli._product import resolve_product_identity
 from firecube.cli._shared_options import (
     product_name_option,
@@ -123,6 +124,6 @@ def multires(
             session=session,
         ).build(config)
     except (ImportError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(render(exc)) from exc
 
     click.echo(json.dumps(result, indent=2))

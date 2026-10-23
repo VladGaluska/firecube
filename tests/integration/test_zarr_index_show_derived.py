@@ -29,6 +29,7 @@ from firecube.core.controlplane.types import (
     ResolvedIndexRecord,
     compute_resolved_index_identity_hash,
 )
+from tests.helpers.rows import table_row
 
 pytestmark = pytest.mark.integration
 
@@ -40,6 +41,7 @@ def _seed_regular_time_record(
     cadence_s: int = 600,
     slot_count: int = 3,
     product_name: str = "test_product",
+    calendar: str | None = None,
 ) -> ResolvedIndexRecord:
     index: dict = {
         "schema_version": "v1",
@@ -52,6 +54,7 @@ def _seed_regular_time_record(
                     "epoch": epoch,
                     "cadence_s": cadence_s,
                     "mode": "exact",
+                    **({"calendar": calendar} if calendar else {}),
                 },
             }
         },
@@ -177,10 +180,17 @@ def test_derived_regular_time_produces_correct_coordinates(tmp_path: Path) -> No
     cadence_s = 600
     slot_count = 3
     _seed_regular_time_record(cube, epoch=epoch, cadence_s=cadence_s, slot_count=slot_count)
+    snapshot_before = tmp_path / "snapshot_before"
+    shutil.copytree(cube, snapshot_before)
 
     result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
 
     assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    # --derived computes coordinates on the fly and persists nothing.
+    comparison = filecmp.dircmp(str(cube), str(snapshot_before))
+    assert not comparison.left_only, f"New files after --derived: {comparison.left_only}"
+    assert not comparison.right_only, f"Files removed after --derived: {comparison.right_only}"
+    assert not comparison.diff_files, f"Files changed after --derived: {comparison.diff_files}"
     epoch_dt = datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC)
     delta = datetime.timedelta(seconds=cadence_s)
     expected = [
@@ -191,45 +201,27 @@ def test_derived_regular_time_produces_correct_coordinates(tmp_path: Path) -> No
     assert "derived_coordinates" in result.stdout
 
 
-def test_derived_does_not_persist_anything(tmp_path: Path) -> None:
-    cube = tmp_path / "cube"
-    cube.mkdir()
-    _seed_regular_time_record(cube)
-
-    snapshot_before = tmp_path / "snapshot_before"
-    shutil.copytree(cube, snapshot_before)
-
-    result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-
-    comparison = filecmp.dircmp(str(cube), str(snapshot_before))
-    assert not comparison.left_only, f"New files after --derived: {comparison.left_only}"
-    assert not comparison.right_only, f"Files removed after --derived: {comparison.right_only}"
-    assert not comparison.diff_files, f"Files changed after --derived: {comparison.diff_files}"
+# Rows: (old test name, seeder). Axes without a regular cadence have nothing to derive.
+_NOOP_ROWS = (
+    ("test_derived_irregular_time_is_noop_with_note", _seed_irregular_time_record),
+    ("test_derived_integer_axis_is_noop_with_note", _seed_integer_record),
+)
 
 
-def test_derived_irregular_time_is_noop_with_note(tmp_path: Path) -> None:
-    cube = tmp_path / "cube"
-    cube.mkdir()
-    _seed_irregular_time_record(cube)
+def test_derived_is_noop_with_note_for_non_regular_axes(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    for row_id, seed in _NOOP_ROWS:
+        with table_row(subtests, row_id, tmp_path) as (workdir, _mp):
+            cube = workdir / "cube"
+            cube.mkdir()
+            seed(cube)
 
-    result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
+            result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
 
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "derived_coordinates" not in result.stdout
-    assert "no-op" in result.stderr or "note" in result.stderr
-
-
-def test_derived_integer_axis_is_noop_with_note(tmp_path: Path) -> None:
-    cube = tmp_path / "cube"
-    cube.mkdir()
-    _seed_integer_record(cube)
-
-    result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
-
-    assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "derived_coordinates" not in result.stdout
-    assert "no-op" in result.stderr or "note" in result.stderr
+            assert result.exit_code == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            assert "derived_coordinates" not in result.stdout
+            assert "no-op" in result.stderr or "note" in result.stderr
 
 
 def test_derived_missing_epoch_fails_with_actionable_error(tmp_path: Path) -> None:
@@ -241,6 +233,19 @@ def test_derived_missing_epoch_fails_with_actionable_error(tmp_path: Path) -> No
 
     assert result.exit_code != 0, f"Expected failure; stdout={result.stdout!r}"
     assert "epoch" in result.output or "epoch" in (result.stderr or "")
+
+
+def test_derived_calendar_group_prints_calendar_dates(tmp_path: Path) -> None:
+    cube = tmp_path / "cube"
+    cube.mkdir()
+    _seed_regular_time_record(
+        cube, epoch="2049-01-01T12:00:00Z", cadence_s=86400, slot_count=90, calendar="360_day"
+    )
+
+    result = CliRunner().invoke(cli, _show_args(cube, "--derived"))
+
+    assert result.exit_code == 0, result.output
+    assert "2049-02-30T12:00:00" in result.stdout
 
 
 def test_no_derived_flag_output_unchanged(tmp_path: Path) -> None:

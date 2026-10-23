@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -41,6 +43,7 @@ from firecube.core.controlplane.types import (
     validate_manifest_entries,
 )
 from firecube.core.errors import ManifestError
+from tests.helpers.rows import table_row
 
 
 def _regular_index() -> dict[str, object]:
@@ -123,171 +126,159 @@ def _coordinate_order_items() -> tuple[ItemManifestEntry, ...]:
     )
 
 
-def test_regular_axis_identity_hash_unchanged_after_schema() -> None:
-    index = _regular_index()
-    pre_manifest_hash = hashlib.sha256(canonical_index_bytes(index)).hexdigest()
-    record = _make_record(index=index)
-    assert record.items is None
-    assert record.identity_hash == pre_manifest_hash
+def test_manifest_record_identity_and_wire_format(subtests: Any, tmp_path: Path) -> None:
+    with table_row(subtests, "regular_axis_identity_hash_unchanged_after_schema", tmp_path):
+        index = _regular_index()
+        pre_manifest_hash = hashlib.sha256(canonical_index_bytes(index)).hexdigest()
+        record = _make_record(index=index)
+        assert record.items is None
+        assert record.identity_hash == pre_manifest_hash
+
+    with table_row(subtests, "integer_axis_identity_hash_unchanged_after_schema", tmp_path):
+        index = _integer_index()
+        pre_manifest_hash = hashlib.sha256(canonical_index_bytes(index)).hexdigest()
+        record = _make_record(index=index)
+        assert record.items is None
+        assert record.identity_hash == pre_manifest_hash
+
+    with table_row(subtests, "to_json_bytes_omits_items_key_when_none", tmp_path):
+        record = _make_record(index=_regular_index())
+        payload = json.loads(record.to_json_bytes())
+        assert "items" not in payload
+
+    with table_row(subtests, "manifest_items_affect_identity_hash", tmp_path):
+        index = _regular_index()
+        record_no_items = _make_record(index=index)
+        record_with_items = _make_record(index=index, items=_sample_items())
+        assert record_no_items.identity_hash != record_with_items.identity_hash
+
+    with table_row(subtests, "manifest_item_content_changes_identity_hash", tmp_path):
+        index = _regular_index()
+        items_a = _sample_items()
+        items_b = (
+            items_a[0],
+            ItemManifestEntry(
+                identity_hash="c" * 64,
+                coordinate_value="2024-01-01T00:20:00Z",
+                source_ref="s3://bucket/three.nc",
+                source_ref_kind="uri",
+            ),
+        )
+        assert (
+            _make_record(index=index, items=items_a).identity_hash
+            != _make_record(index=index, items=items_b).identity_hash
+        )
+
+    with table_row(subtests, "manifest_item_order_does_not_affect_identity_hash", tmp_path):
+        index = _regular_index()
+        items = _sample_items()
+        forward = _make_record(index=index, items=items)
+        reversed_ = _make_record(index=index, items=items[::-1])
+        assert forward.identity_hash == reversed_.identity_hash
+
+    with table_row(subtests, "to_json_bytes_sorts_items_by_coordinate_value", tmp_path):
+        record = _make_record(index=_regular_index(), items=_coordinate_order_items())
+        payload = json.loads(record.to_json_bytes())
+        assert [item["coordinate_value"] for item in payload["items"]] == [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T00:10:00Z",
+        ]
+
+    with table_row(subtests, "validate_manifest_entries_accepts_valid_entries", tmp_path):
+        validate_manifest_entries(list(_sample_items()))
+
+    with table_row(subtests, "round_trip_preserves_manifest", tmp_path):
+        record = _make_record(index=_regular_index(), items=_sample_items())
+        recovered = ResolvedIndexRecord.from_json_bytes(record.to_json_bytes())
+        assert recovered.identity_hash == record.identity_hash
+        assert recovered.items is not None
+        assert len(recovered.items) == len(_sample_items())
+        recovered_hashes = {entry.identity_hash for entry in recovered.items}
+        expected_hashes = {entry.identity_hash for entry in _sample_items()}
+        assert recovered_hashes == expected_hashes
+
+    with table_row(subtests, "round_trip_preserves_absence_of_manifest", tmp_path):
+        record = _make_record(index=_regular_index())
+        recovered = ResolvedIndexRecord.from_json_bytes(record.to_json_bytes())
+        assert recovered.items is None
+
+    with table_row(subtests, "item_manifest_entry_is_reexported_from_public_apis", tmp_path):
+        from firecube.core.api import ItemManifestEntry as CoreEntry
+        from firecube.ingestor.api import ItemManifestEntry as IngestorEntry
+
+        assert CoreEntry is ItemManifestEntry
+        assert IngestorEntry is ItemManifestEntry
+
+    with table_row(subtests, "validate_manifest_entries_is_reexported_from_public_apis", tmp_path):
+        from firecube.core.api import validate_manifest_entries as core_fn
+        from firecube.ingestor.api import validate_manifest_entries as ingestor_fn
+
+        assert core_fn is validate_manifest_entries
+        assert ingestor_fn is validate_manifest_entries
 
 
-def test_integer_axis_identity_hash_unchanged_after_schema() -> None:
-    index = _integer_index()
-    pre_manifest_hash = hashlib.sha256(canonical_index_bytes(index)).hexdigest()
-    record = _make_record(index=index)
-    assert record.items is None
-    assert record.identity_hash == pre_manifest_hash
+def test_invalid_manifests_are_refused(subtests: Any, tmp_path: Path) -> None:
+    with table_row(
+        subtests, "validate_manifest_entries_rejects_duplicate_identity_hashes", tmp_path
+    ):
+        entries = [
+            ItemManifestEntry(
+                identity_hash="same" + "0" * 60,
+                coordinate_value="2024-01-01T00:00:00Z",
+                source_ref="s3://bucket/a.nc",
+                source_ref_kind="uri",
+            ),
+            ItemManifestEntry(
+                identity_hash="same" + "0" * 60,
+                coordinate_value="2024-01-01T00:10:00Z",
+                source_ref="s3://bucket/b.nc",
+                source_ref_kind="uri",
+            ),
+        ]
+        with pytest.raises(ValueError, match="duplicate identity_hash"):
+            validate_manifest_entries(entries)
 
+    with table_row(subtests, "validate_manifest_entries_rejects_duplicate_coordinates", tmp_path):
+        entries = [
+            ItemManifestEntry(
+                identity_hash="a" * 64,
+                coordinate_value="2024-01-01T00:00:00Z",
+                source_ref="s3://bucket/a.nc",
+                source_ref_kind="uri",
+            ),
+            ItemManifestEntry(
+                identity_hash="b" * 64,
+                coordinate_value="2024-01-01T00:00:00Z",
+                source_ref="s3://bucket/b.nc",
+                source_ref_kind="uri",
+            ),
+        ]
+        with pytest.raises(ValueError, match="duplicate coordinate_value"):
+            validate_manifest_entries(entries)
 
-def test_to_json_bytes_omits_items_key_when_none() -> None:
-    record = _make_record(index=_regular_index())
-    payload = json.loads(record.to_json_bytes())
-    assert "items" not in payload
+    with table_row(subtests, "validate_manifest_entries_rejects_empty_source_ref", tmp_path):
+        entries = [
+            ItemManifestEntry(
+                identity_hash="a" * 64,
+                coordinate_value="2024-01-01T00:00:00Z",
+                source_ref="",
+                source_ref_kind="uri",
+            ),
+        ]
+        with pytest.raises(ValueError, match="source_ref must be non-empty"):
+            validate_manifest_entries(entries)
 
+    with table_row(subtests, "from_json_bytes_rejects_tampered_manifest", tmp_path):
+        record = _make_record(index=_regular_index(), items=_sample_items())
+        payload = json.loads(record.to_json_bytes())
+        assert isinstance(payload["items"], list) and payload["items"]
+        payload["items"][0]["identity_hash"] = "d" * 64
+        with pytest.raises(ManifestError, match="identity-hash mismatch"):
+            ResolvedIndexRecord.from_json_bytes(json.dumps(payload).encode("utf-8"))
 
-def test_manifest_items_affect_identity_hash() -> None:
-    index = _regular_index()
-    record_no_items = _make_record(index=index)
-    record_with_items = _make_record(index=index, items=_sample_items())
-    assert record_no_items.identity_hash != record_with_items.identity_hash
-
-
-def test_manifest_item_content_changes_identity_hash() -> None:
-    index = _regular_index()
-    items_a = _sample_items()
-    items_b = (
-        items_a[0],
-        ItemManifestEntry(
-            identity_hash="c" * 64,
-            coordinate_value="2024-01-01T00:20:00Z",
-            source_ref="s3://bucket/three.nc",
-            source_ref_kind="uri",
-        ),
-    )
-    assert (
-        _make_record(index=index, items=items_a).identity_hash
-        != _make_record(index=index, items=items_b).identity_hash
-    )
-
-
-def test_manifest_item_order_does_not_affect_identity_hash() -> None:
-    index = _regular_index()
-    items = _sample_items()
-    forward = _make_record(index=index, items=items)
-    reversed_ = _make_record(index=index, items=items[::-1])
-    assert forward.identity_hash == reversed_.identity_hash
-
-
-def test_to_json_bytes_sorts_items_by_coordinate_value() -> None:
-    record = _make_record(index=_regular_index(), items=_coordinate_order_items())
-    payload = json.loads(record.to_json_bytes())
-
-    assert [item["coordinate_value"] for item in payload["items"]] == [
-        "2024-01-01T00:00:00Z",
-        "2024-01-01T00:10:00Z",
-    ]
-
-
-def test_validate_manifest_entries_accepts_valid_entries() -> None:
-    validate_manifest_entries(list(_sample_items()))
-
-
-def test_validate_manifest_entries_rejects_duplicate_identity_hashes() -> None:
-    entries = [
-        ItemManifestEntry(
-            identity_hash="same" + "0" * 60,
-            coordinate_value="2024-01-01T00:00:00Z",
-            source_ref="s3://bucket/a.nc",
-            source_ref_kind="uri",
-        ),
-        ItemManifestEntry(
-            identity_hash="same" + "0" * 60,
-            coordinate_value="2024-01-01T00:10:00Z",
-            source_ref="s3://bucket/b.nc",
-            source_ref_kind="uri",
-        ),
-    ]
-    with pytest.raises(ValueError, match="duplicate identity_hash"):
-        validate_manifest_entries(entries)
-
-
-def test_validate_manifest_entries_rejects_duplicate_coordinates() -> None:
-    entries = [
-        ItemManifestEntry(
-            identity_hash="a" * 64,
-            coordinate_value="2024-01-01T00:00:00Z",
-            source_ref="s3://bucket/a.nc",
-            source_ref_kind="uri",
-        ),
-        ItemManifestEntry(
-            identity_hash="b" * 64,
-            coordinate_value="2024-01-01T00:00:00Z",
-            source_ref="s3://bucket/b.nc",
-            source_ref_kind="uri",
-        ),
-    ]
-    with pytest.raises(ValueError, match="duplicate coordinate_value"):
-        validate_manifest_entries(entries)
-
-
-def test_validate_manifest_entries_rejects_empty_source_ref() -> None:
-    entries = [
-        ItemManifestEntry(
-            identity_hash="a" * 64,
-            coordinate_value="2024-01-01T00:00:00Z",
-            source_ref="",
-            source_ref_kind="uri",
-        ),
-    ]
-    with pytest.raises(ValueError, match="source_ref must be non-empty"):
-        validate_manifest_entries(entries)
-
-
-def test_round_trip_preserves_manifest() -> None:
-    record = _make_record(index=_regular_index(), items=_sample_items())
-    recovered = ResolvedIndexRecord.from_json_bytes(record.to_json_bytes())
-    assert recovered.identity_hash == record.identity_hash
-    assert recovered.items is not None
-    assert len(recovered.items) == len(_sample_items())
-    recovered_hashes = {entry.identity_hash for entry in recovered.items}
-    expected_hashes = {entry.identity_hash for entry in _sample_items()}
-    assert recovered_hashes == expected_hashes
-
-
-def test_round_trip_preserves_absence_of_manifest() -> None:
-    record = _make_record(index=_regular_index())
-    recovered = ResolvedIndexRecord.from_json_bytes(record.to_json_bytes())
-    assert recovered.items is None
-
-
-def test_from_json_bytes_rejects_tampered_manifest() -> None:
-    record = _make_record(index=_regular_index(), items=_sample_items())
-    payload = json.loads(record.to_json_bytes())
-    assert isinstance(payload["items"], list) and payload["items"]
-    payload["items"][0]["identity_hash"] = "d" * 64
-    with pytest.raises(ManifestError, match="identity-hash mismatch"):
-        ResolvedIndexRecord.from_json_bytes(json.dumps(payload).encode("utf-8"))
-
-
-def test_from_json_bytes_rejects_invalid_source_ref_kind() -> None:
-    record = _make_record(index=_regular_index(), items=_sample_items())
-    payload = json.loads(record.to_json_bytes())
-    payload["items"][0]["source_ref_kind"] = "bogus"
-    with pytest.raises(ManifestError, match="source_ref_kind"):
-        ResolvedIndexRecord.from_json_bytes(json.dumps(payload).encode("utf-8"))
-
-
-def test_item_manifest_entry_is_reexported_from_public_apis() -> None:
-    from firecube.core.api import ItemManifestEntry as CoreEntry
-    from firecube.ingestor.api import ItemManifestEntry as IngestorEntry
-
-    assert CoreEntry is ItemManifestEntry
-    assert IngestorEntry is ItemManifestEntry
-
-
-def test_validate_manifest_entries_is_reexported_from_public_apis() -> None:
-    from firecube.core.api import validate_manifest_entries as core_fn
-    from firecube.ingestor.api import validate_manifest_entries as ingestor_fn
-
-    assert core_fn is validate_manifest_entries
-    assert ingestor_fn is validate_manifest_entries
+    with table_row(subtests, "from_json_bytes_rejects_invalid_source_ref_kind", tmp_path):
+        record = _make_record(index=_regular_index(), items=_sample_items())
+        payload = json.loads(record.to_json_bytes())
+        payload["items"][0]["source_ref_kind"] = "bogus"
+        with pytest.raises(ManifestError, match="source_ref_kind"):
+            ResolvedIndexRecord.from_json_bytes(json.dumps(payload).encode("utf-8"))

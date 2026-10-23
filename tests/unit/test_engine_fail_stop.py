@@ -28,8 +28,10 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar
 
+import click
 import pytest
 
+from firecube.cli._errors import render
 from firecube.ingestor.config.engine import EngineConfig
 from firecube.ingestor.runtime.engine import (
     PipelineExecutor,
@@ -300,8 +302,11 @@ def test_finalize_message_names_failed_and_not_attempted_counts(tmp_path: Path) 
     assert "3 later batch(es) were not attempted" in message
     assert "no batch appends past a gap" in message
     assert "status=failed" in message
-    assert "--option resume_existing=true" in message
-    assert "--option force_reingest=true" in message
+    rendered = render(excinfo.value, click.Context(click.Command("ingest")))
+    assert "--option resume_existing=true" in rendered
+    assert "--option force_reingest=true" in rendered
+    assert "--option" not in message
+    assert "resume_existing=true" in message and "force_reingest=true" in message
 
 
 def test_finalize_message_omits_not_attempted_clause_when_all_attempted(tmp_path: Path) -> None:
@@ -315,4 +320,6 @@ def test_finalize_message_omits_not_attempted_clause_when_all_attempted(tmp_path
     message = str(excinfo.value)
     assert "had 1 failed batch(es)" in message
     assert "not attempted" not in message
-    assert "--option resume_existing=true" in message
+    rendered = render(excinfo.value, click.Context(click.Command("x")))
+    assert "--option resume_existing=true" in rendered
+    assert "--option" not in message

@@ -130,54 +130,39 @@ def _integer_resolved_index() -> ResolvedIndex:
     )
 
 
-class TestLegacySlotIndexBytesUnchanged:
-    def test_opera_legacy_bytes_match_golden(self) -> None:
-        assert _opera_legacy_model().canonical_bytes() == OPERA_LEGACY_BYTES
-
-    def test_opera_legacy_hash_matches_golden(self) -> None:
-        assert _opera_legacy_model().identity_hash == OPERA_LEGACY_HASH
-
-    def test_fci_legacy_bytes_match_golden(self) -> None:
-        assert _fci_legacy_model().canonical_bytes() == FCI_LEGACY_BYTES
-
-    def test_fci_legacy_hash_matches_golden(self) -> None:
-        assert _fci_legacy_model().identity_hash == FCI_LEGACY_HASH
-
-    def test_legacy_hashes_are_sha256_of_canonical_bytes(self) -> None:
-        for model, expected_hash in (
-            (_opera_legacy_model(), OPERA_LEGACY_HASH),
-            (_fci_legacy_model(), FCI_LEGACY_HASH),
-        ):
-            assert hashlib.sha256(model.canonical_bytes()).hexdigest() == expected_hash
+def _canonical_bytes(index: SlotIndexModel | ResolvedIndex) -> bytes:
+    if isinstance(index, SlotIndexModel):
+        return index.canonical_bytes()
+    return canonical_index_bytes(index.canonical_index_payload())
 
 
-class TestResolvedIndexBytesUnchanged:
-    def test_opera_resolved_bytes_match_golden(self) -> None:
-        resolved = _opera_resolved_index()
-        assert canonical_index_bytes(resolved.canonical_index_payload()) == OPERA_RESOLVED_BYTES
+# Specimen rows per family: (name, build, golden bytes, golden hash). Row ids are
+# the old test names: test_<name>_bytes_match_golden, test_<name>_hash_matches_golden
+# and test_<family>_hashes_are_sha256_of_canonical_bytes.
+_FAMILIES = {
+    "legacy": [
+        ("opera_legacy", _opera_legacy_model, OPERA_LEGACY_BYTES, OPERA_LEGACY_HASH),
+        ("fci_legacy", _fci_legacy_model, FCI_LEGACY_BYTES, FCI_LEGACY_HASH),
+    ],
+    "resolved": [
+        ("opera_resolved", _opera_resolved_index, OPERA_RESOLVED_BYTES, OPERA_RESOLVED_HASH),
+        ("fci_resolved", _fci_resolved_index, FCI_RESOLVED_BYTES, FCI_RESOLVED_HASH),
+        (
+            "integer_resolved",
+            _integer_resolved_index,
+            INTEGER_RESOLVED_BYTES,
+            INTEGER_RESOLVED_HASH,
+        ),
+    ],
+}
 
-    def test_opera_resolved_hash_matches_golden(self) -> None:
-        assert _opera_resolved_index().identity_hash == OPERA_RESOLVED_HASH
 
-    def test_fci_resolved_bytes_match_golden(self) -> None:
-        resolved = _fci_resolved_index()
-        assert canonical_index_bytes(resolved.canonical_index_payload()) == FCI_RESOLVED_BYTES
-
-    def test_fci_resolved_hash_matches_golden(self) -> None:
-        assert _fci_resolved_index().identity_hash == FCI_RESOLVED_HASH
-
-    def test_integer_resolved_bytes_match_golden(self) -> None:
-        resolved = _integer_resolved_index()
-        assert canonical_index_bytes(resolved.canonical_index_payload()) == INTEGER_RESOLVED_BYTES
-
-    def test_integer_resolved_hash_matches_golden(self) -> None:
-        assert _integer_resolved_index().identity_hash == INTEGER_RESOLVED_HASH
-
-    def test_resolved_hashes_are_sha256_of_canonical_bytes(self) -> None:
-        for resolved, expected_hash in (
-            (_opera_resolved_index(), OPERA_RESOLVED_HASH),
-            (_fci_resolved_index(), FCI_RESOLVED_HASH),
-            (_integer_resolved_index(), INTEGER_RESOLVED_HASH),
-        ):
-            payload = resolved.canonical_index_payload()
-            assert hashlib.sha256(canonical_index_bytes(payload)).hexdigest() == expected_hash
+def test_canonical_bytes_and_hashes_match_golden(subtests: pytest.Subtests) -> None:
+    for family, specimens in _FAMILIES.items():
+        for name, build, golden_bytes, golden_hash in specimens:
+            with subtests.test(msg=f"test_{name}_bytes_match_golden"):
+                assert _canonical_bytes(build()) == golden_bytes
+            with subtests.test(msg=f"test_{name}_hash_matches_golden"):
+                assert build().identity_hash == golden_hash
+            with subtests.test(msg=f"test_{family}_hashes_are_sha256_of_canonical_bytes"):
+                assert hashlib.sha256(_canonical_bytes(build())).hexdigest() == golden_hash
