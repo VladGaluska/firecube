@@ -20,11 +20,9 @@ import click
 
 from firecube.cli._ctx import get_storage_config
 from firecube.cli._errors import echo_rendered, render, wrap_user_facing_errors
-from firecube.cli._product import require_full_uri
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
-    validate_uri_storage_coherence,
+    parse_and_validate_uri,
 )
 
 
@@ -132,10 +130,8 @@ def consolidate_time_coord(
         consolidate_time_coords,
     )
 
-    require_full_uri(target, option_name="--target")
-    parsed = parse_product_uri(target)
-    storage_type = apply_smart_default(parsed, storage_type)
-    validate_uri_storage_coherence(parse_product_uri(target), storage_type)
+    target_uri = parse_and_validate_uri(target, param_hint="--target")
+    storage_type = apply_smart_default(target_uri, storage_type)
     if chunk_size is not None and chunk_size <= 0:
         raise click.ClickException("--chunk-size must be a positive integer.")
 

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pytest
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
@@ -40,6 +41,34 @@ def test_restore_rejects_storage_type_target_uri_mismatch() -> None:
     assert result.exit_code == 2
     assert "incompatible" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.contract
+def test_restore_rejects_bare_tgm_archive_path() -> None:
+    result = _invoke_restore(
+        ["--archive", "/tmp/foo.tgm", "--target", "file:///tmp/x.zarr", "--dry-run"]
+    )
+
+    assert result.exit_code == 2
+    assert "URI scheme required (file:// or s3://). Did you mean file:///tmp/foo.tgm?" in (
+        result.output
+    )
+    assert "Traceback" not in result.output
+    assert "[dry-run] Would restore" not in result.output
+
+
+@pytest.mark.contract
+def test_restore_rejects_bare_zip_archive_path() -> None:
+    result = _invoke_restore(
+        ["--archive", "/tmp/foo.zip", "--target", "file:///tmp/x.zarr", "--dry-run"]
+    )
+
+    assert result.exit_code == 2
+    assert "URI scheme required (file:// or s3://). Did you mean file:///tmp/foo.zip?" in (
+        result.output
+    )
+    assert "Traceback" not in result.output
+    assert "[dry-run] Would restore" not in result.output
 
 
 def test_restore_rejects_remote_tgm_archive() -> None:

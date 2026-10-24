@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import click
@@ -29,10 +28,7 @@ from firecube.cli._shared_options import (
     archive_uri_option,
 )
 from firecube.cli._typed_options import display_format_option
-from firecube.cli._uri_policy import (
-    parse_product_uri,
-)
-from firecube.cli.archive._common import _is_zip_archive, _local_zip_archive
+from firecube.cli.archive._common import _is_zip_archive, _local_archive
 
 
 def _echo_archive_info(info_dict: dict[str, Any], *, as_json: bool, format_label: str) -> None:
@@ -103,23 +99,17 @@ def info(ctx: click.Context, archive: str, output_format: str) -> None:
     and time coverage. no data is decoded or written; suitable for quick
     inspection.
     """
+    local_path = _local_archive(archive)
     if _is_zip_archive(archive):
         from firecube.core.zarr.zip_archive import zip_info
 
-        info_dict = zip_info(_local_zip_archive(archive))
+        info_dict = zip_info(local_path)
         _echo_archive_info(
             info_dict, as_json=output_format == "json", format_label=info_dict["format"]
         )
         return
 
     from firecube.core.tensogram.inspection import TensogramArchiveError, tgm_info
-
-    parsed = parse_product_uri(archive)
-    if parsed.scheme == "s3":
-        raise click.ClickException("Remote .tgm artifacts not yet supported")
-    local_path = parsed.normalized.removeprefix("file://")
-    if not Path(local_path).exists():
-        raise click.ClickException(f"Archive not found: {archive}")
 
     try:
         info_dict = tgm_info(local_path, operation="firecube archive info")
@@ -164,27 +154,20 @@ def validate(ctx: click.Context, archive: str, quick: bool) -> None:
     entry. exits with code 0 if the archive is valid, code 1 if it is
     corrupted or incomplete.
     """
+    local_path = _local_archive(archive)
     if _is_zip_archive(archive):
         from firecube.core.zarr.zip_archive import validate_zip
 
-        zip_path = _local_zip_archive(archive)
-        zip_issues = validate_zip(zip_path, quick=quick)
+        zip_issues = validate_zip(local_path, quick=quick)
         if not zip_issues:
-            click.echo(f"VALID: {zip_path} (no issues)")
+            click.echo(f"VALID: {local_path} (no issues)")
             return
-        click.echo(f"INVALID: {zip_path} ({len(zip_issues)} issue(s))")
+        click.echo(f"INVALID: {local_path} ({len(zip_issues)} issue(s))")
         for zip_issue in zip_issues:
             click.echo(f"  {zip_issue}")
         raise SystemExit(1)
 
     from firecube.core.tensogram.inspection import validate_tgm
-
-    parsed = parse_product_uri(archive)
-    if parsed.scheme == "s3":
-        raise click.ClickException("Remote .tgm artifacts not yet supported")
-    local_path = parsed.normalized.removeprefix("file://")
-    if not Path(local_path).exists():
-        raise click.ClickException(f"Archive not found: {archive}")
 
     validation = validate_tgm(local_path, quick=quick, operation="firecube archive validate")
     hard_issues = validation.issues
@@ -226,10 +209,11 @@ def list_cmd(ctx: click.Context, archive: str) -> None:
     range. a .zip archive is shown as one xarray dataset per group. no data is
     decoded; useful for reviewing archive contents before restoring.
     """
+    local_path = _local_archive(archive)
     if _is_zip_archive(archive):
         from firecube.core.zarr.zip_archive import list_zip
 
-        listing = list_zip(_local_zip_archive(archive))
+        listing = list_zip(local_path)
         click.echo(f"Groups: {len(listing)}")
         for group_name, dataset in listing:
             click.echo(f"\nGroup: {group_name or '(root)'}")
@@ -237,13 +221,6 @@ def list_cmd(ctx: click.Context, archive: str) -> None:
         return
 
     from firecube.core.tensogram.inspection import open_tgm_listing
-
-    parsed = parse_product_uri(archive)
-    if parsed.scheme == "s3":
-        raise click.ClickException("Remote .tgm artifacts not yet supported")
-    local_path = parsed.normalized.removeprefix("file://")
-    if not Path(local_path).exists():
-        raise click.ClickException(f"Archive not found: {archive}")
 
     with open_tgm_listing(local_path, operation="firecube archive list") as listing:
         click.echo(f"Messages: {listing.message_count}")

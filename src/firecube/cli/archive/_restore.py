@@ -33,17 +33,16 @@ from firecube.cli._shared_options import (
 )
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
+    parse_and_validate_uri,
 )
 from firecube.cli.archive._common import (
     _is_zip_archive,
-    _local_zip_archive,
+    _local_archive,
     _require_overwrite_confirmation,
 )
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
-from firecube.core.uris import is_remote_target, local_path_from_target
 
 
 @click.command(
@@ -114,17 +113,18 @@ def restore(
     """
     is_zip = _is_zip_archive(archive)
 
-    parsed_target = parse_product_uri(target)
-    storage_type = apply_smart_default(parsed_target, storage_type)
-    if is_remote_target(archive):
+    target_uri = parse_and_validate_uri(target, param_hint="--target")
+    storage_type = apply_smart_default(target_uri, storage_type)
+    archive_uri = parse_and_validate_uri(archive, param_hint="--archive")
+    if archive_uri.is_remote():
         raise click.ClickException(
             f"Remote {'.zip' if is_zip else '.tgm'} artifacts not yet supported"
         )
-    if is_zip and is_remote_target(target):
+    if is_zip and target_uri.is_remote():
         raise click.ClickException(
             "Restoring a .zip archive to a remote target is not yet supported"
         )
-    archive_abs = _local_zip_archive(archive) if is_zip else str(local_path_from_target(archive))
+    archive_abs = _local_archive(archive) if is_zip else archive_uri.path
 
     _require_overwrite_confirmation(overwrite=overwrite, yes_i_really_mean_it=yes_i_really_mean_it)
 
@@ -146,10 +146,9 @@ def restore(
 
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     restore_identity = resolve_product_identity(
-        target,
+        target_uri,
         format="zarr",
         product_name=target.rstrip("/").rsplit("/", 1)[-1],
-        option_name="--target",
     )
     session = StorageSession(
         StorageBinding(

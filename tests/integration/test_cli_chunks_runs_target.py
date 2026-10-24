@@ -259,6 +259,31 @@ def test_abandon_target_rejects_bare_path(tmp_path: Path) -> None:
     assert "--target" in result.output
 
 
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("opts", "text"),
+    [
+        (
+            ["--product-name", "p", "--target", "{p}"],
+            "'--target': URI scheme required (file:// or s3://)",
+        ),
+        (
+            ["--product-name", "p", "--target", "FILE://{p}"],
+            "'--target': URI scheme must be lowercase",
+        ),
+        (
+            ["--product-name", "gs://bucket/p.zarr"],
+            "'--product-name': URI scheme 'gs' not supported.",
+        ),
+    ],
+)
+def test_chunks_runs_refuse_a_value_the_uri_rule_refuses(tmp_path, opts, text) -> None:
+    argv = ["chunks", "--workspace", str(tmp_path), "runs", "list"]
+    result = CliRunner().invoke(cli, argv + [o.format(p=tmp_path / "p.zarr") for o in opts])
+    assert result.exit_code == 2 and f"Invalid value for {text}" in result.output, result.output
+    assert "Traceback" not in result.output
+
+
 def test_runs_list_basename_mismatch(tmp_path: Path) -> None:
     product_name = "my_product"
     target_root = tmp_path / "cube-data.zarr"

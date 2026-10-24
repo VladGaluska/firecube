@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from firecube.cli.main import cli
@@ -180,3 +181,15 @@ def test_passes_typed_storage_session_downstream(
     )
 
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.contract
+def test_catalog_intake_writes_output_to_the_literal_path(tmp_local_zarr, tmp_path):
+    out = tmp_path / "sp ace'q" / "catalog.yaml"
+    src = tmp_local_zarr.as_uri()
+    result = _invoke_intake(
+        ["cli_test_plugin", "-p", src, "-o", f"file://{out}", "--collection-id", "c"]
+    )
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    assert not [p for p in tmp_path.rglob("*") if "%" in p.name]

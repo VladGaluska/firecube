@@ -20,8 +20,7 @@ from typing import Any
 
 import click
 
-from firecube.cli._uri_policy import SCHEME_TO_STORAGE_TYPE
-from firecube.core.uris import infer_target_protocol
+from firecube.cli._uri_policy import parse_and_validate_uri, validate_uri_storage_coherence
 
 
 @dataclass(slots=True)
@@ -78,27 +77,17 @@ class IngestCommandConfig:
                 f"--storage-type must be one of: {', '.join(sorted(self._VALID_STORAGE_TYPES))} "
                 f"(got '{self.storage_type}')"
             )
-        if self.storage_type is not None and self.target:
+        if self.target:
             try:
-                scheme = infer_target_protocol(self.target)
-            except ValueError as exc:
-                errors.append(str(exc))
+                uri = parse_and_validate_uri(self.target, param_hint="--target")
+            except click.UsageError as exc:
+                errors.append(exc.format_message())
             else:
-                expected_storage_type = SCHEME_TO_STORAGE_TYPE.get(scheme)
-                if expected_storage_type is None:
-                    errors.append(
-                        f"Target URI scheme '{scheme}' is not supported. Use a file:// URI for "
-                        "--storage-type local, or an s3:// URI for --storage-type s3."
-                    )
-                elif expected_storage_type != self.storage_type:
-                    alternate_target = (
-                        "an s3://-compatible URI" if self.storage_type == "s3" else "a file:// URI"
-                    )
-                    errors.append(
-                        f"Target URI scheme '{scheme}' is incompatible with --storage-type "
-                        f"'{self.storage_type}'. Use --storage-type {expected_storage_type} "
-                        f"for {scheme}:// targets, or change --target to {alternate_target}."
-                    )
+                if self.storage_type is not None:
+                    try:
+                        validate_uri_storage_coherence(uri, self.storage_type)
+                    except click.UsageError as exc:
+                        errors.append(exc.format_message())
 
         if (
             self.storage_driver is not None

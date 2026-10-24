@@ -22,7 +22,7 @@ import click
 
 from firecube.cli._ctx import get_storage_config
 from firecube.cli._errors import render, wrap_user_facing_errors
-from firecube.cli._product import require_full_uri, resolve_product_identity
+from firecube.cli._product import resolve_product_identity
 from firecube.cli._shared_options import (
     product_uri_option,
     storage_driver_option,
@@ -30,7 +30,7 @@ from firecube.cli._shared_options import (
 )
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
+    parse_and_validate_uri,
     validate_uri_storage_coherence,
 )
 from firecube.core.api import compare_zarr_stores
@@ -116,8 +116,8 @@ def validate(
     without modifying any data. Requires --product and --group; exits with a
     structured JSON summary.
     """
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
     storage_config = get_storage_config(
         ctx,
         overrides={
@@ -129,7 +129,7 @@ def validate(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     identity = resolve_product_identity(
-        parsed_uri.normalized, format="zarr", product_name=parsed_uri.normalized
+        product_uri, format="zarr", product_name=product_uri.to_str()
     )
     session = StorageSession(
         StorageBinding(
@@ -215,12 +215,15 @@ def compare(
     Storage flags are optional: --storage-type is inferred from the URI scheme
     (file:// → local, s3:// → s3) and --storage-driver defaults to fsspec.
     """
-    for uri in (a_uri, b_uri):
-        require_full_uri(uri, option_name="store URI")
-    parsed_a = parse_product_uri(a_uri)
-    resolved_storage_type = apply_smart_default(parsed_a, storage_type)
-    for uri in (a_uri, b_uri):
-        validate_uri_storage_coherence(parse_product_uri(uri), resolved_storage_type)
+    # A bare value of either argument is refused before any other check of A or B.
+    # parse_and_validate_uri always refuses a non-empty value without "://".
+    for value, param in ((a_uri, "A_URI"), (b_uri, "B_URI")):
+        if value and "://" not in value:
+            parse_and_validate_uri(value, param_hint=param)
+    store_a = parse_and_validate_uri(a_uri, param_hint="A_URI")
+    resolved_storage_type = apply_smart_default(store_a, storage_type)
+    store_b = parse_and_validate_uri(b_uri, param_hint="B_URI")
+    validate_uri_storage_coherence(store_b, resolved_storage_type)
     resolved_storage_driver = storage_driver.lower() if storage_driver is not None else "fsspec"
     report = compare_zarr_stores(
         a_uri,

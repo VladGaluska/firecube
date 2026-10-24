@@ -28,7 +28,7 @@ import click
 from firecube.cli._ctx import get_storage_config
 from firecube.cli._errors import render
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
-from firecube.cli._product import require_full_uri, resolve_product_identity
+from firecube.cli._product import resolve_product_identity
 from firecube.cli._shared_options import (
     format_option,
     product_name_option,
@@ -38,8 +38,7 @@ from firecube.cli._shared_options import (
 from firecube.cli._typed_options import TypedOptionsParam
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
-    validate_uri_storage_coherence,
+    parse_and_validate_uri,
 )
 from firecube.cli.zarr._common import _configure_ingestor_for_cli
 from firecube.core.controlplane import ChunkManager
@@ -237,10 +236,8 @@ def slots(
     """
     input_filters = resolve_input_filters(ctx, plugin, input_filters)
 
-    require_full_uri(target, option_name="--target")
-    parsed = parse_product_uri(target)
-    storage_type = apply_smart_default(parsed, storage_type)
-    validate_uri_storage_coherence(parse_product_uri(target), storage_type)
+    target_uri = parse_and_validate_uri(target, param_hint="--target")
+    storage_type = apply_smart_default(target_uri, storage_type)
 
     storage_config = get_storage_config(
         ctx,
@@ -253,10 +250,9 @@ def slots(
     )
     resolved_storage_driver = storage_config.storage_driver
     identity = resolve_product_identity(
-        target,
+        target_uri,
         format="zarr",
         product_name=product_name,
-        option_name="--target",
     )
     binding = StorageBinding(
         identity=identity,

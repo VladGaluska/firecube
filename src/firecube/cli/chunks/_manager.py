@@ -23,6 +23,7 @@ import click
 
 from firecube.cli._ctx import get_config, get_storage_config
 from firecube.cli._product import resolve_product_identity
+from firecube.cli._uri_policy import parse_and_validate_uri
 from firecube.core.config import StorageConfig
 from firecube.core.controlplane import ChunkManager
 from firecube.core.product.identity import ProductIdentity
@@ -145,10 +146,9 @@ def resolve_cli_product(
         return None, None
     if "://" not in product:
         return product, None
+    product_uri = parse_and_validate_uri(product, param_hint="--product-name")
     product_label = product.rstrip("/").rsplit("/", 1)[-1]
-    identity = resolve_product_identity(
-        product, format=format, product_name=product_label, option_name="--product-name"
-    )
+    identity = resolve_product_identity(product_uri, format=format, product_name=product_label)
     return identity.product_name, identity.product_uri
 
 

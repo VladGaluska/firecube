@@ -25,12 +25,11 @@ import click
 from firecube.cli._ctx import get_storage_config
 from firecube.cli._errors import echo_rendered, render, wrap_user_facing_errors
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
-from firecube.cli._product import require_full_uri, resolve_product_identity
+from firecube.cli._product import resolve_product_identity
 from firecube.cli._typed_options import TypedOptionsParam
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
-    validate_uri_storage_coherence,
+    parse_and_validate_uri,
 )
 from firecube.cli.zarr._common import _configure_ingestor_for_cli, logger
 from firecube.core.api import (
@@ -176,10 +175,8 @@ def preallocate(
     from firecube.ingestor.api import BaseIngestor
     from firecube.ingestor.runtime.preallocate import SlotWindowError, preallocate_product
 
-    require_full_uri(target, option_name="--target")
-    parsed = parse_product_uri(target)
-    storage_type = apply_smart_default(parsed, storage_type)
-    validate_uri_storage_coherence(parse_product_uri(target), storage_type)
+    target_uri = parse_and_validate_uri(target, param_hint="--target")
+    storage_type = apply_smart_default(target_uri, storage_type)
     if (slot_start is None) ^ (slot_end is None):
         raise click.UsageError("--slot-start and --slot-end must be provided together")
     from firecube.cli._slot_env import resolve_slot_range_from_env
@@ -202,10 +199,9 @@ def preallocate(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     identity = resolve_product_identity(
-        target,
+        target_uri,
         format="zarr",
         product_name=product_name,
-        option_name="--target",
     )
     binding = StorageBinding(identity=identity, driver=driver_config)
     session = StorageSession(binding)

@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
+import pytest
 import xarray as xr
 from click.testing import CliRunner
 
@@ -46,6 +48,49 @@ def test_create_rejects_storage_type_source_uri_mismatch() -> None:
     assert result.exit_code == 2
     assert "incompatible" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.contract
+def test_create_writes_nothing_for_a_refused_archive_uri(
+    tmp_path: Path, tmp_local_zarr: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    args = ["--source", f"file://{tmp_local_zarr}", "--archive", f"FILE://{tmp_path}/out.tgm"]
+
+    def snapshot() -> dict[str, bytes | None]:
+        return {
+            str(p): p.read_bytes() if p.is_file() else None for p in sorted(tmp_path.rglob("*"))
+        }
+
+    before = snapshot()
+    result = CliRunner().invoke(cli, ["archive", "create", *args])
+    assert snapshot() == before
+    assert os.listdir(cwd) == []
+    assert result.exit_code == 2
+    assert "URI scheme must be lowercase (file:// or s3://)" in result.output
+    assert not (tmp_path / "out.tgm").exists()
+
+
+@pytest.mark.contract
+def test_create_rejects_bare_archive_path() -> None:
+    result = _invoke_create(
+        [
+            "--source",
+            "file:///tmp/x.zarr",
+            "--archive",
+            "/tmp/foo.tgm",
+            "--dry-run",
+        ]
+    )
+
+    assert result.exit_code == 2
+    assert "URI scheme required (file:// or s3://). Did you mean file:///tmp/foo.tgm?" in (
+        result.output
+    )
+    assert "Traceback" not in result.output
+    assert "[dry-run] Would archive" not in result.output
 
 
 def test_create_rejects_remote_tgm_archive() -> None:

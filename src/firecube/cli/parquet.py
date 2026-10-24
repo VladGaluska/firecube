@@ -31,7 +31,7 @@ from firecube.cli._shared_options import (
     storage_driver_option,
     storage_type_option,
 )
-from firecube.cli._uri_policy import apply_smart_default, parse_product_uri
+from firecube.cli._uri_policy import apply_smart_default, parse_and_validate_uri
 from firecube.core import observability
 from firecube.core.filesystem import StorageFilesystem
 from firecube.core.storage.binding import StorageBinding
@@ -51,6 +51,11 @@ def parquet(ctx: click.Context) -> None:
     """
     observability.init_observability("firecube-parquet")
     ctx.ensure_object(dict)
+
+
+def _sql_string_body(value: str) -> str:
+    """Return ``value`` with each ``'`` doubled, for use inside a SQL string literal."""
+    return value.replace("'", "''")
 
 
 def _list_parquet_files(fs: StorageFilesystem, root: StorageUri) -> list[StorageUri]:
@@ -135,8 +140,8 @@ def validate(
     the product path and reports any missing or corrupt files. Read-only; does
     not modify any data.
     """
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
     storage_config = get_storage_config(
         ctx,
         overrides={
@@ -148,7 +153,7 @@ def validate(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     identity = resolve_product_identity(
-        parsed_uri.normalized, format="parquet", product_name=parsed_uri.normalized
+        product_uri, format="parquet", product_name=product_uri.to_str()
     )
     session = StorageSession(
         StorageBinding(
@@ -236,10 +241,10 @@ def consolidate(
     single consolidated file with the specified codec. The source dataset
     is not modified.
     """
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
-    parsed_output = parse_product_uri(output)
-    if parsed_output.scheme == "s3":
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
+    output_uri = parse_and_validate_uri(output, param_hint="--output")
+    if output_uri.is_remote():
         raise click.ClickException("Remote artifact output not yet supported")
     storage_conf = get_storage_config(
         ctx,
@@ -252,7 +257,7 @@ def consolidate(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_conf)
     identity = resolve_product_identity(
-        parsed_uri.normalized, format="parquet", product_name=parsed_uri.normalized
+        product_uri, format="parquet", product_name=product_uri.to_str()
     )
     session = StorageSession(
         StorageBinding(
@@ -262,7 +267,7 @@ def consolidate(
     )
 
     store_uri = identity.product_uri.to_str()
-    output_path = str(Path(parsed_output.normalized.removeprefix("file://")).resolve())
+    output_path = str(Path(output_uri.path).resolve())
 
     con = duckdb.connect()
     session.duckdb.apply(con, output_uri=output_path)
@@ -277,8 +282,8 @@ def consolidate(
 
     try:
         con.execute(f"""
-            COPY (SELECT * FROM '{source}')
-            TO '{output_path}'
+            COPY (SELECT * FROM '{_sql_string_body(source)}')
+            TO '{_sql_string_body(output_path)}'
             (FORMAT 'parquet', COMPRESSION '{codec}')
         """)
 

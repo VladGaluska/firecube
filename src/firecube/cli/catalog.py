@@ -30,7 +30,7 @@ from firecube.cli._shared_options import (
     storage_driver_option,
     storage_type_option,
 )
-from firecube.cli._uri_policy import apply_smart_default, parse_product_uri
+from firecube.cli._uri_policy import apply_smart_default, parse_and_validate_uri
 from firecube.core import observability
 from firecube.core.intake import (
     build_catalog_source_specs,
@@ -119,12 +119,12 @@ def intake(
 
     ingestor_cls = plugins[plugin]
 
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
-    parsed_output = parse_product_uri(output)
-    if parsed_output.scheme == "s3":
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
+    output_uri = parse_and_validate_uri(output, param_hint="--output")
+    if output_uri.is_remote():
         raise click.ClickException("Remote artifact output not yet supported")
-    local_output = Path(parsed_output.normalized.removeprefix("file://"))
+    local_output = Path(output_uri.path)
     storage_config = get_storage_config(
         ctx,
         overrides={
@@ -137,9 +137,9 @@ def intake(
 
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     identity = resolve_product_identity(
-        parsed_uri.normalized,
+        product_uri,
         format="zarr",
-        product_name=parsed_uri.normalized,
+        product_name=product_uri.to_str(),
     )
     session = StorageSession(
         StorageBinding(
@@ -158,7 +158,7 @@ def intake(
         raise click.ClickException(render(exc)) from exc
     source_specs = build_catalog_source_specs(
         plugin_name=plugin,
-        product=parsed_uri.normalized,
+        product=product_uri.to_str(),
         store_uri=store_uri,
         groups=groups,
         group_info_resolver=getattr(ingestor, "catalog_group_info", None),
@@ -166,11 +166,11 @@ def intake(
     )
     if not source_specs:
         raise click.ClickException(
-            f"No catalogable dataset groups found for plugin '{plugin}' under product '{parsed_uri.normalized}'."
+            f"No catalogable dataset groups found for plugin '{plugin}' under product '{product_uri.to_str()}'."
         )
 
     catalog_name = plugin
-    catalog_description = f"Firecube product '{parsed_uri.normalized}' for plugin '{plugin}'."
+    catalog_description = f"Firecube product '{product_uri.to_str()}' for plugin '{plugin}'."
     catalog_dict = build_intake_catalog(
         catalog_name=catalog_name,
         catalog_description=catalog_description,
