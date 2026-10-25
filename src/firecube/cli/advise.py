@@ -31,7 +31,7 @@ from firecube.cli._shared_options import (
     storage_driver_option,
     storage_type_option,
 )
-from firecube.cli._uri_policy import apply_smart_default, parse_product_uri
+from firecube.cli._uri_policy import apply_smart_default, parse_and_validate_uri
 from firecube.core import observability
 from firecube.core.cf import CFReport
 from firecube.core.cf.validator import validate_cf18
@@ -97,8 +97,8 @@ def batch_size(
     into memory without partial chunks. Run before a long ingestion job to
     set --option pipeline_batch_size=N.
     """
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
     storage_cfg = get_storage_config(
         ctx,
         overrides={
@@ -110,7 +110,7 @@ def batch_size(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_cfg)
     identity = resolve_product_identity(
-        parsed_uri.normalized, format="zarr", product_name=parsed_uri.normalized
+        product_uri, format="zarr", product_name=product_uri.to_str()
     )
     session = StorageSession(
         StorageBinding(
@@ -226,8 +226,8 @@ def compliance(
     (or warnings/info without --strict), 1 if any error finding is reported,
     2 if warnings/info appear under --strict.
     """
-    parsed_uri = parse_product_uri(product)
-    storage_type = apply_smart_default(parsed_uri, storage_type)
+    product_uri = parse_and_validate_uri(product, param_hint="--product")
+    storage_type = apply_smart_default(product_uri, storage_type)
     storage_cfg = get_storage_config(
         ctx,
         overrides={
@@ -240,7 +240,7 @@ def compliance(
     driver_config = StorageDriverConfig.from_storage_config(storage_cfg)
 
     identity = resolve_product_identity(
-        parsed_uri.normalized, format="zarr", product_name=parsed_uri.normalized
+        product_uri, format="zarr", product_name=product_uri.to_str()
     )
     session = StorageSession(StorageBinding(identity=identity, driver=driver_config))
 

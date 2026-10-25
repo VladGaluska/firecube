@@ -41,15 +41,8 @@ def _config(**overrides: object) -> IngestCommandConfig:
 
 _FILE_TARGET = "file:///tmp/out.zarr"
 _S3_TARGET = "s3://bucket/out.zarr"
-_GS_UNSUPPORTED = (
-    "Target URI scheme 'gs' is not supported. Use a file:// URI for "
-    "--storage-type local, or an s3:// URI for --storage-type s3."
-)
-_FILE_WITH_S3 = (
-    "Target URI scheme 'file' is incompatible with --storage-type 's3'. "
-    "Use --storage-type local for file:// targets, or change --target to an "
-    "s3://-compatible URI."
-)
+_GS_UNSUPPORTED = "URI scheme 'gs' not supported."
+_FILE_WITH_S3 = "--storage-type 's3' is incompatible with URI scheme 'file'"
 
 # (row id, overrides of _config, expected attribute values)
 _ACCEPTED: tuple[tuple[str, dict[str, object], dict[str, object]], ...] = (
@@ -79,11 +72,6 @@ _ACCEPTED: tuple[tuple[str, dict[str, object], dict[str, object]], ...] = (
         {"target": _S3_TARGET, "storage_type": "s3"},
         {"target": _S3_TARGET, "storage_type": "s3"},
     ),
-    (
-        "test_uppercase_s3_scheme_behavior",
-        {"target": "S3://bucket/out.zarr", "storage_type": "s3"},
-        {"target": "S3://bucket/out.zarr", "storage_type": "s3"},
-    ),
 )
 
 
@@ -109,8 +97,7 @@ _REJECTED: tuple[tuple[str, dict[str, object], str], ...] = (
     (
         "test_storage_type_local_with_s3_target_raises",
         {"target": _S3_TARGET, "storage_type": "local"},
-        "Target URI scheme 's3' is incompatible with --storage-type 'local'. "
-        "Use --storage-type s3 for s3:// targets, or change --target to a file:// URI.",
+        "--storage-type 'local' is incompatible with URI scheme 's3'",
     ),
     (
         "test_unsupported_scheme_gs_with_local_storage_type_raises",
@@ -126,6 +113,17 @@ _REJECTED: tuple[tuple[str, dict[str, object], str], ...] = (
         "test_aggregation_missing_driver_and_target_storage_type_mismatch",
         {"target": _FILE_TARGET, "storage_type": "s3", "storage_driver": None},
         _FILE_WITH_S3,
+    ),
+    (
+        "test_uppercase_s3_scheme_raises",
+        {"target": "S3://bucket/out.zarr", "storage_type": "s3"},
+        "URI scheme must be lowercase",
+    ),
+    ("test_bare_target_raises", {"target": "/tmp/out.zarr"}, "URI scheme required"),
+    (
+        "test_localhost_target_raises",
+        {"target": "file://localhost/tmp/out.zarr"},
+        "must not name a host",
     ),
 )
 

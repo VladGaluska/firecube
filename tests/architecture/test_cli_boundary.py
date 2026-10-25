@@ -14,7 +14,7 @@
 
 """Architectural gate for the CLI boundary, with a tagged allowlist of today's debt.
 
-Five checks walk ``src/firecube`` with :mod:`ast`:
+Six checks walk ``src/firecube`` with :mod:`ast`:
 
 1. Click is imported only below ``src/firecube/cli/``.
 2. ``firecube.cli`` is imported only below ``src/firecube/cli/``.
@@ -24,6 +24,7 @@ Five checks walk ``src/firecube`` with :mod:`ast`:
    module (a path component with one leading underscore). Private *names* are
    covered by ``test_cli_no_private_cross_subsystem_imports.py``.
 5. Every ``cli/`` module stays at or under ``CLI_MODULE_LINE_CEILING`` lines.
+6. Only ``cli/_uri_policy.py`` parses URIs; other ``cli/`` calls are rows keyed by function.
 
 Existing debt is listed in the row tables below. Each row carries a tag,
 ``PERMANENT: <reason>`` or ``UNTIL <owner>: <reason>``. Rows only shrink by
@@ -83,6 +84,17 @@ _PRIVATE_IMPORT_ROWS: dict[tuple[str, str, int], str] = {}
 # path -> (cap, tag)
 _LINE_CEILING_ROWS: dict[str, tuple[int, str]] = {
     "src/firecube/cli/main.py": (963, "UNTIL unscheduled: module is over the ceiling"),
+}
+_URI_CALL = re.compile(
+    r"(?:\w+\.)*(urlparse|urlsplit|parse_uri|infer_target_protocol|is_remote_target|StorageUri\.parse"
+    r"|local_path_from_target|storage_uri_from_target|parse_target)\(|.*\.(removeprefix)\('file://'\)$"
+)
+_URI_PARSE_ROWS = {  # "path below src/firecube | qualified scope | callee xN" -> tag
+    "cli/main.py | ingest | is_remote_target x1": "PERMANENT: --input-data is exempt",
+    "cli/main.py | ingest | local_path_from_target x1": "PERMANENT: --input-data is exempt",
+    "cli/chunks/_manager.py | _storage_uri_from_base | StorageUri.parse x1": (
+        "PERMANENT: parses the base URI of the [storage] config, not a CLI value"
+    ),
 }
 
 
@@ -361,6 +373,28 @@ def test_cli_modules_stay_under_line_ceiling() -> None:
     _fail("cli/ modules over the line ceiling", offenders, stale)
 
 
+def _uri_calls(node: ast.AST, scope: str = "<module>") -> Iterator[tuple[str, str]]:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.Call) and (hit := _URI_CALL.match(ast.unparse(child))):
+            yield scope, hit[1] or hit[2]
+        inner = scope
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            inner = child.name if scope == "<module>" else f"{scope}.{child.name}"
+        yield from _uri_calls(child, inner)
+
+
+def test_cli_parses_uris_only_in_uri_policy() -> None:
+    calls = [
+        (path.relative_to(_SRC_ROOT).as_posix(), scope, name)
+        for path in _py_files(_CLI_ROOT)
+        if path != _CLI_ROOT / "_uri_policy.py"
+        for scope, name in _uri_calls(_parse(path))
+    ]
+    found = {f"{w} | {s} | {n} x{calls.count((w, s, n))}" for w, s, n in calls}
+    stale = [f"stale row, delete or correct it: {row!r}" for row in _URI_PARSE_ROWS.keys() - found]
+    _fail("URI parsing outside cli/_uri_policy.py", sorted(found - _URI_PARSE_ROWS.keys()), stale)
+
+
 def test_allowlist_tags_are_well_formed() -> None:
     tags = [
         *_CLICK_ROWS.values(),
@@ -368,6 +402,7 @@ def test_allowlist_tags_are_well_formed() -> None:
         *_CLI_TEXT_ROWS.values(),
         *_CLI_TEXT_FILE_ROWS.values(),
         *_PRIVATE_IMPORT_ROWS.values(),
+        *_URI_PARSE_ROWS.values(),
         *(tag for _cap, tag in _LINE_CEILING_ROWS.values()),
     ]
     bad = [f"malformed tag: {tag!r}" for tag in tags if not _TAG.match(tag)]

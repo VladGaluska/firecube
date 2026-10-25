@@ -54,3 +54,15 @@ def test_file_uri_input_no_storage_flags_and_file_uri_output(
     payload = json.loads(result.output[result.output.index("{") :])
     assert payload["status"] == "success"
     assert payload["output"] == str(output_path.resolve())
+
+
+@pytest.mark.contract
+def test_parquet_consolidate_writes_output_to_the_literal_path(tmp_path: Path) -> None:
+    src, out = tmp_path / "in'put", tmp_path / "sp ace'q" / "out.parquet"
+    src.mkdir()
+    out.parent.mkdir()
+    _write_parquet(src / "part.parquet")
+    result = _invoke_consolidate(["-p", f"file://{src}", "-o", f"file://{out}"])
+    assert result.exit_code == 0, result.output
+    assert pq.read_table(out).equals(pq.read_table(src / "part.parquet"))
+    assert not [p for p in tmp_path.rglob("*") if "%" in p.name]

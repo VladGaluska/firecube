@@ -14,16 +14,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import click
 import pytest
 
 from firecube.cli._uri_policy import (
     SCHEME_TO_STORAGE_TYPE,
-    ParsedUri,
     apply_smart_default,
-    parse_product_uri,
+    parse_and_validate_uri,
     resolve_storage_type,
     validate_uri_storage_coherence,
 )
@@ -43,75 +40,36 @@ def test_scheme_mapping_matches_storage_session_for_s3() -> None:
     assert SCHEME_TO_STORAGE_TYPE["s3"] == _storage_type_for_uri(uri)
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected_path"),
-    [
-        ("file:///abs/path.zarr", "/abs/path.zarr"),
-    ],
-)
-def test_parse_product_uri_accepts_local_absolute_forms(raw: str, expected_path: str) -> None:
-    parsed = parse_product_uri(raw)
-
-    assert parsed == ParsedUri(
-        raw=raw,
-        scheme="file",
-        normalized=Path(expected_path).as_uri(),
-        local=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("raw", "message"),
-    [
-        ("file://", "file:// URI requires a non-empty path"),
-        ("file:///", "file:// URI requires a non-empty path"),
-    ],
-)
-def test_parse_product_uri_rejects_empty_file_path(raw: str, message: str) -> None:
-    with pytest.raises(click.UsageError, match=message):
-        parse_product_uri(raw)
-
-
+@pytest.mark.contract
 @pytest.mark.parametrize(
     "raw",
-    [
-        "s3://bucket/path.zarr",
-        "s3://bucket",
-        "s3://bucket/nested/path.zarr",
-    ],
+    ["file:///abs/p.zarr", "file:///tmp/a b.zarr", "file:///tmp/a%20b.zarr", "s3://b/p", "s3://b"],
 )
-def test_parse_product_uri_accepts_s3(raw: str) -> None:
-    parsed = parse_product_uri(raw)
-
-    assert parsed == ParsedUri(raw=raw, scheme="s3", normalized=raw, local=False)
+def test_parse_and_validate_uri_returns_the_path_literally(raw: str) -> None:
+    assert parse_and_validate_uri(raw, param_hint="--target").to_str() == raw
 
 
-@pytest.mark.parametrize(
-    "raw",
-    ["/abs/path.zarr", "./rel/path.zarr", "rel/path.zarr", "x.zarr"],
-)
-def test_parse_product_uri_rejects_bare_paths_with_did_you_mean(raw: str) -> None:
-    with pytest.raises(
-        click.UsageError, match=r"URI scheme required \(file:// or s3://\)\. Did you mean file://"
-    ):
-        parse_product_uri(raw)
+_BARE = r"^URI scheme required \(file:// or s3://\)\."
+_REFUSED = {
+    "URI must not (be empty|contain control)": ["", "   ", "file:///tmp/a\tb.zarr"],
+    _BARE + " Did you mean file://": ["/abs/path.zarr", "./rel/path.zarr", "rel/p.zarr", "x.zarr"],
+    _BARE + " Did you mean file:///tmp/a b.zarr\\?$": ["/tmp/a b.zarr"],
+    _BARE + "$": ["file:/tmp/a.zarr", "~firecube_no_such_user_17/a.zarr"],
+    "not supported": [f"{s}://x" for s in ("gs", "GS", "abfs", "https", "memory", "ftp")],
+    "must be lowercase .* Did you mean (file|s3)://": ["FILE:///a", "S3://b/x", "File:///x"],
+    r"must not name a host \(got '(h|localhost)'\)": ["file://h/p", "file://localhost/a"],
+    "must name a path, not the root directory": ["file://", "file:///"],
+    "s3:// URI must name a bucket": ["s3:///missing-bucket"],
+    r"must not contain '\?' or '#'": ["file:///a?x=1", "file:///a?", "file:///a#", "s3://b/x#y"],
+}
 
 
-@pytest.mark.parametrize(
-    ("raw", "message"),
-    [
-        ("file://hostname/path", r"URI scheme 'file' with non-local host 'hostname' not supported"),
-        ("gs://bucket/x", "URI scheme 'gs' not supported"),
-        ("abfs://container/x", "URI scheme 'abfs' not supported"),
-        ("https://x.com/x", "URI scheme 'https' not supported"),
-        ("memory://x", "URI scheme 'memory' not supported"),
-        ("ftp://host/x", "URI scheme 'ftp' not supported"),
-        ("s3:///missing-bucket", "authority (bucket) is required"),
-    ],
-)
-def test_parse_product_uri_rejects_unsupported_or_malformed(raw: str, message: str) -> None:
-    with pytest.raises(click.UsageError, match=message):
-        parse_product_uri(raw)
+@pytest.mark.contract
+@pytest.mark.parametrize(("raw", "msg"), [(r, m) for m, rs in _REFUSED.items() for r in rs])
+def test_parse_and_validate_uri_refuses_each_rule_naming_the_option(raw: str, msg: str) -> None:
+    with pytest.raises(click.UsageError, match=msg) as refused:
+        parse_and_validate_uri(raw, param_hint="--target")
+    assert refused.value.format_message().startswith("Invalid value for '--target': ")
 
 
 @pytest.mark.parametrize(
@@ -122,7 +80,7 @@ def test_parse_product_uri_rejects_unsupported_or_malformed(raw: str, message: s
     ],
 )
 def test_resolve_storage_type_returns_scheme_mapping(raw: str, expected: str) -> None:
-    assert resolve_storage_type(parse_product_uri(raw)) == expected
+    assert resolve_storage_type(parse_and_validate_uri(raw, param_hint="--target")) == expected
 
 
 @pytest.mark.parametrize(
@@ -133,7 +91,7 @@ def test_resolve_storage_type_returns_scheme_mapping(raw: str, expected: str) ->
     ],
 )
 def test_validate_uri_storage_coherence_accepts_matches(raw: str, storage_type: str) -> None:
-    validate_uri_storage_coherence(parse_product_uri(raw), storage_type)
+    validate_uri_storage_coherence(parse_and_validate_uri(raw, param_hint="--target"), storage_type)
 
 
 @pytest.mark.parametrize(
@@ -147,31 +105,35 @@ def test_validate_uri_storage_coherence_rejects_mismatches(
     raw: str, storage_type: str, scheme: str
 ) -> None:
     with pytest.raises(click.UsageError, match=f"incompatible with URI scheme '{scheme}'"):
-        validate_uri_storage_coherence(parse_product_uri(raw), storage_type)
+        validate_uri_storage_coherence(
+            parse_and_validate_uri(raw, param_hint="--target"), storage_type
+        )
 
 
 def test_apply_smart_default_infers_local_from_file_uri() -> None:
-    assert apply_smart_default(parse_product_uri("file:///abs/path.zarr"), None) == "local"
+    uri = parse_and_validate_uri("file:///abs/path.zarr", param_hint="--target")
+    assert apply_smart_default(uri, None) == "local"
 
 
 def test_apply_smart_default_infers_s3_from_uri_scheme() -> None:
-    assert apply_smart_default(parse_product_uri("s3://bucket/path.zarr"), None) == "s3"
+    uri = parse_and_validate_uri("s3://bucket/path.zarr", param_hint="--target")
+    assert apply_smart_default(uri, None) == "s3"
 
 
 def test_apply_smart_default_accepts_explicit_local() -> None:
-    uri = parse_product_uri("file:///abs/path.zarr")
+    uri = parse_and_validate_uri("file:///abs/path.zarr", param_hint="--target")
 
     assert apply_smart_default(uri, "local") == "local"
 
 
 def test_apply_smart_default_validates_after_resolution() -> None:
-    uri = parse_product_uri("file:///abs/path.zarr")
+    uri = parse_and_validate_uri("file:///abs/path.zarr", param_hint="--target")
 
     with pytest.raises(click.UsageError, match="incompatible with URI scheme 'file'"):
         apply_smart_default(uri, "s3")
 
 
 def test_apply_smart_default_accepts_explicit_s3_storage_type() -> None:
-    uri = parse_product_uri("s3://bucket/path.zarr")
+    uri = parse_and_validate_uri("s3://bucket/path.zarr", param_hint="--target")
 
     assert apply_smart_default(uri, "s3") == "s3"

@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import json
+import shlex
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,18 +59,58 @@ def _install_fake_tensogram(monkeypatch: pytest.MonkeyPatch, seen: dict[str, str
     monkeypatch.setitem(sys.modules, "tensogram", fake_module)
 
 
+@pytest.mark.parametrize("folder", ["", "sp ace"])
 @pytest.mark.parametrize("subcommand", ["info", "validate", "list"])
 def test_archive_artifact_inspect_accepts_file_uri(
     subcommand: str,
+    folder: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive_path = tmp_path / "archive.tgm"
+    archive_path = tmp_path / folder / "archive.tgm"
+    archive_path.parent.mkdir(exist_ok=True)
     archive_path.write_bytes(b"not a real archive")
     seen: dict[str, str] = {}
     _install_fake_tensogram(monkeypatch, seen)
 
-    result = CliRunner().invoke(cli, ["archive", subcommand, "--archive", archive_path.as_uri()])
+    result = CliRunner().invoke(cli, ["archive", subcommand, "--archive", f"file://{archive_path}"])
 
     assert result.exit_code != 2
     assert seen["path"] == str(archive_path)
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("line", "sentence"),
+    [
+        ("info --archive {p}/a.zip", "Did you mean file://{p}/a.zip?"),
+        ("validate --archive {p}/a.zip", "Did you mean file://{p}/a.zip?"),
+        ("list --archive {p}/a.zip", "Did you mean file://{p}/a.zip?"),
+        ("create --source file://{p}/s --archive FILE://{p}/a.tgm --dry-run", "must be lowercase"),
+        ("restore --target file://{p}/t --archive FILE://{p}/a.tgm --dry-run", "must be lowercase"),
+        ("info --archive FILE://{p}/a.tgm", "must be lowercase"),
+        ("validate --archive File://{p}/a.zip", "must be lowercase"),
+        (
+            "create --source file://{p}/s --archive file://localhost{p}/a.tgm --dry-run",
+            "(got 'localhost')",
+        ),
+        ("list --archive gs://bucket/x.zip", "'gs' not supported"),
+        ("info --archive ''", "must not be empty"),
+        ("info --archive ~firecube_no_such_user_17/a.zip", "URI scheme required"),
+    ],
+)
+def test_archive_commands_admit_archive_uri_through_the_uri_rule(
+    line, sentence, tmp_path, monkeypatch
+):
+    root = {"zarr_format": 3, "node_type": "group", "attributes": {}}
+    with zipfile.ZipFile(tmp_path / "a.zip", "w") as zf:
+        zf.writestr("zarr.json", json.dumps(root))
+    (tmp_path / "a.tgm").write_bytes(b"not a real archive")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    result = CliRunner().invoke(cli, ["archive", *shlex.split(line.format(p=tmp_path))])
+    assert not list(cwd.iterdir())
+    assert result.exit_code == 2, result.output
+    assert sentence.format(p=tmp_path) in result.output
+    assert "Invalid value for '--archive'" in result.output

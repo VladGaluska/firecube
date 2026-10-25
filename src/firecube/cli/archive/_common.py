@@ -23,7 +23,7 @@ from pathlib import Path
 
 import click
 
-from firecube.core.uris import is_remote_target, local_path_from_target
+from firecube.cli._uri_policy import parse_and_validate_uri
 
 
 def _require_overwrite_confirmation(*, overwrite: bool, yes_i_really_mean_it: bool) -> None:
@@ -42,11 +42,17 @@ def _is_zip_archive(archive: str) -> bool:
     return archive.rstrip("/").lower().endswith(".zip")
 
 
-def _local_zip_archive(archive: str) -> str:
-    """Resolve a zip archive URI to an existing local path, or fail with a CLI error."""
-    if is_remote_target(archive):
-        raise click.ClickException("Remote .zip artifacts not yet supported")
-    local_path = str(local_path_from_target(archive))
-    if not Path(local_path).is_file():
+def _local_archive(archive: str) -> str:
+    """Admit an ``--archive`` value and return the literal path of the local file it names.
+
+    Raises:
+        click.BadParameter: The value fails the URI rule.
+        click.ClickException: The archive is remote, or no file exists at its path.
+    """
+    archive_uri = parse_and_validate_uri(archive, param_hint="--archive")
+    if archive_uri.is_remote():
+        suffix = ".zip" if _is_zip_archive(archive) else ".tgm"
+        raise click.ClickException(f"Remote {suffix} artifacts not yet supported")
+    if not Path(archive_uri.path).is_file():
         raise click.ClickException(f"Archive not found: {archive}")
-    return local_path
+    return archive_uri.path

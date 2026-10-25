@@ -30,7 +30,7 @@ from firecube.cli._shared_options import (
 )
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
+    parse_and_validate_uri,
 )
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
@@ -87,8 +87,8 @@ def multires(
     storage_anonymous: bool | None,
 ) -> None:
     """Build multi-resolution Zarr pyramid for an existing product."""
-    parsed = parse_product_uri(target)
-    storage_type = apply_smart_default(parsed, storage_type)
+    target_uri = parse_and_validate_uri(target, param_hint="--target")
+    storage_type = apply_smart_default(target_uri, storage_type)
     storage_config = get_storage_config(
         ctx,
         overrides={
@@ -100,10 +100,9 @@ def multires(
     )
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     identity = resolve_product_identity(
-        target,
+        target_uri,
         format="zarr",
         product_name=product_name,
-        option_name="--target",
     )
     session = StorageSession(
         StorageBinding(

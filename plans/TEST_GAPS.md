@@ -28,10 +28,16 @@ assertion-light mock tests.
    invalid output containers, and assert the public runtime boundary fails
    clearly before downstream code consumes the result.
 
-5. Artifact URI strictness is inconsistent.
-   `AGENTS.md` says `--archive` and `--output` are strict artifact URIs, but
-   archive restore still accepts bare local archive paths. Add behavior tests
-   after the CLI implementation rejects bare artifact paths consistently.
+5. The contract matrix does not run a refused URI for each declared role.
+   One rule admits every CLI URI option, and behaviour tests pin it for the
+   archive, catalog, parquet, `zarr index` and `chunks runs` commands.
+   `uri_roles` in `tests/cli/_command_contracts.py` declares the URI options
+   of each command. No matrix test runs a refused value for each declared
+   role. Argument builders exist only for `--product` commands
+   (`tests/cli/test_per_command_contracts.py:153`). The entry for
+   `plugins create` declares `--target-dir` as `artifact-output`
+   (`tests/cli/_command_contracts.py:277`), although `AGENTS.md` exempts
+   `--target-dir` from the URI rule.
 
 ## P1 - Next Coverage Targets
 

@@ -298,9 +298,47 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
 - The reason of `IndexedWriteCompilationError` now names the type and the
   message of the underlying error when a coordinate does not resolve. Update
   any code that matches the old reason text.
+- Every option that takes a URI follows one rule. If a script passes a value
+  that the rule refuses, change the value.
+  - The scheme must be lowercase `file://` or `s3://`.
+  - A `file://` URI names no host, not even `localhost`. It names a path below
+    the root.
+  - An `s3://` URI names a bucket.
+  - The command refuses a URI with `?`, `#` or a control character.
+  - The command reads a `file://` path as written. It does not decode `%20`.
+  - Before, the rule differed between commands. `archive create` read
+    `FILE:///tmp/a.tgm` as a path under the working directory. The `chunks`
+    commands accepted `gs://` and `file://localhost/`.
+- A refused URI names its option. For example, the message reads `Invalid value
+  for '--target': URI scheme required (file:// or s3://).` The sentence `Bare
+  names are no longer supported` is gone.
+- `firecube zarr index show`, `verify` and `rebuild` refuse a `--target`
+  without a URI scheme. The other commands that take `--target` already did so.
+- `firecube ingest` words its storage-type refusal like the other commands. The
+  message now reads `--storage-type '<type>' is incompatible with URI scheme
+  '<scheme>'`.
 
 ### Fixed
 
+- `firecube archive create`, `archive restore`, `archive info`, `archive
+  validate` and `archive list` refuse an `--archive` value without a URI
+  scheme. They exit with code 2 and name the `file://` form to use. Before,
+  `create` and `restore` accepted any bare path. Before, `info`, `validate` and
+  `list` accepted a bare path to a `.zip` archive (#17).
+- A `file://` URI whose path holds a space, a `%`, a quote or a non-ASCII
+  character now names that path. Before, these commands encoded the path and
+  used another location, such as a directory named `sp%20ace`:
+  - `archive info`, `archive validate` and `archive list`
+  - `catalog intake`, `parquet validate` and `parquet consolidate`
+  - `advise batch-size`, `advise compliance` and `zarr validate`
+- `firecube parquet consolidate` accepts a product path or an output path that
+  contains a quote. The command escapes the quote in its SQL statement.
+- A URI with a host, a query or a fragment no longer stops `archive create`,
+  `archive info` or `zarr index show` with a traceback. These commands exit with
+  code 2 and a message.
+- An `--archive` value that starts with `~user` for an unknown user no longer
+  stops the archive commands with a `RuntimeError`. They exit with code 2 and a
+  message.
 - Refusals no longer print a recovery command that fails to run. Each command
   now carries the options that it needs and names only options that the
   command has.

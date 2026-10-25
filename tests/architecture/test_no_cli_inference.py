@@ -26,7 +26,8 @@ import pytest
 from click.testing import CliRunner
 
 from firecube.cli._command_schemas import IngestCommandConfig
-from firecube.cli._uri_policy import apply_smart_default, parse_product_uri
+from firecube.cli._uri_policy import apply_smart_default
+from firecube.cli._uri_policy import parse_and_validate_uri as parse
 from firecube.cli.main import cli
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.uri import StorageUri
@@ -47,11 +48,16 @@ def test_product_name_is_explicit_not_uri_basename() -> None:
 
 def test_storage_type_smart_default_uses_uri_scheme_mapping() -> None:
     """Inspect-tier storage defaults come from the explicit scheme map."""
-    assert apply_smart_default(parse_product_uri("file:///tmp/product.zarr"), None) == "local"
-    assert apply_smart_default(parse_product_uri("s3://bucket/product.zarr"), None) == "s3"
+    assert (
+        apply_smart_default(parse("file:///tmp/product.zarr", param_hint="--target"), None)
+        == "local"
+    )
+    assert (
+        apply_smart_default(parse("s3://bucket/product.zarr", param_hint="--target"), None) == "s3"
+    )
 
     with pytest.raises(click.UsageError, match="incompatible with URI scheme 'file'"):
-        apply_smart_default(parse_product_uri("file:///tmp/product.zarr"), "s3")
+        apply_smart_default(parse("file:///tmp/product.zarr", param_hint="--target"), "s3")
 
 
 def test_write_mode_required_not_inferred_from_local_target() -> None:

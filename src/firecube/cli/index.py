@@ -28,6 +28,7 @@ import click
 
 from firecube.cli._errors import echo_rendered, render
 from firecube.cli._formatter import FirecubeGroup
+from firecube.cli._uri_policy import parse_and_validate_uri
 from firecube.core.controlplane import ChunkManager
 from firecube.core.errors import (
     ManifestError,
@@ -40,7 +41,6 @@ from firecube.core.product.identity import ProductIdentity
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.time.calendar import is_gregorian_like
-from firecube.core.uris import storage_uri_from_target
 from firecube.ingestor.registry import loader as ingestor_loader
 
 if TYPE_CHECKING:
@@ -55,7 +55,7 @@ def index() -> None:
 
 
 def _manager(target: str, product_name: str) -> ChunkManager:
-    product_uri = storage_uri_from_target(target)
+    product_uri = parse_and_validate_uri(target, param_hint="--target")
     binding = StorageBinding(
         identity=ProductIdentity.from_uri(product_uri, "zarr", product_name=product_name),
         driver=StorageDriverConfig.from_storage_config_or_default(None),

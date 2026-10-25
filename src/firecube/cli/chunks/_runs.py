@@ -22,11 +22,10 @@ from typing import Any
 import click
 
 from firecube.cli._errors import render
-from firecube.cli._product import require_full_uri
 from firecube.cli._shared_options import dry_run_flag, yes_flag
+from firecube.cli._uri_policy import parse_and_validate_uri
 from firecube.core.controlplane.types import AbandonSweepResult
 from firecube.core.errors import ManifestError
-from firecube.core.storage.uri import StorageUri
 
 from ._manager import resolve_cli_product, resolve_manager
 
@@ -158,11 +157,7 @@ def list_cmd(
     plane. shows run status (started, complete, failed, abandoned), timestamps,
     and span counts. use to identify stuck or failed runs before abandoning"""
     if target is not None:
-        require_full_uri(target, option_name="--target")
-        try:
-            product_uri = StorageUri.parse(target)
-        except ValueError as exc:
-            raise click.UsageError(render(exc)) from exc
+        product_uri = parse_and_validate_uri(target, param_hint="--target")
     else:
         product_name, product_uri = resolve_cli_product(product_name)
     manager = resolve_manager(ctx, workspace, product_uri=product_uri, product_name=product_name)
@@ -300,11 +295,7 @@ def abandon_cmd(
     abandons them. single-run operations
     prompt in a terminal and require the flag in non-TTY contexts."""
     if target is not None:
-        require_full_uri(target, option_name="--target")
-        try:
-            product_uri = StorageUri.parse(target)
-        except ValueError as exc:
-            raise click.UsageError(render(exc)) from exc
+        product_uri = parse_and_validate_uri(target, param_hint="--target")
     else:
         product_name, product_uri = resolve_cli_product(product_name)
 

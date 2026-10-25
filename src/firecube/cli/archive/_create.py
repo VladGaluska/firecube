@@ -32,14 +32,13 @@ from firecube.cli._shared_options import (
 )
 from firecube.cli._uri_policy import (
     apply_smart_default,
-    parse_product_uri,
+    parse_and_validate_uri,
 )
 from firecube.cli.archive._common import _require_overwrite_confirmation
 from firecube.core.config import get_archive_defaults
 from firecube.core.storage.binding import StorageBinding
 from firecube.core.storage.driver_config import StorageDriverConfig
 from firecube.core.storage.session import StorageSession
-from firecube.core.uris import is_remote_target, local_path_from_target
 
 
 @click.command(
@@ -150,11 +149,12 @@ def create(
     and --end-date to archive a specific time window, or --group to select one
     product group.
     """
-    parsed_source = parse_product_uri(source)
-    storage_type = apply_smart_default(parsed_source, storage_type)
-    if is_remote_target(archive):
+    source_uri = parse_and_validate_uri(source, param_hint="--source")
+    storage_type = apply_smart_default(source_uri, storage_type)
+    archive_uri = parse_and_validate_uri(archive, param_hint="--archive")
+    if archive_uri.is_remote():
         raise click.ClickException("Remote artifacts not yet supported")
-    archive_abs = str(local_path_from_target(archive))
+    archive_abs = archive_uri.path
 
     storage_config = get_storage_config(
         ctx,
@@ -198,10 +198,9 @@ def create(
 
     driver_config = StorageDriverConfig.from_storage_config(storage_config)
     source_identity = resolve_product_identity(
-        source,
+        source_uri,
         format="zarr",
         product_name=source.rstrip("/").rsplit("/", 1)[-1],
-        option_name="--source",
     )
     session = StorageSession(
         StorageBinding(

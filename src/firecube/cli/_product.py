@@ -19,26 +19,21 @@ import click
 from firecube.cli._errors import render
 from firecube.core.product.identity import ProductIdentity
 from firecube.core.product.resolver import ProductResolver
-
-
-def require_full_uri(value: str, *, option_name: str) -> None:
-    if value and "://" not in value:
-        raise click.UsageError(
-            f"{option_name} must be a full URI like 's3://bucket/path/x.zarr' or "
-            f"'file:///abs/path/x.zarr'. Bare names are no longer supported. "
-            f"Got: {value!r}"
-        )
+from firecube.core.storage.uri import StorageUri
 
 
 def resolve_product_identity(
-    value: str,
+    uri: StorageUri,
     *,
     format: str,
     product_name: str,
-    option_name: str = "--product",
 ) -> ProductIdentity:
-    require_full_uri(value, option_name=option_name)
+    """Resolve an admitted product URI into a ProductIdentity.
+
+    Raises:
+        click.UsageError: The resolver refuses the URI.
+    """
     try:
-        return ProductResolver.resolve(value, format=format, product_name=product_name)
+        return ProductResolver.resolve(uri.to_str(), format=format, product_name=product_name)
     except ValueError as exc:
         raise click.UsageError(render(exc)) from exc

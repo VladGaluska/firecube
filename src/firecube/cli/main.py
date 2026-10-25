@@ -35,7 +35,6 @@ from firecube.cli._formatter import (
     install_option_groups_patch,
 )
 from firecube.cli._input_filters import input_filters_option, resolve_input_filters
-from firecube.cli._product import require_full_uri
 from firecube.cli._rename_hints import install_rename_hints
 from firecube.cli._shared_options import (
     storage_driver_option,
@@ -718,12 +717,12 @@ def ingest(
     extra_options = coerce_options_for_plugin(plugin, extra_options)
     ingest_cfg: IngestCommandConfig | None = None
     if not show_options:
-        from firecube.cli._uri_policy import apply_smart_default, parse_product_uri
+        from firecube.cli._uri_policy import apply_smart_default, parse_and_validate_uri
 
         storage_type_resolved: str | None = storage_type
         if target is not None:
-            parsed_target = parse_product_uri(target)
-            storage_type_resolved = apply_smart_default(parsed_target, storage_type)
+            target_uri = parse_and_validate_uri(target, param_hint="--target")
+            storage_type_resolved = apply_smart_default(target_uri, storage_type)
         # storage_driver flows through unresolved; build_storage_config handles
         # env > config > default precedence downstream.
 
@@ -743,10 +742,8 @@ def ingest(
         except click.UsageError:
             raise
 
-    if not show_options:
-        if target is None:
-            raise click.ClickException("Missing option '--target'.")
-        require_full_uri(str(target), option_name="--target")
+    if not show_options and target is None:
+        raise click.ClickException("Missing option '--target'.")
 
     if (slot_start is None) ^ (slot_end is None):
         raise click.UsageError("--slot-start and --slot-end must be provided together")
@@ -816,7 +813,6 @@ def ingest(
                 raise MissingProductNameError(plugin)
 
             target_str = ingest_cfg.target
-            require_full_uri(target_str, option_name="--target")
             try:
                 identity = ProductResolver.resolve(
                     target_str,

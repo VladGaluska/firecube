@@ -179,3 +179,13 @@ def test_show_missing_product_name_raises_click_usage_error(tmp_path: Path) -> N
     # Click's UsageError uses exit code 2 (distinct from our 1=error and 3=not-found).
     assert result.exit_code == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "--product-name" in result.stderr
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize("cmd", [["show"], ["verify"], ["rebuild", "--plugin", "p"]])
+@pytest.mark.parametrize("pre", ["", "FILE://"])
+def test_index_commands_refuse_a_target_the_uri_rule_refuses(tmp_path, cmd, pre) -> None:
+    args = ["zarr", "index", *cmd, "--target", f"{pre}{tmp_path}", "--product-name", "p"]
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 2 and "Invalid value for '--target'" in result.stderr, result.stderr
+    assert ("must be lowercase" if pre else "scheme required (file:// or s3://)") in result.stderr
