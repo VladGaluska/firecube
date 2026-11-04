@@ -31,7 +31,11 @@ from typing import Any, ClassVar, cast, get_type_hints
 
 from firecube.core.controlplane import ChunkManager
 from firecube.core.controlplane.metrics import collect_wal_metrics
-from firecube.core.controlplane.types import IndexEnsuredOutcome
+from firecube.core.controlplane.types import (
+    WRITTEN_TO_TARGET,
+    WRITTEN_TO_WORKSPACE,
+    IndexEnsuredOutcome,
+)
 from firecube.core.discovery import DiscoveryRequest, SourceItem, discover
 from firecube.core.errors import Message, Param, PluginOption
 from firecube.core.filesystem import collect_filesystem_metrics
@@ -57,7 +61,7 @@ from firecube.ingestor.runtime.configure import (
     ensure_chunk_manager_config,
     ensure_run_id,
 )
-from firecube.ingestor.runtime.engine import run_sequential
+from firecube.ingestor.runtime.engine import run_sequential, zero_batch_metrics
 from firecube.ingestor.runtime.parallel_execution_state import _ParallelExecutionState
 from firecube.ingestor.runtime.parallel_run_id import derive_pod_run_id
 from firecube.ingestor.runtime.preflight import preflight
@@ -968,6 +972,11 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
             incremental=bool(self.engine_config.incremental),
             dry_run=bool(self.engine_config.dry_run),
         )
+        self._span_recorder.written_to = (
+            WRITTEN_TO_TARGET
+            if str(self.engine_config.write_mode) == "direct"
+            else WRITTEN_TO_WORKSPACE
+        )
 
         # 2a. Derive slot-aware run_id for parallel mode (single-pod returns base unchanged).
         run_id = derive_pod_run_id(
@@ -1184,7 +1193,7 @@ class BaseIngestor(BaseIngestorHookMixin, Ingestor, ABC):
                         execution_result = IngestResult(
                             outputs=OutputPaths(primary=str(runtime_ctx.target)),
                             output_format=str(runtime_ctx.output_format or ""),
-                            metrics={},
+                            metrics=zero_batch_metrics(self),
                         )
                     else:
                         execution_result = self._firecube_engine.finalize(runtime_ctx, state, self)

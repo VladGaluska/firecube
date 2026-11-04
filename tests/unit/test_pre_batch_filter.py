@@ -14,13 +14,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
 import pytest
 
+from firecube.core.controlplane import ChunkManager
 from firecube.core.index_spec import IndexSpec, ItemInfo, RegularTimeAxis
 from firecube.ingestor.api import (
     DirectZarrIngestor,
@@ -31,8 +35,13 @@ from firecube.ingestor.api import (
 )
 from firecube.ingestor.errors import ConfigurationError
 from firecube.ingestor.runtime import engine as engine_module
-from firecube.ingestor.runtime.engine import _create_batches_with_parallel_filter
-from tests.helpers.storage import begin_write_session
+from firecube.ingestor.runtime.engine import (
+    PipelineExecutor,
+    _create_batches_with_parallel_filter,
+)
+from firecube.ingestor.types.context import OutputPaths, PipelineResult, PipelineRunState
+from tests.helpers.resume_spans import record_run_with_span
+from tests.helpers.storage import begin_write_session, make_test_binding
 
 pytestmark = pytest.mark.unit
 
@@ -279,3 +288,291 @@ def test_non_direct_zarr_host_uses_standard_path() -> None:
     assert result == []
     host._create_batches.assert_called_once_with(ctx, 10)
     host.discover_source_files.assert_not_called()
+
+
+# --- resume filter: guard conditions and serial / slot-range insertion -----------------
+
+_RESUME_PRODUCT = "mock_cap"
+
+
+@contextlib.contextmanager
+def _written_manager(root: Path) -> Iterator[ChunkManager]:
+    """A real control plane in ``root`` where a complete run wrote slots 0..9 of group ``data``.
+
+    The host name is also the product and plugin name, which is what the
+    engine falls back to without an output session. Item ``n`` of
+    ``_MockCapableIngestor`` sits on slot ``n``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    manager = ChunkManager(binding=make_test_binding(root), workspace=root)
+    try:
+        record_run_with_span(
+            manager,
+            product=_RESUME_PRODUCT,
+            plugin=_RESUME_PRODUCT,
+            run_id="run-complete",
+            ranges=[[0, 9]],
+            terminal="complete",
+        )
+        yield manager
+    finally:
+        manager.close()
+
+
+@pytest.fixture
+def written_spans(tmp_path: Path) -> Iterator[ChunkManager]:
+    with _written_manager(tmp_path) as manager:
+        yield manager
+
+
+def _resume_config(**overrides: Any) -> EngineConfig:
+    options: dict[str, Any] = {"resume_existing": True, "write_mode": "direct"}
+    options.update(overrides)
+    return EngineConfig(**options)
+
+
+def _resume_host(
+    manager: ChunkManager,
+    *,
+    items: list[int],
+    inspect_impl: Any = None,
+    bind: bool = True,
+) -> _MockCapableIngestor:
+    host = _MockCapableIngestor(items=items, inspect_impl=inspect_impl)
+    host._chunk_manager = manager
+    if bind:
+        host._bind_index_at_startup(PluginContext(_make_runtime_ctx()))
+    return host
+
+
+class _FilterItemIngestor(_MockCapableIngestor):
+    """Refuses every item whose number is 3 mod 4 at ``filter_item``."""
+
+    def filter_item(self, item: Any, ctx: PluginContext) -> bool:
+        return int(item) % 4 != 3
+
+
+def test_filter_guard_matrix(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    configs: dict[str, Any] = {
+        "resume_existing_off": _resume_config(resume_existing=False),
+        "force_reingest_on": _resume_config(force_reingest=True),
+        "staged_write_mode": _resume_config(write_mode="staged"),
+        "opted_out": _resume_config(resume_skip_written=False),
+        "no_index_binding": _resume_config(),
+    }
+    for name, cfg in configs.items():
+        with subtests.test(msg=name), _written_manager(tmp_path / name) as manager:
+            host = _resume_host(manager, items=list(range(20)), bind=name != "no_index_binding")
+            planner = _RecordingBatchPlanner()
+            host._batch_planner = planner  # type: ignore[assignment]
+
+            result = _create_batches_with_parallel_filter(
+                host=host, ctx=_make_runtime_ctx(), batch_size=10, engine_config=cfg, log=_log()
+            )
+
+            assert result == []
+            assert host.inspect_calls == []
+            assert host._create_batches_calls == 1
+            assert planner.calls == []
+            assert host._timestamps_skipped_before_batching == 0
+
+    with subtests.test(msg="non_direct_zarr_host"):
+        mock_host = MagicMock()
+        mock_host._create_batches = MagicMock(return_value=iter([]))
+        mock_host.discover_source_files = MagicMock()
+        mock_host.inspect_item = MagicMock()
+        ctx = _make_runtime_ctx()
+
+        result = _create_batches_with_parallel_filter(
+            host=mock_host,
+            ctx=ctx,
+            batch_size=10,
+            engine_config=_resume_config(),
+            log=_log(),
+        )
+
+        assert result == []
+        mock_host._create_batches.assert_called_once_with(ctx, 10)
+        mock_host.inspect_item.assert_not_called()
+        mock_host.discover_source_files.assert_not_called()
+
+
+def test_serial_resume_filters_items_before_batching(written_spans: ChunkManager) -> None:
+    host = _FilterItemIngestor(items=list(range(20)))
+    host._chunk_manager = written_spans
+    host._bind_index_at_startup(PluginContext(_make_runtime_ctx()))
+
+    batches = _create_batches_with_parallel_filter(
+        host=host,
+        ctx=_make_runtime_ctx(),
+        batch_size=3,
+        engine_config=_resume_config(),
+        log=_log(),
+    )
+
+    # Slots 0..9 are written: items 0..9 never reach a batch, inspected before any decode.
+    # Of 10..19, filter_item then removes 11, 15 and 19.
+    assert [item for batch in batches for item in batch.items] == [10, 12, 13, 14, 16, 17, 18]
+    assert max(len(batch.items) for batch in batches) == 3
+    assert host.inspect_calls == list(range(20))
+    assert host._create_batches_calls == 0
+    assert host._timestamps_skipped_before_batching == 10
+
+
+def test_serial_resume_keeps_items_that_cannot_be_placed(written_spans: ChunkManager) -> None:
+    def placeable_only_below_ten(item: Any, ctx: Any) -> ItemInfo | None:
+        if item % 2:
+            return None
+        return ItemInfo(
+            coordinate=dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=int(item))
+        )
+
+    host = _resume_host(written_spans, items=list(range(12)), inspect_impl=placeable_only_below_ten)
+    planner = _RecordingBatchPlanner()
+    host._batch_planner = planner  # type: ignore[assignment]
+
+    _create_batches_with_parallel_filter(
+        host=host,
+        ctx=_make_runtime_ctx(),
+        batch_size=10,
+        engine_config=_resume_config(),
+        log=_log(),
+    )
+
+    # Even items 0..8 sit on written slots and drop; odd items have no coordinate and stay, as
+    # does the unwritten slot 10.
+    assert planner.calls[0]["items"] == [1, 3, 5, 7, 9, 10, 11]
+    assert host._timestamps_skipped_before_batching == 5
+
+
+def test_serial_filter_disabled_on_inspect_not_implemented(written_spans: ChunkManager) -> None:
+    def not_implemented(item: Any, ctx: Any) -> ItemInfo | None:
+        raise NotImplementedError
+
+    host = _resume_host(written_spans, items=list(range(20)), inspect_impl=not_implemented)
+    planner = _RecordingBatchPlanner()
+    host._batch_planner = planner  # type: ignore[assignment]
+
+    result = _create_batches_with_parallel_filter(
+        host=host,
+        ctx=_make_runtime_ctx(),
+        batch_size=10,
+        engine_config=_resume_config(),
+        log=_log(),
+    )
+
+    assert result == []
+    assert host._create_batches_calls == 1
+    assert planner.calls == []
+    assert host.inspect_calls == [0]
+    assert host._timestamps_skipped_before_batching == 0
+
+
+def test_serial_resume_without_written_slots_never_inspects(tmp_path: Path) -> None:
+    manager = ChunkManager(binding=make_test_binding(tmp_path), workspace=tmp_path)
+    try:
+        host = _resume_host(manager, items=list(range(20)))
+        planner = _RecordingBatchPlanner()
+        host._batch_planner = planner  # type: ignore[assignment]
+
+        _create_batches_with_parallel_filter(
+            host=host,
+            ctx=_make_runtime_ctx(),
+            batch_size=10,
+            engine_config=_resume_config(),
+            log=_log(),
+        )
+
+        # A fresh product has no coverage to compare against, so no item is positioned.
+        assert host.inspect_calls == []
+        assert planner.calls[0]["items"] == list(range(20))
+        assert host._timestamps_skipped_before_batching == 0
+    finally:
+        manager.close()
+
+
+def test_slot_range_filter_reuses_inspected_dict(written_spans: ChunkManager) -> None:
+    host = _resume_host(written_spans, items=list(range(200)))
+    planner = _RecordingBatchPlanner()
+    host._batch_planner = planner  # type: ignore[assignment]
+    ctx = _make_runtime_ctx()
+    cfg = _resume_config(slot_start=0, slot_end=100)
+    begin_write_session(host, PluginContext(ctx), engine_config=cfg)
+
+    _create_batches_with_parallel_filter(
+        host=host, ctx=ctx, batch_size=10, engine_config=cfg, log=_log()
+    )
+
+    # One inspection per discovered item, shared by the window filter and the resume filter.
+    assert host.inspect_calls == list(range(200))
+    assert planner.calls[0]["items"] == list(range(10, 100))
+    assert host._timestamps_skipped_before_batching == 10
+
+
+def test_dropped_count_surfaces_in_pipeline_summary(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    for stash, per_batch, expected in ((4, 3, 7), (0, 3, 3), (4, 0, 4)):
+        with subtests.test(msg=f"stash_{stash}_per_batch_{per_batch}"):
+            batch = PipelineBatch(
+                batch_id="b1", data_path=Path("."), items=[], size_bytes=0, files_count=0
+            )
+            result = PipelineResult(
+                batch=batch,
+                outputs=OutputPaths(primary="s3://bucket/product"),
+                success=True,
+                metrics={"pipeline": {"timestamps_skipped": per_batch}},
+            )
+            state = PipelineRunState(
+                product="dummy",
+                pipeline_workers=1,
+                batch_size=1,
+                batches=(batch,),
+                ingestion_start_time=0.0,
+                batch_creation_duration=0.0,
+                processing_start_time=0.0,
+                results=(result,),
+            )
+            host = MagicMock(spec=DirectZarrIngestor)
+            host._aggregate_metrics.return_value = {}
+            host.name = "dummy"
+            host._chunk_manager = None
+            host._timestamps_skipped_before_batching = stash
+            ctx = RuntimeIngestContext(source=str(tmp_path), target=str(tmp_path / "t.zarr"))
+
+            finalized = PipelineExecutor().finalize(ctx, state, host)
+
+            assert finalized.metrics.pipeline is not None
+            assert finalized.metrics.pipeline.timestamps_skipped == expected
+
+
+def _run_pipeline_over(
+    manager: ChunkManager, items: list[int]
+) -> tuple[Any, _RecordingBatchPlanner]:
+    host = _resume_host(manager, items=items)
+    host.engine_config = _resume_config(pipeline_workers=2)
+    planner = _RecordingBatchPlanner()
+    host._batch_planner = planner  # type: ignore[assignment]
+    return PipelineExecutor().run_pipeline(_make_runtime_ctx(), host), planner
+
+
+def test_all_items_skipped_yields_zero_batches_with_skip_count(
+    written_spans: ChunkManager,
+) -> None:
+    # Items 0..9 are all written: no batch is planned and the run reports the skips.
+    result, planner = _run_pipeline_over(written_spans, list(range(10)))
+
+    assert planner.calls == []
+    assert result.metrics.pipeline is not None
+    assert result.metrics.pipeline.timestamps_skipped == 10
+
+
+def test_nothing_skipped_leaves_empty_result_without_skip_metrics(
+    written_spans: ChunkManager,
+) -> None:
+    # Items 20..29 are unwritten, so the (recording) planner is asked for them; it plans
+    # none, which leaves an empty result that reports no skip.
+    result, planner = _run_pipeline_over(written_spans, list(range(20, 30)))
+
+    assert [call["items"] for call in planner.calls] == [list(range(20, 30))]
+    assert result.metrics.pipeline is None

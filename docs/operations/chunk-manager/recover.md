@@ -207,6 +207,19 @@ firecube ingest <plugin> \
   --option resume_existing=true
 ```
 
+With `--write-mode direct`, a plugin that places items on time slots skips
+reading the items whose slots are already written. The run's
+`timestamps_skipped` counts them. Two consequences follow:
+
+- New files for a written slot are not read: A source file added or
+  corrected after its slot was written, such as a late-arriving segment, is
+  skipped by a plain resume. Add `--option resume_skip_written=false` to read
+  and rewrite every item, or use `--option force_reingest=true`.
+- A resume after a failed force reingest does not finish the reprocessing:
+  The slots that the failed run had already rewritten, and the slots that
+  still hold the earlier processing, both count as written and are skipped.
+  The cube then mixes old and new processing.
+
 ## Recover From A Failed Batch
 
 A run recorded as `failed` has already stopped and does not need to be

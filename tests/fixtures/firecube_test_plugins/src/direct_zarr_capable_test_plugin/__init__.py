@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
@@ -32,6 +34,14 @@ from firecube.ingestor.api import (
 )
 
 PRODUCT_NAME = "direct_zarr_capable_test_product"
+
+
+def _count_decode(item: Any) -> None:
+    log_path = os.environ.get("DIRECT_ZARR_CAPABLE_DECODE_LOG")
+    if not log_path:
+        return
+    with Path(log_path).open("a", encoding="utf-8") as handle:
+        handle.write(f"{item}\n")
 
 
 @register_ingestor("direct_zarr_capable_test_plugin")
@@ -92,6 +102,7 @@ class DirectZarrCapableTestIngestor(DirectZarrIngestor):
         resolved = self.resolved_index(ctx)
         intents: list[WriteIntent] = []
         for item in batch.items:
+            _count_decode(item)
             info = self.inspect_item(item, ctx)
             if info is None:
                 continue

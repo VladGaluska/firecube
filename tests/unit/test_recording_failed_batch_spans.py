@@ -20,6 +20,9 @@ its result metrics; the recorder turns them into an ``active`` span, a
 ``failed`` span with a ``not_attempted`` reason, under distinct keys. A plain
 failure (no append outcome) keeps the old shape: one ``failed`` span per
 batch group.
+
+The ``written_to`` stamp of ``active`` spans (the durability marker the resume
+filter reads) is covered at the end of the module.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from firecube.core.controlplane import ChunkManager
 from firecube.ingestor.runtime.recording import SpanRecorder
 from firecube.ingestor.types.context import (
     IngestContext,
+    IngestResult,
+    OutputPaths,
     PipelineBatch,
     PipelineResult,
     PluginContext,
@@ -254,3 +259,149 @@ def test_plain_failure_without_append_outcome_keeps_one_failed_span_per_group(
         assert record["span"]["reason"] == "boom"
         assert record["span"]["time_index_ranges"] == []
         assert "repair" not in record["meta"]
+
+
+def _coverage_metrics(group: str, ranges: list[list[int]]) -> dict:
+    return {"zarr": {"coverage": [_entry(group, ranges)]}}
+
+
+def test_active_batch_spans_carry_the_recorders_written_to(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    rows = {
+        "direct_target": ("target", {"plugin": "test"}, "target"),
+        "staged_workspace": ("workspace", {"plugin": "test"}, "workspace"),
+        "unset_recorder_stamps_nothing": (None, {"plugin": "test"}, None),
+        "slice_meta_cannot_override_recorder": (
+            "workspace",
+            {"plugin": "test", "written_to": "target"},
+            "workspace",
+        ),
+        "slice_meta_cannot_stamp_when_recorder_unset": (
+            None,
+            {"plugin": "test", "written_to": "target"},
+            None,
+        ),
+    }
+    for name, (written_to, slice_meta, expected) in rows.items():
+        with subtests.test(msg=name):
+            case_dir = tmp_path / name
+            manager = _manager(case_dir)
+            batch = _batch(case_dir, ["A"])
+            recorder = SpanRecorder(manager)
+            recorder.written_to = written_to
+
+            recorder.record_batch_success(
+                ctx=_plugin_ctx(),
+                batch=batch,
+                result=PipelineResult(
+                    batch=batch, success=True, metrics=_coverage_metrics("A", [[0, 3]])
+                ),
+                slice_meta=slice_meta,
+                run_id=_RUN_ID,
+                product=_PRODUCT,
+            )
+            _finish_failed(manager, case_dir)
+
+            span = _spans_by_group(manager)["A"]
+            assert span["status"] == "active"
+            assert span["meta"].get("written_to") == expected
+
+
+def test_failed_and_skipped_batch_spans_are_not_stamped(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    recorder = SpanRecorder(manager)
+    recorder.written_to = "target"
+    skipped_batch = _batch(tmp_path, ["A"])
+    failed_batch = PipelineBatch(
+        batch_id="batch_0002", data_path=tmp_path, items=["y.nc"], groups=["B"]
+    )
+
+    recorder.record_batch_success(
+        ctx=_plugin_ctx(),
+        batch=skipped_batch,
+        result=PipelineResult(batch=skipped_batch, success=True, metrics={}),
+        slice_meta={"plugin": "test"},
+        run_id=_RUN_ID,
+        product=_PRODUCT,
+    )
+    recorder.record_batch_failure(
+        ctx=_plugin_ctx(),
+        batch=failed_batch,
+        result=PipelineResult(batch=failed_batch, success=False, error="boom"),
+        slice_meta={"plugin": "test"},
+        run_id=_RUN_ID,
+        product=_PRODUCT,
+    )
+    _finish_failed(manager, tmp_path)
+
+    spans = _spans_by_group(manager)
+    assert spans["A"]["status"] == "skipped"
+    assert spans["B"]["status"] == "failed"
+    assert "written_to" not in spans["A"]["meta"]
+    assert "written_to" not in spans["B"]["meta"]
+
+
+def test_terminal_run_spans_ignore_a_written_to_in_slice_meta(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    rows = {"recorder_wins": ("workspace", "workspace"), "unset_recorder_removes": (None, None)}
+    for name, (written_to, expected) in rows.items():
+        with subtests.test(msg=name):
+            case_dir = tmp_path / name
+            manager = _manager(case_dir)
+            recorder = SpanRecorder(manager)
+            recorder.written_to = written_to
+            ctx = RuntimeIngestContext.from_ingest_context(
+                IngestContext(source="."),
+                run_id=_RUN_ID,
+                temp_root=Path("."),
+                materializer=lambda p: Path(p),
+            )
+            result = IngestResult(
+                output_format="zarr",
+                outputs=OutputPaths(primary=str(case_dir / _PRODUCT)),
+                metrics=_coverage_metrics("A", [[0, 3]]),
+            )
+
+            recorder.register_run(
+                ctx=ctx,
+                result=result,
+                run_id=_RUN_ID,
+                product=_PRODUCT,
+                slice_meta={"plugin": "test", "written_to": "target"},
+            )
+
+            assert _spans_by_group(manager)["A"]["meta"].get("written_to") == expected
+
+
+def test_terminal_run_spans_carry_written_to_but_run_meta_does_not(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    recorder = SpanRecorder(manager)
+    recorder.written_to = "target"
+    ctx = RuntimeIngestContext.from_ingest_context(
+        IngestContext(source="."),
+        run_id=_RUN_ID,
+        temp_root=Path("."),
+        materializer=lambda p: Path(p),
+    )
+    result = IngestResult(
+        output_format="zarr",
+        outputs=OutputPaths(primary=str(tmp_path / _PRODUCT)),
+        metrics=_coverage_metrics("A", [[0, 3]]),
+    )
+
+    recorder.register_run(
+        ctx=ctx,
+        result=result,
+        run_id=_RUN_ID,
+        product=_PRODUCT,
+        slice_meta={"plugin": "test"},
+    )
+
+    span = _spans_by_group(manager)["A"]
+    assert span["key"] == f"span_{_RUN_ID}_single_A"
+    assert span["meta"]["written_to"] == "target"
+    (run,) = manager.list_chunks(product=_PRODUCT, chunk_type="run", include_replaced=True)
+    assert run.status == "complete"
+    assert "written_to" not in (run.meta or {})

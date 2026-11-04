@@ -50,6 +50,8 @@ class SpanRecorder:
     def __init__(self, chunk_manager: ChunkManager):
         self._chunk_manager = chunk_manager
         self._log = logging.getLogger("firecube.ingestor.recording")
+        # The resume filter trusts spans on this, so only the recorder may state it.
+        self.written_to: str | None = None
 
     def register_run_started(
         self,
@@ -177,6 +179,7 @@ class SpanRecorder:
                     span_meta["time_max"] = cov.time_max
                 if overwrites := overwrites_by_coverage.get(cov_index):
                     span_meta["overwrites_index_ranges"] = overwrites
+                _stamp_written_to(span_meta, self.written_to)
                 self._chunk_manager.record_span(
                     product=product,
                     run_id=str(run_id),
@@ -393,6 +396,7 @@ class SpanRecorder:
                 meta["time_min"] = cov.time_min
             if cov.time_max:
                 meta["time_max"] = cov.time_max
+            _stamp_written_to(meta, self.written_to)
             self._chunk_manager.record_span(
                 product=product,
                 run_id=run_id,
@@ -402,6 +406,13 @@ class SpanRecorder:
                 coverage=cov,
                 meta=meta,
             )
+
+
+def _stamp_written_to(meta: dict[str, Any], written_to: str | None) -> None:
+    if written_to is None:
+        meta.pop("written_to", None)
+    else:
+        meta["written_to"] = written_to
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -451,7 +462,7 @@ def _list_prior_active_spans_for_replacement(
     query_meta = {
         key: value
         for key, value in slice_meta.items()
-        if key not in {"run_id", "time_min", "time_max"}
+        if key not in {"run_id", "time_min", "time_max", "written_to"}
     }
     time_min = slice_meta.get("time_min")
     time_max = slice_meta.get("time_max")

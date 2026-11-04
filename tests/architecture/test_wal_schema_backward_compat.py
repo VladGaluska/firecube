@@ -27,6 +27,7 @@ The fixture predates the following optional coverage fields:
   - ``PipelineMetrics.timestamps_skipped`` (int, default 0, future)
   - span meta ``overwrites_index_ranges`` (optional list, future)
   - span ``write_strategy`` (optional str, future)
+  - span meta ``written_to`` (optional str, ``"target"`` or ``"workspace"``)
 
 These tests must pass both before and after those fields are added.
 """

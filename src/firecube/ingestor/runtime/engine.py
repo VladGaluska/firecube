@@ -38,6 +38,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -60,6 +61,12 @@ from firecube.ingestor.runtime.index_binding import (
     filter_items_by_index,
 )
 from firecube.ingestor.runtime.parallel_evidence import log_filter_evidence
+from firecube.ingestor.runtime.resume_filter import (
+    UnplaceableItemError,
+    active_position_group,
+    filter_items_by_written_slots,
+    written_slot_coverage,
+)
 from firecube.ingestor.runtime.telemetry import derive_pipeline_summary, result_totals
 from firecube.ingestor.types.context import (
     IngestResult,
@@ -74,6 +81,8 @@ from firecube.ingestor.types.result_metrics import OutputPaths, StorageMetrics
 if TYPE_CHECKING:
     from firecube.core.storage.session import StorageSession
     from firecube.ingestor.runtime.base import BaseIngestor
+    from firecube.ingestor.runtime.batching import BatchPlanHost
+    from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
 
 
 class PipelineFailedBatchesError(FirecubeError, RuntimeError):
@@ -161,6 +170,27 @@ def _storage_completer() -> Any:
 def _total_timestamps_skipped(state: PipelineRunState) -> int:
     return sum(
         _extract_timestamps_skipped(result.metrics) for result in state.results if result.success
+    )
+
+
+def _timestamps_skipped_before_batching(host: PipelineHost) -> int:
+    return int(getattr(host, "_timestamps_skipped_before_batching", 0))
+
+
+def zero_batch_metrics(host: PipelineHost) -> dict[str, Any]:
+    skipped = _timestamps_skipped_before_batching(host)
+    if skipped > 0:
+        return {"pipeline": {"timestamps_skipped": skipped}}
+    return {}
+
+
+def _resume_filter_active(host: DirectZarrIngestor, engine_config: EngineConfig) -> bool:
+    return (
+        getattr(host, "_index_binding", None) is not None
+        and bool(engine_config.resume_existing)
+        and not engine_config.force_reingest
+        and str(engine_config.write_mode) == "direct"
+        and bool(engine_config.resume_skip_written)
     )
 
 
@@ -650,12 +680,21 @@ def _create_batches_with_parallel_filter(
 ) -> list[PipelineBatch]:
     """Create batches, optionally pre-filtering source items for slot-range parallel mode.
 
-    In single-pod mode (slot_start/slot_end not set), this is a pass-through
-    to ``host._create_batches(ctx, batch_size)`` with no behavior change.
+    Without a slot window this is a pass-through to
+    ``host._create_batches(ctx, batch_size)``. The exception is a direct-mode
+    DirectZarr resume with an index binding and ``resume_skip_written``: in
+    both modes it drops, before any is decoded, the items whose slot is
+    already written in every group the run writes (the window's group, or
+    every group).
     """
     slot_start = engine_config.slot_start
     slot_end = engine_config.slot_end
     from firecube.ingestor.templates.direct_zarr import DirectZarrIngestor
+
+    resume_filter_active = False
+    if isinstance(host, DirectZarrIngestor):
+        host._timestamps_skipped_before_batching = 0
+        resume_filter_active = _resume_filter_active(host, engine_config)
 
     if slot_start is not None and slot_end is not None and isinstance(host, DirectZarrIngestor):
         from firecube.ingestor.errors import ConfigurationError
@@ -736,12 +775,30 @@ def _create_batches_with_parallel_filter(
             dropped_count=dropped_count,
         )
 
+        filtered_items = _filter_already_written_items_if_resume_should_skip(
+            host=host,
+            ctx=ctx,
+            items=filtered_items,
+            inspected=inspected,
+            engine_config=engine_config,
+            log=log,
+        )
+
         if not filtered_items:
-            log.info(
-                "Pre-batch filter: no items in slot range [%s,%s). This pod has nothing to write.",
-                slot_start,
-                slot_end,
-            )
+            if filtered_count:
+                log.info(
+                    "Pre-batch filter: every item in slot range [%s,%s) is already written. "
+                    "This pod has nothing to write.",
+                    slot_start,
+                    slot_end,
+                )
+            else:
+                log.info(
+                    "Pre-batch filter: no items in slot range [%s,%s). "
+                    "This pod has nothing to write.",
+                    slot_start,
+                    slot_end,
+                )
             return []
 
         if str(engine_config.write_mode) == "staged":
@@ -755,21 +812,163 @@ def _create_batches_with_parallel_filter(
                 inspected=inspected,
             )
 
-        batches = list(
-            base_host._batch_planner.create_batches(
-                host,
-                PluginContext(ctx),
-                batch_size,
-                items=filtered_items,
-            )
+        return _plan_batches(host=host, ctx=ctx, batch_size=batch_size, items=filtered_items)
+
+    if resume_filter_active:
+        batches = _create_batches_skipping_written(
+            host=cast("DirectZarrIngestor", host),
+            ctx=ctx,
+            batch_size=batch_size,
+            log=log,
         )
-        verify = getattr(host, "_verify_existing_cube_batch_groups", None)
-        if verify is not None:
-            for batch in batches:
-                verify(ctx, batch.groups)
-        return batches
+        if batches is not None:
+            return batches
 
     return list(host._create_batches(ctx, batch_size))
+
+
+def _plan_batches(
+    *,
+    host: PipelineHost,
+    ctx: RuntimeIngestContext,
+    batch_size: int,
+    items: list[Any],
+) -> list[PipelineBatch]:
+    base_host = cast("BaseIngestor", host)
+    batches = list(
+        base_host._batch_planner.create_batches(
+            cast("BatchPlanHost", host),
+            PluginContext(ctx),
+            batch_size,
+            items=items,
+        )
+    )
+    verify = getattr(host, "_verify_existing_cube_batch_groups", None)
+    if verify is not None:
+        for batch in batches:
+            verify(ctx, batch.groups)
+    return batches
+
+
+class _ResumeFilterUnavailable(Exception):
+    """The plugin cannot place items before decoding; the resume filter is disabled."""
+
+
+def _inspected_coordinate(inspected: Mapping[int, Any], item: Any) -> Any | None:
+    """The coordinate ``inspect_item`` reported for ``item``, or ``None``."""
+    info = inspected.get(id(item))
+    if info is None:
+        return None
+    return info.coordinate if hasattr(info, "coordinate") else info
+
+
+def _filter_already_written_items_if_resume_should_skip(
+    *,
+    host: DirectZarrIngestor,
+    ctx: RuntimeIngestContext,
+    items: list[Any],
+    inspected: Mapping[int, Any],
+    engine_config: EngineConfig,
+    log: logging.Logger,
+) -> list[Any]:
+    if not items or not _resume_filter_active(host, engine_config):
+        return items
+    return _drop_already_written_items(
+        host=host,
+        ctx=ctx,
+        items=items,
+        slot_group=engine_config.slot_group,
+        position_for_item=partial(_inspected_coordinate, inspected),
+        log=log,
+    )
+
+
+def _drop_already_written_items(
+    *,
+    host: DirectZarrIngestor,
+    ctx: RuntimeIngestContext,
+    items: list[Any],
+    slot_group: str | None,
+    position_for_item: Callable[[Any], Any | None],
+    log: logging.Logger,
+) -> list[Any]:
+    resolved = host._index_binding.resolved
+    active_group = active_position_group(resolved, slot_group)
+    if active_group is None:
+        log.debug("resume_written_filter: no single group positions items, filter disabled")
+        return items
+    required_groups = [slot_group] if slot_group is not None else list(resolved.groups)
+    coverage = written_slot_coverage(
+        chunk_manager=host._chunk_manager,
+        product=_output_product_name(ctx, host.name),
+        plugin_name=host.name,
+        groups=required_groups,
+        log=log,
+    )
+    if not all(coverage.get(group) for group in required_groups):
+        log.debug("resume_written_filter: no slot is written in every required group")
+        return items
+    kept, dropped = filter_items_by_written_slots(
+        items,
+        resolved=resolved,
+        coverage=coverage,
+        active_group=active_group,
+        required_groups=required_groups,
+        position_for_item=position_for_item,
+        log=log,
+    )
+    host._timestamps_skipped_before_batching = dropped
+    return kept
+
+
+def _create_batches_skipping_written(
+    *,
+    host: DirectZarrIngestor,
+    ctx: RuntimeIngestContext,
+    batch_size: int,
+    log: logging.Logger,
+) -> list[PipelineBatch] | None:
+    """Create a serial run's batches from the items whose slots are not yet written.
+
+    A serial run writes every group, so every group must cover a slot for its
+    items to be dropped, whatever ``slot_group`` says. Returns ``None`` when
+    the plugin does not implement ``inspect_item``.
+    """
+    plugin_ctx = PluginContext(ctx)
+    cached_items = host._discovered_source_files
+    if cached_items is None:
+        all_items = list(host.discover_source_files(plugin_ctx))
+    else:
+        all_items = list(cached_items)
+
+    def _inspect_coordinate(item: Any) -> Any | None:
+        # A plugin error keeps the item and surfaces at decode; the filter never refuses a run.
+        try:
+            info = host.inspect_item(item, plugin_ctx)
+        except NotImplementedError as exc:
+            raise _ResumeFilterUnavailable from exc
+        except Exception as exc:
+            raise UnplaceableItemError from exc
+        if info is None:
+            return None
+        return info.coordinate if hasattr(info, "coordinate") else info
+
+    try:
+        kept = _drop_already_written_items(
+            host=host,
+            ctx=ctx,
+            items=all_items,
+            slot_group=None,
+            position_for_item=_inspect_coordinate,
+            log=log,
+        )
+    except _ResumeFilterUnavailable:
+        log.debug("resume_written_filter: plugin does not implement inspect_item; filter disabled")
+        return None
+    if not kept:
+        log.info("Resume: every item's slot is already written; nothing to write.")
+        return []
+    return _plan_batches(host=host, ctx=ctx, batch_size=batch_size, items=kept)
 
 
 def _refuse_sparse_staged_window(
@@ -840,7 +1039,7 @@ class PipelineExecutor:
         if not batches:
             return IngestResult(
                 output_format=str(ctx.output_format or ""),
-                metrics={},
+                metrics=zero_batch_metrics(host),
                 outputs=OutputPaths(primary=str(ctx.target)),
             )
 
@@ -900,7 +1099,9 @@ class PipelineExecutor:
                 plugin_name=host.name,
             )
             pipeline_summary = derive_pipeline_summary(state, merged_metrics)
-            pipeline_summary["timestamps_skipped"] = _total_timestamps_skipped(state)
+            pipeline_summary["timestamps_skipped"] = _total_timestamps_skipped(
+                state
+            ) + _timestamps_skipped_before_batching(host)
             merged_metrics["pipeline"] = pipeline_summary
 
             failed = [res for res in state.results if res.attempted and not res.success]

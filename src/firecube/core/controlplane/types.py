@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -108,6 +108,9 @@ MAINTENANCE_OPS = frozenset(
 )
 RUN_JOURNAL_FILENAME = "plan.json"
 MAINTENANCE_KIND = "maintenance"
+
+WRITTEN_TO_TARGET = "target"
+WRITTEN_TO_WORKSPACE = "workspace"
 
 
 def canonical_index_bytes(index: dict[str, Any]) -> bytes:
@@ -598,6 +601,35 @@ class ChunkInfo:
         if not isinstance(span, dict):
             return 0
         return int(span.get("timestamps_written", 0))
+
+
+def half_open_slot_coverage(
+    chunks: Iterable[ChunkInfo], groups: Sequence[str]
+) -> dict[str, list[tuple[int, int]]]:
+    """Return the half-open slot intervals the span chunks cover, per group.
+
+    Stored span ranges are inclusive; each becomes ``(start, end + 1)``.
+    Malformed span entries and groups outside ``groups`` are skipped.
+    """
+    coverage: dict[str, list[tuple[int, int]]] = {group: [] for group in groups}
+    for chunk in chunks:
+        meta = chunk.meta or {}
+        group = meta.get("group")
+        if group not in coverage:
+            continue
+        span_payload = chunk.record.get("span") if isinstance(chunk.record, dict) else None
+        if not isinstance(span_payload, dict):
+            continue
+        for entry in span_payload.get("time_index_ranges") or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            try:
+                start = int(entry[0])
+                end_inclusive = int(entry[1])
+            except (TypeError, ValueError):
+                continue
+            coverage[group].append((start, end_inclusive + 1))
+    return coverage
 
 
 @dataclass

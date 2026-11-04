@@ -108,6 +108,17 @@ class EngineConfig:
             ``--stac-search`` or a table in plugin configuration.
         write_mode: Write strategy, either ``"staged"`` or ``"direct"``.
         resume_existing: Continue a compatible incomplete or overlapping run.
+            On Zarr, already written outputs are skipped by default:
+            the GenericZarr append path skips timestamps the store already
+            holds, and a DirectZarr run with an index skips decoding items
+            whose slots the control plane records as written. Defaults to ``False``.
+        resume_skip_written: On a resume, skip decoding the items whose slots
+            are already written. Only applies to direct-mode DirectZarr runs of a
+            plugin that declares an index. A staged run, a force reingest and
+            a run without ``resume_existing`` decode every item. A slot counts
+            as written when a complete run recorded it, or when an
+            interrupted direct run recorded it after its writes reached the
+            target. Skipped items count in ``timestamps_skipped``. Defaults to ``True``.
         force_reingest: Re-process existing spans intentionally. Overlapping
             timestamps are overwritten in-place (region overwrite); new tail
             timestamps are appended. No separate delete step is required.
@@ -157,6 +168,7 @@ class EngineConfig:
     # Write Strategy
     write_mode: str = "staged"  # staged | direct
     resume_existing: bool = False
+    resume_skip_written: bool = True
     force_reingest: bool = False
     incremental: bool = False
     dry_run: bool = False

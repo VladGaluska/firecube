@@ -128,7 +128,7 @@ silently ignored.
 
 | Tier | Examples | Applies to |
 |---|---|---|
-| Engine options | `pipeline_workers`, `pipeline_batch_size`, `extract_workers`, `input_filters`, `resume_existing` | Runtime behavior shared by plugins. |
+| Engine options | `pipeline_workers`, `pipeline_batch_size`, `extract_workers`, `input_filters`, `resume_existing`, `resume_skip_written` | Runtime behavior shared by plugins. |
 | Output options | `zarr_chunk_shape`, `zarr_compression`, `zarr_consolidate` | Zarr template behavior. |
 | Plugin options | `region`, thresholds, filters, product-specific switches | Options declared by the installed plugin. |
 
@@ -145,6 +145,37 @@ firecube plugins describe <plugin_name>
 firecube ingest <plugin_name> --show-options
 firecube plugins explain <plugin_name>.engine.pipeline_workers
 ```
+
+## Resume Behavior
+
+`resume_existing=true` continues a compatible incomplete or overlapping run.
+On Zarr outputs, a resume skips work that is already written, so it costs less
+than a clean run:
+
+- GenericZarr outputs skip the timestamps the store already holds.
+- Direct-mode runs of a plugin that declares a slot index skip reading and
+  decoding the items whose slots are already written. The skipped items count
+  in the run's `timestamps_skipped`.
+
+`resume_skip_written` controls the direct-mode skip and defaults to `true`. Set
+`--option resume_skip_written=false` to decode and rewrite every item. A
+staged run and a `force_reingest=true` run always decode and rewrite every
+item.
+
+A slot counts as written when a completed run recorded it, or when an
+interrupted direct-mode run recorded it after its writes reached the target.
+Items whose slots do not count as written are decoded and rewritten, which is
+safe. Runs interrupted under Firecube 0.1.8 or earlier are never skipped and
+their items are rewritten on the first resume. Once the product has had a
+maintenance operation that can change stored data, a `chunks delete`,
+`chunks delete-span`, `archive restore`, a migration, or a store adoption,
+only the slots of completed runs count as written.
+
+The skip is per slot, not per array. A slot counts as written when its run
+recorded it, even if that run wrote only some of the slot's arrays or part of
+an array. If you add a static array to the schema and every item is then
+skipped, the resume writes nothing, so the new array is not written. Run that
+resume once with `resume_skip_written=false`, or use `force_reingest=true`.
 
 ## Troubleshooting
 

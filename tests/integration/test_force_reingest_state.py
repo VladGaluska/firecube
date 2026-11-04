@@ -334,6 +334,48 @@ def test_force_reingest_of_a_real_run_replaces_prior_spans_and_spans_carry_no_pr
     )
 
 
+def test_force_reingest_replaces_pre_stamp_spans_whatever_written_to_the_run_stamps(
+    tmp_path: Path, subtests: pytest.Subtests
+) -> None:
+    for written_to in ("target", "workspace", None):
+        name = f"stamps_{written_to}"
+        with subtests.test(msg=name):
+            workspace = tmp_path / name
+            workspace.mkdir()
+            product = "test_product"
+            output_path = str(workspace / product)
+            manager = ChunkManager(binding=make_test_binding(workspace), workspace=workspace)
+            recorder = SpanRecorder(manager)
+            recorder.written_to = written_to
+            prior_key = _record_completed_span_run(
+                manager,
+                product=product,
+                run_id="run-old",
+                group="F024",
+                time_min="2024-01-01T00:00:00Z",
+                time_max="2024-01-02T00:00:00Z",
+            )
+            _start_run(manager, product=product, run_id="run-new", output_path=output_path)
+
+            recorder.register_run(
+                ctx=_make_runtime_ctx(run_id="run-new", target=output_path, force_reingest=True),
+                result=_make_result(
+                    output_path=output_path,
+                    group="F024",
+                    time_min="2024-01-01T00:00:00Z",
+                    time_max="2024-01-02T00:00:00Z",
+                ),
+                run_id="run-new",
+                product=product,
+                slice_meta={"plugin": "test_product", "group": "F024"},
+            )
+
+            current = _current_state(manager, product=product)
+            assert current[prior_key]["status"] != "active"
+            assert current["span_run-new_single_F024"]["status"] == "active"
+            manager.close()
+
+
 def test_force_reingest_first_time_no_prior_spans_does_not_raise(temp_workspace):
     product = "test_product"
     output_path = str(temp_workspace / product)

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from firecube.core.controlplane import ChunkManager
+from firecube.core.controlplane.types import half_open_slot_coverage
 from firecube.core.errors import (
     CommandName,
     FirecubeError,
@@ -481,7 +482,6 @@ def _query_slots_coverage(
         storage_config: Builds the storage settings the control plane is read with.
         groups: The groups to report; each gets a list, empty when nothing is covered.
     """
-    coverage: dict[str, list[tuple[int, int]]] = {g: [] for g in groups}
     driver = StorageDriverConfig.from_storage_config(storage_config())
     binding = StorageBinding(identity=identity, driver=driver)
     manager = ChunkManager(binding=binding)
@@ -493,24 +493,4 @@ def _query_slots_coverage(
         )
     finally:
         manager.close()
-
-    for chunk in chunks:
-        meta = chunk.meta or {}
-        group = meta.get("group")
-        if group not in coverage:
-            continue
-        span_payload = chunk.record.get("span") if isinstance(chunk.record, dict) else None
-        if not isinstance(span_payload, dict):
-            continue
-        time_index_ranges = span_payload.get("time_index_ranges") or []
-        for entry in time_index_ranges:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                continue
-            try:
-                start = int(entry[0])
-                end_inclusive = int(entry[1])
-            except (TypeError, ValueError):
-                continue
-            coverage[group].append((start, end_inclusive + 1))
-
-    return coverage
+    return half_open_slot_coverage(chunks, groups)

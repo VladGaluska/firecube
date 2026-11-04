@@ -1068,6 +1068,7 @@ class DirectZarrIngestor(BaseIngestor):
 
     template_config_class = ZarrTemplateConfig
     _zarr_write_session: ZarrWriteSession | None = None
+    _timestamps_skipped_before_batching: int = 0
 
     def index_spec(self, ctx: PluginContext) -> IndexSpec | None:
         """Override to enable slot-range parallel ingestion.
@@ -1090,21 +1091,30 @@ class DirectZarrIngestor(BaseIngestor):
         return None
 
     def inspect_item(self, item: Any, ctx: PluginContext) -> ItemInfo | None:
-        """Override to enable slot-range parallel ingestion.
+        """Override to enable slot-range parallel ingestion and the resume skip.
 
-        Called by the engine for each source item to determine its slot index.
-        Return an ``ItemInfo`` with the item's time coordinate, or ``None``
-        to drop the item from this worker's slot range.
+        Called by the engine for each source item, before the item is read,
+        to determine its slot index. Return an ``ItemInfo`` with the item's
+        time coordinate, or ``None`` to drop the item from this worker's slot
+        range.
 
-        Default raises ``NotImplementedError`` — override this method to
-        enable parallel ingestion.
+        The engine also calls it on a direct-mode resume with
+        ``resume_skip_written`` on, serial runs included. There the
+        coordinate decides which items are never read: an item whose slot is
+        already written is skipped. The coordinate must therefore be the slot
+        the item's writes land on, and one item maps to one slot. On a resume
+        ``None`` keeps the item, so it is read and written as usual.
+
+        On a serial resume ``NotImplementedError`` disables the skip, and
+        every item is read.
 
         Args:
             item: A source item from the batch.
             ctx: The plugin context for this run.
 
         Returns:
-            An ``ItemInfo`` with the item's coordinate, or ``None`` to drop.
+            An ``ItemInfo`` with the item's coordinate, or ``None`` to drop
+            the item from a slot window (a resume keeps it).
 
         Raises:
             NotImplementedError: If not overridden.

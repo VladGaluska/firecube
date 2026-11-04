@@ -337,6 +337,20 @@ and Firecube package versions follow PEP 440-compatible Semantic Versioning.
     `firecube.core.api`.
   - If a run has one `file://` source, `PipelineBatch.data_path` holds its
     local path.
+- A direct-mode `DirectZarrIngestor` resume (`--option resume_existing=true`)
+  of a plugin that declares `index_spec()` and `inspect_item()` now skips
+  reading and decoding the items whose slots are already written. A slot counts
+  as written when a completed run recorded it, or when an interrupted
+  direct-mode run recorded it after its writes reached the target. Skipped
+  items count in the run's `timestamps_skipped`. Staged runs and
+  `force_reingest=true` runs are unchanged. This is on by default. Pass
+  `--option resume_skip_written=false` to read and rewrite every item, for
+  example to pick up a corrected or late-arriving source file for a slot that
+  is already written. Runs interrupted under 0.1.8 or earlier are never
+  skipped, and once the product has had a data-changing maintenance run like a
+  deletion (`chunks delete`, `chunks delete-span` or a scrub), an
+  `archive restore`, a migration or a store adoption, only completed runs'
+  slots are skipped.
 - The refusal for a legacy index record now names the library function that
   rebuilds the index. A Python caller reads that name in the message. The CLI
   prints the command `firecube zarr index rebuild` instead. The
